@@ -18,8 +18,8 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - PCIE Protocol : Not supported
 - Retimer : Not supported
 - Electrical PHY : Not supported (Implement the negotiated parameters but not the analog circuits)
-- Sideband Frequency : 800 MHz (spec accurate; asynchronous CDC between lclk and sbclk)
-- Mainband Frequency : 2 GHz forwarded clock (fCK), DDR transfer (4 GT/s effective per lane)
+- **Sideband Frequency** : 800 MHz (spec accurate). Includes method for clock domain crossing (CDC) between lclk and sbclk datapath.
+- **Mainband Frequency** : Physical interface operates as a true 4 GT/s DDR link: 2 GHz forwarded clock (fCK), DDR mainband transfer, with lclk set to 500 MHz (slowest IO data rate).
 - RDI / Adapter Clock (lclk) : 500 MHz (exact bandwidth match: 16 bytes @ 500 MHz = 64 Gbps for x16 @ 4 GT/s)
 - Standard Package width : x16 only (no x8 degrade negotiated on the main line;
   the byte-to-lane mapper implements both x8 degrade halves and is covered by
@@ -27,7 +27,7 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - Data width : parameterized `NBYTES`, default 16 bytes, on both FDI and RDI
 - Data link : no CRC, no retry/replay, no sequence numbers (legal at 4 GT/s)
 - Sideband packet : 64-bit header, one bit per UI, 32-UI inter-packet gap
-- Physical Layer RESET : minimum 4 ms residency enforced upon entry to RESET (spec 4.5.3.1)
+- **Physical Layer RESET** : Physical Layer must stay in RESET for a minimum of 4ms upon every entry to RESET, as mentioned in the spec.
 - Timer constants : 4 ms RESET minimum, 8 ms residency/message timeouts, and 4 ms stall keep-alive
   are implemented at their true spec physical values in `rtl/rtl_common/timer.sv` calibrated to lclk = 500 MHz;
   no RTL timer constant is divided for simulation speed

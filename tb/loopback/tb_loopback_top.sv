@@ -372,7 +372,8 @@ module tb_loopback_top;
     while (!(d0_link_active_obs && d1_link_active_obs)) begin
       @(posedge lclk);
       i = i + 1;
-      if (i > 200000) begin
+      // Must wait for at least 4 ms in RESET (2,000,000 cycles) plus training
+      if (i > 3000000) begin
         $display("FAIL bring-up timeout: die0 active %b die1 active %b",
                  d0_link_active_obs, d1_link_active_obs);
         $display("     die0 LTSM %02h die1 LTSM %02h", d0_ltsm_state, d1_ltsm_state);
@@ -409,7 +410,8 @@ module tb_loopback_top;
   initial begin
     cov_path = "logs/coverage.json";
     void'($value$plusargs("covfile=%s", cov_path));
-    #(2_000_000);
+    // True-to-spec physical reset takes at least 4 ms (4,000,000 ns). Watchdog at 10 ms.
+    #(10_000_000);
     $display("FAIL tb_loopback_top: watchdog at %0t", $time);
     u_cov.export_json(cov_path);
     $finish;

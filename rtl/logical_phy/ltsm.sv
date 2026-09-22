@@ -150,9 +150,10 @@
 // --------------------------------------------------------------------------
 // Timer interface
 // --------------------------------------------------------------------------
-//   tmr_start : pulsed on entry to each new sub-state (state_q != prev).
-//   tmr_run   : held while the handshake is pending (timer_start_q &&
-//               !resp_rcvd_q). On expiry the LTSM transitions to TRAINERROR.
+//   tmr_start       : pulsed on entry to each new sub-state (state_q != prev).
+//   tmr_run         : held while the handshake is pending (timer_start_q &&
+//                     !resp_rcvd_q). On expiry the LTSM transitions to TRAINERROR.
+//   rst_tmr_expired : 4 ms physical layer RESET minimum timeout (spec 4.5.3.1).
 //
 // --------------------------------------------------------------------------
 // Parameters
@@ -171,7 +172,7 @@
 //                 sb_rx_dp_err) from the sb_codec.
 //   Pattern gen : pat_enable, pat_select, pat_lfsr_reset, pat_lfsr_enable,
 //                 pat_done.
-//   Timers      : tmr_start, tmr_run, tmr_expired.
+//   Timers      : tmr_start, tmr_run, tmr_expired, rst_tmr_expired.
 //
 // --------------------------------------------------------------------------
 // Implementation notes
@@ -194,6 +195,7 @@
 //                        states, sideband handshake, pattern control, and
 //                        timer interface.
 //   v0.0.2  2026-09-22  Fix tmr_start to pulse for 1 cycle on sub-state entry.
+//   v0.0.3  2026-09-22  Enforce 4 ms physical layer RESET minimum (Req.1).
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -257,7 +259,8 @@ module ltsm #(
   // ---- timers
   output logic        tmr_start,
   output logic        tmr_run,
-  input  logic        tmr_expired
+  input  logic        tmr_expired,
+  input  logic        rst_tmr_expired
 );
 
   // =========================================================================
@@ -278,22 +281,24 @@ module ltsm #(
   logic        req_sent_q;       // local side sent its sub-state request
   logic        resp_rcvd_q;      // partner's response received
   logic        timer_start_q;
+  logic        reset_min_done_q; // 4 ms RESET minimum met
   logic        retrain_req_q;
-  logic        req_sent_d, resp_rcvd_d, timer_start_d, retrain_req_d;
-
+  logic        req_sent_d, resp_rcvd_d, timer_start_d, retrain_req_d, reset_min_done_d;
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      state_q       <= LT_RESET;
-      req_sent_q    <= 1'b0;
-      resp_rcvd_q   <= 1'b0;
-      timer_start_q <= 1'b0;
-      retrain_req_q <= 1'b0;
+      state_q          <= LT_RESET;
+      req_sent_q       <= 1'b0;
+      resp_rcvd_q      <= 1'b0;
+      timer_start_q    <= 1'b0;
+      reset_min_done_q <= 1'b0;
+      retrain_req_q    <= 1'b0;
     end else begin
-      state_q       <= state_d;
-      req_sent_q    <= req_sent_d;
-      resp_rcvd_q   <= resp_rcvd_d;
-      timer_start_q <= timer_start_d;
-      retrain_req_q <= retrain_req_d;
+      state_q          <= state_d;
+      req_sent_q       <= req_sent_d;
+      resp_rcvd_q      <= resp_rcvd_d;
+      timer_start_q    <= timer_start_d;
+      reset_min_done_q <= reset_min_done_d;
+      retrain_req_q    <= retrain_req_d;
     end
   end
 
@@ -520,13 +525,14 @@ module ltsm #(
     req_sent_d    = req_sent_q;
     resp_rcvd_d   = resp_rcvd_q;
     timer_start_d = timer_start_q;
+    reset_min_done_d = reset_min_done_q;
     retrain_req_d = retrain_req_q;
-
     // A new sub-state entry clears the handshake flags and arms the timer.
     if (state_q != state_q_prev) begin
-      req_sent_d    = 1'b0;
-      resp_rcvd_d   = 1'b0;
-      timer_start_d = 1'b1;
+      req_sent_d       = 1'b0;
+      resp_rcvd_d      = 1'b0;
+      timer_start_d    = 1'b1;
+      reset_min_done_d = 1'b0;
     end else begin
       // Record the local request once the codec accepts it.
       if (sb_tx_load)            req_sent_d  = 1'b1;
@@ -547,11 +553,14 @@ module ltsm #(
       // 4.5.3.1 RESET
       // -----------------------------------------------------------------
       // Wait for the adapter to release the reset and for the sideband to
-      // be usable. The exit stimulus is start_link_train (from the top-
-      // level pin or CSR TRAIN_CTL write). On exit, transition to SBINIT.
+      // be usable. Spec 4.5.3.1 enforces a minimum 4 ms residency upon
+      // entry to RESET. The exit stimulus is start_link_train (from the top-
+      // level pin or CSR write); transition to SBINIT occurs only after
+      // the 4 ms reset timer has elapsed.
       // -----------------------------------------------------------------
       LT_RESET: begin
-        if (start_link_train) state_d = LT_SBINIT;
+        if (rst_tmr_expired) reset_min_done_d = 1'b1;
+        if (start_link_train && (rst_tmr_expired || reset_min_done_q)) state_d = LT_SBINIT;
       end
 
       // -----------------------------------------------------------------
@@ -711,7 +720,7 @@ module ltsm #(
     // deadline).
     // -------------------------------------------------------------------
     if (tmr_expired && timer_start_q && state_q != LT_ACTIVE &&
-        state_q != LT_L1L2 && state_q != LT_TRAINERROR) begin
+        state_q != LT_L1L2 && state_q != LT_TRAINERROR && state_q != LT_RESET) begin
       state_d       = LT_TRAINERROR;
       timer_start_d = 1'b0;
     end

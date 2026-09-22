@@ -6,6 +6,8 @@ import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module ut_ltsm;
+  import ucie_pkg::*;
+  logic        rst_tmr_expired;
   logic        lclk, lreset_n, sbclk, sbreset_n;
   logic        start_link_train, adapter_active_req;
   logic        link_trained, train_error, link_reset_out, phy_retrain_done;
@@ -80,7 +82,8 @@ module ut_ltsm;
     .sb_msg_timeout(sb_msg_timeout), .sb_stall_sent(sb_stall_sent),
     .pat_enable(pat_enable), .pat_select(), .pat_lfsr_reset(pat_lfsr_reset),
     .pat_lfsr_enable(pat_lfsr_enable), .pat_done(pat_done),
-    .tmr_start(tmr_start), .tmr_run(tmr_run), .tmr_expired(tmr_expired)
+    .tmr_start(tmr_start), .tmr_run(tmr_run), .tmr_expired(tmr_expired),
+    .rst_tmr_expired(rst_tmr_expired)
   );
 
   sb_codec u_loc (
@@ -188,6 +191,12 @@ module ut_ltsm;
     .running(tmr_run), .expired(tmr_expired)
   );
 
+  // Reset Timer: True to spec (LIMIT_CYCLES=C_RESET_MIN = 2,000,000 lclk cycles = 4 ms).
+  ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN)) u_rst_tmr (
+    .clk(lclk), .reset_n(lreset_n), .start(tmr_start),
+    .running(ltsm_state == ucie_pkg::LT_RESET), .expired(rst_tmr_expired)
+  );
+
   initial lclk  = 1'b0;
   initial sbclk = 1'b0;
   // Single clock domain: the PoC samples the sideband on the same edge as
@@ -218,7 +227,9 @@ module ut_ltsm;
           #0.1;
         end
         begin
-          repeat (200000) @(posedge lclk);
+          // Need more cycles for LT_RESET (2,000,000 cycles = 4 ms)
+          if (exp == LT_RESET) repeat (2500000) @(posedge lclk);
+          else                 repeat (200000)  @(posedge lclk);
         end
       join_any
       if (ltsm_state === exp) begin
@@ -241,7 +252,7 @@ module ut_ltsm;
 
     // RESET must hold until training is requested.
     @(negedge lclk);
-    if (ltsm_state !== LT_RESET) begin
+    if (ltsm_state !== ucie_pkg::LT_RESET) begin
       $display("FAIL ut_ltsm: not in RESET after power-on");
       errors = errors + 1;
     end

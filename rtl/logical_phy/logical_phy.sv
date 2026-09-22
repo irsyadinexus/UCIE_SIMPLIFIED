@@ -52,9 +52,9 @@
 //  |  +------------------+        |          |          |          |
 //  |                              |          |          |          |
 //  |  +------------------+        |          |          |          |
-//  |  | ucie_timer       |        |          |          |          |
+//  |  | ucie_timer x 2   |        |          |          |          |
 //  |  | (u_resid_timer)  |--------+          |          |          |
-//  |  | 8 ms residency   |                   |          |          |
+//  |  | (u_reset_timer)  |                   |          |          |
 //  |  +------------------+                   |          |          |
 //  +---------------------------------------------------------------+
 //      |               |                    |          |
@@ -119,6 +119,7 @@
 //                        sub-module instantiations, static RDI outputs, and
 //                        CSR/config stub.
 //   v0.0.2  2026-09-22  Update lclk and timer cycle comments for 500 MHz.
+//   v0.0.3  2026-09-22  Add 4 ms physical layer RESET minimum timer (Req.1).
 // ============================================================================
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
@@ -216,7 +217,7 @@ module logical_phy #(
   logic        tmr_start;
   logic        tmr_run;
   logic        tmr_expired;
-
+  logic        rst_tmr_expired;
   // ------------------------------------------------- LTSM <-> adapter
   logic        csr_start_link_train;
   wire         ltsm_start_link_train;
@@ -311,7 +312,8 @@ module logical_phy #(
   // Control of the pattern generator (pat_enable, pat_select, etc.) is
   // driven entirely by the LTSM based on the current training sub-state.
   // The 8 ms residency timer (u_resid_timer) provides timeout enforcement
-  // per spec 4.5.3: any sub-state exceeding 8 ms escalates to TRAINERROR.
+  // per spec 4.5.3. The 4 ms reset timer (u_reset_timer) enforces the
+  // minimum RESET duration requirement per spec 4.5.3.1.
   // ---------------------------------------------------------------------------
   ltsm #(.NLANES(NLANES)) u_ltsm (
     .lclk            (lclk),
@@ -359,9 +361,9 @@ module logical_phy #(
     .pat_done        (pat_done),
     .tmr_start       (tmr_start),
     .tmr_run         (tmr_run),
-    .tmr_expired     (tmr_expired)
+    .tmr_expired     (tmr_expired),
+    .rst_tmr_expired (rst_tmr_expired)
   );
-
   // ---------------------------------------------------------------------------
   // 8 ms Residency Timer Instantiation  (u_resid_timer)
   // ---------------------------------------------------------------------------
@@ -380,6 +382,22 @@ module logical_phy #(
     .start    (tmr_start),
     .running  (tmr_run),
     .expired  (tmr_expired)
+  );
+
+  // ---------------------------------------------------------------------------
+  // 4 ms RESET Minimum Timer Instantiation (u_reset_timer)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 4.5.3.1 – Physical Layer must stay in RESET for a
+  //                  minimum of 4 ms upon every entry to RESET.
+  // ucie_timer is parameterised with C_RESET_MIN = 2_000_000 lclk cycles
+  // (4 ms at 500 MHz).
+  // ---------------------------------------------------------------------------
+  ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN)) u_reset_timer (
+    .clk      (lclk),
+    .reset_n  (lreset_n),
+    .start    (tmr_start),
+    .running  (ltsm_state == ucie_pkg::LT_RESET),
+    .expired  (rst_tmr_expired)
   );
 
   // ---------------------------------------------------------------------------

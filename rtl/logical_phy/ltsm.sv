@@ -770,8 +770,12 @@ module ltsm #(
                           (state_q == LT_LINKINIT)    ? PAT_LFSR      :
                           (state_q == LT_MB_RXDESKEW) ? PAT_CLKREPAIR :
                                                         PAT_PERLANEID;
-  // Scrambling is off for Per-Lane-ID, VALTRAIN and clock repair; the LFSR
-  // pattern reseeds on LINKINIT entry.
+  // LFSR reset/enable gating for the training-pattern generator.
+  //
+  // Scrambling is disabled for Per-Lane-ID, VALTRAIN and clock-repair
+  // patterns, so the LFSR only runs during LINKINIT, where the LFSR
+  // pattern itself is the payload and the shift register is reseeded on
+  // LINKINIT entry. ref: spec 4.5.3 (LINKINIT), 4.4.1 (scrambling).
   assign pat_lfsr_reset = (state_q == LT_LINKINIT);
   assign pat_lfsr_enable= (state_q == LT_LINKINIT);
 

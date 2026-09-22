@@ -134,27 +134,20 @@ module adapter_datapath #(
   // -------------------------------------------------------------------------
   // always_ff: Tx/Rx Pipeline Registers
   //
-  // Registers the FDI-to-RDI (Tx) and RDI-to-FDI (Rx) data paths on every
-  // rising edge of lclk. On asynchronous reset, all registers are cleared
-  // to zero, ensuring no spurious data is driven onto either interface
-  // during reset.
+  // Registers the Tx (FDI -> RDI) and Rx (RDI -> FDI) data paths on lclk;
+  // reset clears all four registers so no spurious data is driven during
+  // reset.
   //
-  // Tx path (FDI -> RDI):
-  //   tx_data_q  <= lp_data (Protocol Layer transmit data).
-  //   tx_valid_q <= lp_valid && lp_irdy && !stall_active. The conjunction
-  //     ensures that:
-  //     (a) The Protocol Layer has valid data (lp_valid).
-  //     (b) The Protocol Layer is ready to transfer (lp_irdy).
-  //     (c) The stall handshake is not active (datapath unfrozen).
-  //   While the PHY is stalled, lp_valid and lp_irdy are held low by the
-  //   Protocol Layer (per spec 8.3.1), so the register simply stops moving.
+  //   tx_data_q  <= lp_data
+  //   tx_valid_q <= lp_valid && lp_irdy && !stall_active
+  //     The conjunction requires (a) valid Protocol Layer data, (b) Protocol
+  //     Layer ready, and (c) the stall handshake inactive. While the PHY is
+  //     stalled, lp_valid/lp_irdy are held low by the Protocol Layer
+  //     (spec 8.3.1), so the register simply stops moving.
+  //   rx_data_q  <= rdi_pl_data ; rx_valid_q <= rdi_pl_valid
   //
-  // Rx path (RDI -> FDI):
-  //   rx_data_q  <= rdi_pl_data (Logical PHY receive data).
-  //   rx_valid_q <= rdi_pl_valid (Logical PHY receive valid).
-  //
-  // Spec ref: UCIe 1.0, Section 8.1 (pipeline stage), Section 4.1.x
-  //           (byte/valid framing), Section 8.3.1 (stall behaviour).
+  // Spec ref: 8.1 (pipeline stage), 4.1.x (byte/valid framing),
+  //           8.3.1 (stall behaviour).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -175,31 +168,20 @@ module adapter_datapath #(
   // -------------------------------------------------------------------------
   // always_comb: Output Multiplexing and x8 Width Degrade
   //
-  // Single combinational block driving all datapath outputs. Ensures no
+  // Single combinational driver for every datapath output, so there are no
   // multi-driver conflicts.
   //
-  // FDI -> RDI outputs:
-  //   rdi_lp_irdy  = lp_irdy gated by !stall_active. When stall_active is
-  //                  high, the PHY must not see irdy.
-  //   rdi_lp_valid = tx_valid_q (registered from FDI handshake).
-  //   rdi_lp_data  = tx_data_q (registered FDI transmit data).
+  // FDI -> RDI: rdi_lp_irdy = lp_irdy && !stall_active (the PHY must not see
+  //   irdy during a stall); rdi_lp_valid = tx_valid_q; rdi_lp_data = tx_data_q.
+  //   Width degrade (spec 4.3.4): when rdi_lnk_is_x8, the upper half
+  //   [NBYTES*8-1:NBYTES*4] is forced to zero so only lanes 0-7 (bytes 0-7)
+  //   carry data; the explicit zeroing gives the scoreboard a clean compare.
+  // RDI -> FDI: pl_valid = rx_valid_q; pl_data = rx_data_q;
+  //   pl_trdy = rdi_pl_trdy && !stall_active (Protocol Layer must not see
+  //   trdy during a stall); pl_stream = lp_stream pass-through.
   //
-  //   x8 width degrade (spec 4.3.4): when rdi_lnk_is_x8 is asserted, the
-  //   upper half of the data bus (NBYTES*8-1 downto NBYTES*4, i.e. bits
-  //   [127:64] for NBYTES=16) is driven to zero. Only lanes 0-7 (bytes
-  //   0-7) carry valid data in x8 mode. The zeroing ensures a clean
-  //   byte-for-byte comparison in the verification scoreboard.
-  //
-  // RDI -> FDI outputs:
-  //   pl_valid  = rx_valid_q (registered from RDI).
-  //   pl_data   = rx_data_q (registered from RDI).
-  //   pl_trdy   = rdi_pl_trdy gated by !stall_active. The Protocol Layer
-  //               must not see trdy during a stall.
-  //   pl_stream = pass-through of lp_stream (stream identifier is set by
-  //               the Protocol Layer and returned unchanged).
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.x (byte/valid framing), Section 4.3.4
-  //           (width degrade), Section 8.3.1 (stall gating).
+  // Spec ref: 4.1.x (byte/valid framing), 4.3.4 (width degrade),
+  //           8.3.1 (stall gating).
   // -------------------------------------------------------------------------
   always_comb begin
     // FDI -> RDI

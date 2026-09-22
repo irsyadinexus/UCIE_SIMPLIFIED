@@ -168,10 +168,13 @@ module scrambler #(
   //         (UCIe 1.0 spec 4.4.1, shift-right convention.)
   assign lfsr_d       = {fb, lfsr_q[LFSR_W-1:1]};
 
-  // data_scrambled_q: XOR of the raw data bit with the LFSR output (bit 0).
-  //                   This is the core scrambling operation (spec 4.4.1).
-  //                   The same XOR serves as both scrambler (TX) and
-  //                   descrambler (RX) since XOR is self-inverse.
+  // data_scrambled_q: core scrambling operation - the raw data bit XORed
+  // with the LFSR output bit (bit 0).
+  //
+  // The identical XOR serves as both scrambler on TX and descrambler on RX,
+  // because XOR is self-inverse: applying it twice returns the original
+  // bit. One instance therefore covers both directions of a lane.
+  // ref: spec 4.4.1 (data scrambling).
   assign data_scrambled_q = data_in ^ lfsr_q[0];
 
   // -----------------------------------------------------------------------

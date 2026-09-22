@@ -139,12 +139,9 @@ module adapter_regfile (
   //   [12:11] Clock phase setting.
   //   [17:13] Module ID.
   //   [19:18] Lane map 0/1.
-  //
   // reg_el_param2 (offset 0x28) is reserved expansion, reset to zero.
-  //
   // Both registers are RW via sideband CfgWr. The address decode selects
   // which register receives the write data.
-  //
   // Spec ref: UCIe 1.0, Section 7.7 - Electrical Parameter registers.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
@@ -265,11 +262,9 @@ module adapter_regfile (
   // transactions. When csr_rd is asserted, the register addressed by
   // csr_addr is selected and driven onto csr_rdata one cycle later
   // (registered output). csr_rdata_vld qualifies the read data.
-  //
   // The one-cycle read latency matches the sideband protocol's expected
   // CfgRd completion timing: the adapter_sb_if transmits the completion
   // packet on the cycle after csr_rdata_vld is asserted.
-  //
   // Address decode:
   //   0x00 -> reg_link_ctrl     (UCIe Link Control)
   //   0x08 -> reg_link_stat     (UCIe Link Status)
@@ -278,7 +273,6 @@ module adapter_regfile (
   //   0x20 -> reg_el_param      (Electrical Parameters)
   //   0x28 -> reg_el_param2     (Electrical Parameters 2)
   //   other -> 64'h0            (default / unmapped)
-  //
   // Spec ref: UCIe 1.0, Section 7.1 - CSR read access.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin

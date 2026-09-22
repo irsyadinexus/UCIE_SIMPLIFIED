@@ -234,33 +234,22 @@ module fdi_state_machine (
   // -------------------------------------------------------------------------
   // always_comb: FDI Output Drivers and State-Request Forwarding
   //
-  // Single combinational driver for every FDI output port. This ensures
-  // there are no multi-driver conflicts and makes the mapping from RDI
-  // indications to FDI outputs explicit:
+  // Single combinational driver for every FDI output port, so there are no
+  // multi-driver conflicts and the RDI -> FDI mapping is explicit:
   //
-  //   pl_protocol         = PROTO_STREAMING (111b) - Streaming only.
-  //   pl_protocol_flitfmt = FMT_RAW (0001b) - Format 1, Raw Mode.
-  //   pl_stream           = pass-through of lp_stream from Protocol Layer.
-  //   pl_error            = 1'b0 - not autonomously generated.
-  //   pl_cerror           = forwarded from rdi_cerror.
-  //   pl_nferror          = forwarded from rdi_nferror.
-  //   pl_trainerror       = forwarded from rdi_trainerror.
-  //   pl_phyinrecenter    = forwarded from rdi_phyinrecenter.
-  //   pl_state_sts        = fdi_q (the registered FDI state).
-  //   pl_inband_pres      = inband_pres_q (sticky registered flag).
-  //   pl_rx_active_req    = asserted when rdi_state_sts == ACTIVE, per
-  //                         spec 8.2.6 (first arm of four-way handshake);
-  //                         NOT gated on F_ACTIVE to avoid deadlock.
+  //   pl_protocol=PROTO_STREAMING  pl_protocol_flitfmt=FMT_RAW (Format 1)
+  //   pl_stream=lp_stream          pl_error=1'b0 (not self-generated)
+  //   pl_cerror/pl_nferror/pl_trainerror/pl_phyinrecenter = forwarded RDI
+  //   pl_state_sts=fdi_q           pl_inband_pres=inband_pres_q (sticky)
+  //   pl_rx_active_req = (rdi_state_sts == ACTIVE); per spec 8.2.6, asserted
+  //     as the first arm of the four-way handshake and NOT gated on F_ACTIVE
+  //     to avoid deadlock.
   //
-  // State-request forwarding (fdi_state_req_out / fdi_state_req_vld):
-  //   - FDI_REQ_ACTIVE: sets fdi_active_req = 1; forwards the request
-  //     only when BOTH local_active_req AND adapter_active_req are asserted.
-  //   - LinkReset, Retrain, Disabled, L1, L2: pass through immediately
-  //     with fdi_state_req_vld = 1.
-  //   - Default (NOP or unknown): drives RDI_REQ_NOP.
-  //
-  // Spec ref: UCIe 1.0, Section 8.2 (FDI), Section 8.2.6 (Rx Active),
-  //           Section 8.1.6 step 6 (Active gating), Table 115.
+  // State-request forwarding: FDI_REQ_ACTIVE sets fdi_active_req and forwards
+  // only when local_active_req AND adapter_active_req are both asserted
+  // (spec 8.1.6 step 6); LinkReset/Retrain/Disabled/L1/L2 pass straight
+  // through with vld=1; default drives RDI_REQ_NOP.
+  // Spec ref: 8.2 (FDI), 8.2.6 (Rx Active), 8.1.6 step 6, Table 115.
   // -------------------------------------------------------------------------
   always_comb begin
     pl_protocol        = PROTO_STREAMING;
@@ -303,49 +292,22 @@ module fdi_state_machine (
   // -------------------------------------------------------------------------
   // always_comb: FDI State Transition Logic
   //
-  // Computes the next FDI state (fdi_d) based on the current registered
-  // state (fdi_q) and the RDI status (rdi_state_sts). The transition
-  // table implements the spec 8.2 FDI LSM, simplified for Streaming-only
-  // operation:
-  //
-  //   F_RESET:
-  //     The four-way handshake: Active is entered only when the RDI has
-  //     reached Active AND the Protocol Layer has acknowledged Rx-active
-  //     (lp_rx_active_sts). LinkError and Disabled take priority.
-  //
-  //   F_ACTIVE:
-  //     From Active, any RDI state change triggers a corresponding FDI
-  //     transition. PMNAK is reported while the partner has not completed
-  //     its Active request. A catch-all for non-Active falls back to RESET.
-  //
-  //   F_PMNAK:
-  //     Returns to Active when the RDI reaches Active. Can also transition
-  //     to LinkReset, LinkError, or Disabled.
-  //
-  //   F_L1 / F_L2:
-  //     Power-management low-power states. L1 exits via Retrain, LinkReset,
-  //     Active, or LinkError. L2 exits via Retrain, LinkReset, or LinkError
-  //     (no direct return to Active from L2).
-  //
-  //   F_LINKRESET:
-  //     Exits to Reset when the RDI returns to Reset, to Active if the RDI
-  //     reaches Active, or to LinkError.
-  //
-  //   F_RETRAIN:
-  //     Re-enters the bring-up path: the LTSM returns through Reset on the
-  //     way back to SBINIT, then reports Active when training completes.
-  //
-  //   F_LINKERROR:
-  //     Exits only through Reset (spec 8.1.5 Exit-Link-Error) or LinkReset.
-  //
-  //   F_DISABLED:
-  //     Exits to Reset or LinkReset only.
-  //
-  //   default:
-  //     Any unrecognised state value falls back to F_RESET (defensive).
-  //
-  // Spec ref: UCIe 1.0, Section 8.2 - FDI LSM state transitions,
-  //           Section 8.1.5 - Exit-Link-Error.
+  // Computes next FDI state (fdi_d) from fdi_q and rdi_state_sts, per the
+  // spec 8.2 FDI LSM (Streaming-only simplification):
+  //   F_RESET    -> Active needs RDI Active AND lp_rx_active_sts (the second
+  //                 arm of the four-way handshake); LinkError/Disabled win.
+  //   F_ACTIVE   -> mirrors any RDI change; PMNAK while the partner has not
+  //                 finished its own Active request; unknown -> RESET.
+  //   F_PMNAK    -> Active when RDI Active; else LinkReset/LinkError/Disabled.
+  //   F_L1/F_L2  -> L1 exits to Retrain/LinkReset/Active/LinkError; L2 lacks a
+  //                 direct return to Active (spec 8.2 low-power behaviour).
+  //   F_LINKRESET-> Reset / Active / LinkError.
+  //   F_RETRAIN  -> re-enters bring-up: LTSM passes Reset to SBINIT, reports
+  //                 Active once training completes.
+  //   F_LINKERROR-> only Reset (Exit-Link-Error) or LinkReset.
+  //   F_DISABLED -> only Reset or LinkReset.
+  //   default    -> F_RESET (defensive).
+  // Spec ref: 8.2 (FDI LSM transitions), 8.1.5 (Exit-Link-Error).
   // -------------------------------------------------------------------------
   always_comb begin
     case (fdi_q)

@@ -134,34 +134,21 @@ module ucie_timer #(
   // -----------------------------------------------------------------------
   // Main Expiry Counter and Expired Flag (always_ff)
   // -----------------------------------------------------------------------
-  // This is the core timer logic implementing the spec-compliant interval.
-  // The counter counts from 0 up to LIMIT_CYCLES − 1 on each tick, then
-  // saturates (does not wrap) and asserts the `expired` flag for exactly
-  // one cycle.
+  // Core timer logic. Counts 0 -> LIMIT_CYCLES-1 on each tick, then
+  // saturates (no wrap) and pulses `expired` for exactly one cycle.
   //
-  // State transitions:
-  //   1. Asynchronous reset (reset_n = 0):
-  //      Counter and expired are cleared.  This is the power-on state.
+  //   reset_n=0 -> clear counter and expired (power-on state).
+  //   start=1   -> clear both; begins a new interval. Asserted by the LTSM
+  //                on entry to each training sub-state.
+  //   running=0 -> expired cleared, counter HOLDS. Per spec 4.5.3 "Stall
+  //                resets the requester timer": the LTSM re-asserts start
+  //                on the next entry to reload explicitly.
+  //   running & tick, cnt_q == LIMIT-1 -> saturate, assert expired.
+  //   running & tick, otherwise        -> increment, clear expired.
+  //   running & no tick (DIV>1 only)   -> expired cleared, counter holds.
   //
-  //   2. Synchronous start (start = 1):
-  //      Counter and expired are cleared.  This begins a new interval and
-  //      is asserted by the LTSM on entry to each training sub-state.
-  //
-  //   3. Running deasserted (running = 0):
-  //      Expired is cleared but the counter holds its value.
-  //      Per spec 4.5.3: "Stall resets the requester timer."  Holding the
-  //      count while inactive implements this: the LTSM will re-assert
-  //      start on the next entry, explicitly reloading the counter.
-  //
-  //   4. Running asserted + tick:
-  //      a. If cnt_q == LIMIT_CYCLES − 1 : saturate counter, assert expired.
-  //      b. Otherwise                    : increment counter, clear expired.
-  //
-  //   5. Running asserted + no tick (DIV > 1 only):
-  //      Expired is cleared; counter holds.
-  //
-  // The saturating behaviour ensures expired is a clean one-shot pulse
-  // that does not re-fire on subsequent cycles.
+  // Saturating makes `expired` a clean one-shot that cannot re-fire.
+  // ref: spec 4.5.3 (timer reset on stall).
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
       cnt_q    <= '0;

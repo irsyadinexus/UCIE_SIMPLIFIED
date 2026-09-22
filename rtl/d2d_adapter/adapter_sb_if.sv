@@ -260,7 +260,6 @@ module adapter_sb_if (
   //   When lp_cfg_vld is deasserted:
   //     - rx_pkt_vld is cleared. rx_hdr_q and rx_ui_q hold their values,
   //       preserving partial packet state across idle gaps.
-  //
   // Spec ref: UCIe 1.0, Section 4.5.x - sideband UI framing.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
@@ -420,15 +419,12 @@ module adapter_sb_if (
   //     number of credits (1-4) to add to crd_fdi_q. These credits allow
   //     the Protocol Layer to send additional sideband packets to the
   //     Adapter.
-  //
   //   crd_remote_q (remote credit loop):
   //     Decremented when a received packet has the Cr (credit return) bit
   //     set, indicating the remote die has consumed a credit and is
   //     returning it. The decrement is guarded (crd_remote_q > 0) to
   //     prevent underflow.
-  //
   // On reset, both counters are cleared to zero (no credits available).
-  //
   // Spec ref: UCIe 1.0, Section 6.1.3 - sideband credit model,
   //           max SB_CRD_MAX (4) outstanding remote credits.
   // -------------------------------------------------------------------------
@@ -480,9 +476,7 @@ module adapter_sb_if (
   //
   // All decoded messages must have opcode SB_OP_MSG_NODATA (message without
   // data payload) per Table 47.
-  //
   // On reset, adapter_active_req is cleared (no partner request pending).
-  //
   // Spec ref: UCIe 1.0, Tables 53-56 (message codes), Section 8.1.6 step 6.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
@@ -532,20 +526,15 @@ module adapter_sb_if (
   //     outstanding remote credits (crd_remote_q != 0) AND no credit-return
   //     packet has just arrived (!(rx_pkt_vld && rx_cr)). A credit return
   //     restarts the timeout.
-  //
   //   msg_timer_run: the timer runs as long as there are outstanding credits.
   //     When crd_remote_q drops to 0, the timer stops.
-  //
   //   stall_timer_start: the stall keep-alive timer starts when the message
   //     timeout expires (msg_timer_expired == 1).
-  //
   //   stall_timer_run: runs while there are outstanding credits AND the
   //     message timeout has not expired yet. Once the message timeout fires,
   //     the stall timer takes over.
-  //
   //   sb_msg_timeout: asserted when the 8 ms message timeout expires.
   //   sb_stall_sent:  asserted when the 4 ms stall keep-alive expires.
-  //
   // Spec ref: UCIe 1.0, Section 6.2 (8 ms timeout), Section 6.3 (4 ms stall).
   // -------------------------------------------------------------------------
   always_comb begin
@@ -579,7 +568,6 @@ module adapter_sb_if (
   // These are implemented as continuous assigns rather than inside an
   // always_* process because Icarus Verilog 12 does not evaluate constant
   // part-selects correctly inside always_* blocks.
-  //
   // Spec ref: UCIe 1.0, Section 4.5.x - sideband CfgRd/CfgWr encoding.
   // -------------------------------------------------------------------------
   assign csr_addr  = rx_hdr_q[26:0];
@@ -588,29 +576,19 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   // always_comb: CSR Read/Write Decode and Transmit Control
   //
-  // Decodes received sideband packets addressed to the Adapter (dstid ==
-  // SRCID_ADAPT, i.e. 3'b001) and classifies them as CfgWr or CfgRd:
+  // Decodes received packets addressed to the Adapter (dstid == SRCID_ADAPT)
+  // and classifies them:
+  //   csr_wr - CfgWr (5'b00001) or CfgWr-with-data (5'b00101): writes the
+  //            addressed CSR.
+  //   csr_rd - CfgRd (5'b00100) or CfgRd-with-type (5'b01100): starts a read.
+  //   tx_send - asserted when a CfgRd is outstanding AND the register file
+  //             has returned csr_rdata_vld; triggers the serialiser to send
+  //             the completion packet.
+  //   tx_hdr  - the 64-bit completion header: csr_rdata in the payload plus
+  //             a fixed completion opcode and routing (dstid SRCID_ADAPT).
+  //             Simplified encoding: one 64-bit header, read data embedded.
   //
-  //   csr_wr: asserted when rx_pkt_vld is high, dstid matches SRCID_ADAPT,
-  //           and the opcode is either 5'b00001 (CfgWr) or 5'b00101
-  //           (CfgWr with data). Both opcodes write to the addressed CSR.
-  //
-  //   csr_rd: asserted when rx_pkt_vld is high, dstid matches SRCID_ADAPT,
-  //           and the opcode is either 5'b00100 (CfgRd) or 5'b01100
-  //           (CfgRd with type). Both opcodes initiate a CSR read.
-  //
-  //   tx_send: asserted when a CfgRd has been issued AND the register file
-  //            has returned valid read data (csr_rdata_vld). This triggers
-  //            the transmit serialiser to send a completion packet.
-  //
-  //   tx_hdr: the 64-bit completion header, constructed from:
-  //           - csr_rdata (read data, upper 64 bits of the header payload).
-  //           - A fixed completion opcode and routing fields.
-  //           In this simplified encoding, the completion is a single
-  //           64-bit header with the read data embedded.
-  //
-  // Spec ref: UCIe 1.0, Table 47 (opcodes), Table 49 (srcid/dstid),
-  //           Section 4.5.x (CfgRd/CfgWr completion format).
+  // Spec ref: Table 47 (opcodes), Table 49 (srcid/dstid), 4.5.x (completion).
   // -------------------------------------------------------------------------
   always_comb begin
     csr_wr    = rx_pkt_vld && (rx_dstid == SRCID_ADAPT) &&

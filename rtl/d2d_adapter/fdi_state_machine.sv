@@ -1,8 +1,95 @@
-// UCIe 1.0 Simplified Endpoint - FDI state machine
-// Spec 8.2 / Table 115. FDI sits between the Protocol Layer and the D2D Adapter.
-// Streaming only: pl_protocol = 111b, pl_protocol_flitfmt = 0001b (Format 1 Raw).
-// The link management handshake mirrors the RDI sequence but uses
-// pl_rx_active_req / lp_rx_active_sts.
+// ============================================================================
+// Module    : fdi_state_machine
+// Project   : UCIe 1.0 Simplified Endpoint
+// File      : rtl/d2d_adapter/fdi_state_machine.sv
+// ----------------------------------------------------------------------------
+//
+// SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 8.2 - Fdie-to-Die Interface (FDI)
+//   UCIe 1.0 Specification, Section 8.2.6 - Rx Active Handshake
+//   UCIe 1.0 Specification, Section 8.1.6 Step 6 - Active Entry Gating
+//   UCIe 1.0 Specification, Table 115 - FDI Signal List
+//   UCIe 1.0 Specification, Table 114 - RDI Signal List (state encodings)
+//
+// DESCRIPTION
+//   FDI Link Sub-state Machine (FDI LSM). This module sits between the
+//   Protocol Layer (above, Table 115 signals) and the RDI status signals
+//   from the Logical PHY (below, Table 114). Its responsibilities:
+//
+//     1. Track the FDI link state in a registered state variable (fdi_q)
+//        that mirrors the RDI state transitions reported by rdi_state_sts.
+//        The FDI state space reuses the same 4-bit encoding as the RDI:
+//          F_RESET(0), F_ACTIVE(1), F_PMNAK(3), F_L1(4), F_L2(8),
+//          F_LINKRESET(9), F_LINKERROR(A), F_RETRAIN(B), F_DISABLED(C).
+//
+//     2. Implement the four-way Active handshake (spec 8.2.6):
+//        - The Protocol Layer asserts lp_state_req == FDI_REQ_ACTIVE.
+//        - The Protocol Layer asserts lp_rx_active_sts.
+//        - The RDI status reaches RDI_STS_ACTIVE.
+//        - Only then does the FDI report F_ACTIVE on pl_state_sts.
+//        pl_rx_active_req is asserted as soon as rdi_state_sts == ACTIVE,
+//        NOT gated on F_ACTIVE, to avoid a deadlock where the Protocol
+//        Layer waits for pl_rx_active_req before asserting lp_rx_active_sts.
+//
+//     3. Forward the Protocol Layer's state request to the RDI via
+//        fdi_state_req_out, after applying the Active gating. Non-Active
+//        requests (LinkReset, Retrain, L1, L2, Disabled) pass through
+//        unconditionally.
+//
+//     4. Drive all FDI status and indication outputs to the Protocol Layer:
+//        pl_state_sts, pl_inband_pres, pl_error, pl_cerror, pl_nferror,
+//        pl_trainerror, pl_phyinrecenter, pl_protocol, pl_protocol_flitfmt,
+//        pl_rx_active_req, pl_stream.
+//
+//   This module operates in Streaming-only mode:
+//     pl_protocol       = 111b (PROTO_STREAMING)
+//     pl_protocol_flitfmt = 0001b (FMT_RAW, Format 1 Raw Mode)
+//
+//   The LTSM (Link Training and Status Machine) is NOT in this module;
+//   it lives in logical_phy. This module observes LTSM results only
+//   through the RDI status signals.
+//
+// STATE TRANSITION TABLE (spec 8.2, simplified)
+//   Current State  | Condition on rdi_state_sts       | Next State
+//   ---------------+----------------------------------+------------
+//   F_RESET        | LINKERROR                        | F_LINKERROR
+//   F_RESET        | DISABLED                         | F_DISABLED
+//   F_RESET        | ACTIVE && lp_rx_active_sts       | F_ACTIVE
+//   F_ACTIVE       | PMNAK                            | F_PMNAK
+//   F_ACTIVE       | LINKRESET                        | F_LINKRESET
+//   F_ACTIVE       | RETRAIN                          | F_RETRAIN
+//   F_ACTIVE       | L1                               | F_L1
+//   F_ACTIVE       | L2                               | F_L2
+//   F_ACTIVE       | LINKERROR                        | F_LINKERROR
+//   F_ACTIVE       | DISABLED                         | F_DISABLED
+//   F_ACTIVE       | != ACTIVE (catch-all)            | F_RESET
+//   F_PMNAK        | ACTIVE                           | F_ACTIVE
+//   F_PMNAK        | LINKRESET / LINKERROR / DISABLED | respective
+//   F_L1           | RETRAIN / LINKRESET / ACTIVE /   | respective
+//                  | LINKERROR                        |
+//   F_L2           | RETRAIN / LINKRESET / LINKERROR  | respective
+//   F_LINKRESET    | RESET / ACTIVE / LINKERROR       | respective
+//   F_RETRAIN      | RESET / ACTIVE / LINKERROR       | respective
+//   F_LINKERROR    | RESET / LINKRESET                | respective
+//   F_DISABLED     | RESET / LINKRESET                | respective
+//
+// PORTS
+//   See Table 115 for the FDI port definitions. RDI-side inputs are named
+//   rdi_* and carry the Logical PHY's status. Adapter-internal ports
+//   (adapter_active_req, adapter_state_req_vld, adapter_state_req,
+//   fdi_active_req, fdi_state_req_out, fdi_state_req_vld) connect to
+//   d2d_adapter and adapter_sb_if for the Active handshake coordination.
+//
+// CLOCK / RESET
+//   lclk      - Main link clock (1 GHz).
+//   lreset_n  - Active-low asynchronous reset.
+//
+// REVISION HISTORY
+//   v0.0.1  2025-08-15  Initial creation - first commit to git.
+//
+// LICENSE
+//   SPDX-License-Identifier: Apache-2.0
+// ============================================================================
 `ifndef FdiStateMachine_SV
 `define FdiStateMachine_SV
 `include "ucie_pkg.sv"
@@ -46,7 +133,14 @@ module fdi_state_machine (
 
   import ucie_pkg::*;
 
-  // FDI LSM states (mirrors the RDI state space).
+  // --------------------------------------------------------------------------
+  // FDI LSM State Encoding
+  // --------------------------------------------------------------------------
+  // The FDI state encodings mirror the RDI state space (Table 114/115) so that
+  // a simple equality comparison between the FDI and RDI states is meaningful.
+  // Each state is a 4-bit value matching the pl_state_sts / lp_state_req
+  // encoding defined in the UCIe 1.0 specification.
+  // --------------------------------------------------------------------------
   typedef enum logic [3:0] {
     F_RESET    = 4'h0,
     F_ACTIVE   = 4'h1,
@@ -64,7 +158,20 @@ module fdi_state_machine (
   logic       local_active_req;   // Protocol Layer asked for Active
   logic       pl_inband_pres_d;
 
-  // ---------------------------------------------------------------- state
+  // -------------------------------------------------------------------------
+  // always_ff: FDI State Register and In-Band Presence Register
+  //
+  // On every rising edge of lclk (or asynchronous reset), this block
+  // advances the FDI LSM state from fdi_d (combinationally computed in the
+  // "transitions" always_comb below) into the registered state fdi_q.
+  // Simultaneously, the in-band presence flag inband_pres_q is updated
+  // from pl_inband_pres_d (computed in its own always_comb).
+  //
+  // On reset, the FDI starts in F_RESET with in-band presence deasserted,
+  // per spec 8.2 initial conditions.
+  //
+  // Spec ref: UCIe 1.0, Section 8.2 - FDI initial state.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       fdi_q         <= F_RESET;
@@ -75,7 +182,22 @@ module fdi_state_machine (
     end
   end
 
-  // Protocol Layer Active request latch.
+  // -------------------------------------------------------------------------
+  // always_ff: Protocol Layer Active Request Latch
+  //
+  // Captures and holds the fact that the Protocol Layer has requested Active
+  // and has acknowledged the Rx-active handshake (lp_rx_active_sts == 1).
+  // The latch sets when both conditions are true and clears when the FDI
+  // enters F_RESET or F_LINKRESET, which invalidates any prior Active
+  // agreement.
+  //
+  // This registered flag is used in the outputs always_comb to gate the
+  // fdi_state_req_vld for Active: the Active request is only forwarded to
+  // the RDI when both local_active_req (this latch) AND adapter_active_req
+  // (partner's request, from adapter_sb_if) are asserted.
+  //
+  // Spec ref: UCIe 1.0, Section 8.1.6 step 6 (four-way Active handshake).
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       local_active_req <= 1'b0;
@@ -86,7 +208,21 @@ module fdi_state_machine (
     end
   end
 
-  // in-band presence is sticky 1 until Reset/LinkError/Disable.
+  // -------------------------------------------------------------------------
+  // always_comb: In-Band Presence Next-State Logic
+  //
+  // In-band presence (pl_inband_pres) is a sticky-high flag per spec 8.2:
+  //   - It sets to 1 when the RDI reports rdi_inband_pres (the PHY has
+  //     detected in-band signalling from the remote die).
+  //   - It clears to 0 when the FDI enters F_RESET, F_LINKERROR, or
+  //     F_DISABLED (these states invalidate any prior presence detection).
+  //   - Otherwise, it holds its current registered value (sticky).
+  //
+  // The computed pl_inband_pres_d is registered into inband_pres_q in the
+  // state register always_ff above.
+  //
+  // Spec ref: UCIe 1.0, Section 8.2 - pl_inband_pres behaviour.
+  // -------------------------------------------------------------------------
   always_comb begin
     if (rdi_inband_pres)               pl_inband_pres_d = 1'b1;
     else if (fdi_q == F_RESET ||
@@ -95,11 +231,37 @@ module fdi_state_machine (
     else                               pl_inband_pres_d = inband_pres_q;
   end
 
-  // ---------------------------------------------------------------- outputs
-  // Single driver for every output. The Rx-active request is asserted as soon as
-  // the RDI reaches Active, not after FDI does: spec 8.2.6 makes this the first
-  // arm of the four-way handshake, and gating it on F_ACTIVE would deadlock
-  // against a Protocol Layer that waits for pl_rx_active_req before answering.
+  // -------------------------------------------------------------------------
+  // always_comb: FDI Output Drivers and State-Request Forwarding
+  //
+  // Single combinational driver for every FDI output port. This ensures
+  // there are no multi-driver conflicts and makes the mapping from RDI
+  // indications to FDI outputs explicit:
+  //
+  //   pl_protocol         = PROTO_STREAMING (111b) - Streaming only.
+  //   pl_protocol_flitfmt = FMT_RAW (0001b) - Format 1, Raw Mode.
+  //   pl_stream           = pass-through of lp_stream from Protocol Layer.
+  //   pl_error            = 1'b0 - not autonomously generated.
+  //   pl_cerror           = forwarded from rdi_cerror.
+  //   pl_nferror          = forwarded from rdi_nferror.
+  //   pl_trainerror       = forwarded from rdi_trainerror.
+  //   pl_phyinrecenter    = forwarded from rdi_phyinrecenter.
+  //   pl_state_sts        = fdi_q (the registered FDI state).
+  //   pl_inband_pres      = inband_pres_q (sticky registered flag).
+  //   pl_rx_active_req    = asserted when rdi_state_sts == ACTIVE, per
+  //                         spec 8.2.6 (first arm of four-way handshake);
+  //                         NOT gated on F_ACTIVE to avoid deadlock.
+  //
+  // State-request forwarding (fdi_state_req_out / fdi_state_req_vld):
+  //   - FDI_REQ_ACTIVE: sets fdi_active_req = 1; forwards the request
+  //     only when BOTH local_active_req AND adapter_active_req are asserted.
+  //   - LinkReset, Retrain, Disabled, L1, L2: pass through immediately
+  //     with fdi_state_req_vld = 1.
+  //   - Default (NOP or unknown): drives RDI_REQ_NOP.
+  //
+  // Spec ref: UCIe 1.0, Section 8.2 (FDI), Section 8.2.6 (Rx Active),
+  //           Section 8.1.6 step 6 (Active gating), Table 115.
+  // -------------------------------------------------------------------------
   always_comb begin
     pl_protocol        = PROTO_STREAMING;
     pl_protocol_flitfmt = FMT_RAW;
@@ -138,7 +300,53 @@ module fdi_state_machine (
     endcase
   end
 
-  // ---------------------------------------------------------------- transitions
+  // -------------------------------------------------------------------------
+  // always_comb: FDI State Transition Logic
+  //
+  // Computes the next FDI state (fdi_d) based on the current registered
+  // state (fdi_q) and the RDI status (rdi_state_sts). The transition
+  // table implements the spec 8.2 FDI LSM, simplified for Streaming-only
+  // operation:
+  //
+  //   F_RESET:
+  //     The four-way handshake: Active is entered only when the RDI has
+  //     reached Active AND the Protocol Layer has acknowledged Rx-active
+  //     (lp_rx_active_sts). LinkError and Disabled take priority.
+  //
+  //   F_ACTIVE:
+  //     From Active, any RDI state change triggers a corresponding FDI
+  //     transition. PMNAK is reported while the partner has not completed
+  //     its Active request. A catch-all for non-Active falls back to RESET.
+  //
+  //   F_PMNAK:
+  //     Returns to Active when the RDI reaches Active. Can also transition
+  //     to LinkReset, LinkError, or Disabled.
+  //
+  //   F_L1 / F_L2:
+  //     Power-management low-power states. L1 exits via Retrain, LinkReset,
+  //     Active, or LinkError. L2 exits via Retrain, LinkReset, or LinkError
+  //     (no direct return to Active from L2).
+  //
+  //   F_LINKRESET:
+  //     Exits to Reset when the RDI returns to Reset, to Active if the RDI
+  //     reaches Active, or to LinkError.
+  //
+  //   F_RETRAIN:
+  //     Re-enters the bring-up path: the LTSM returns through Reset on the
+  //     way back to SBINIT, then reports Active when training completes.
+  //
+  //   F_LINKERROR:
+  //     Exits only through Reset (spec 8.1.5 Exit-Link-Error) or LinkReset.
+  //
+  //   F_DISABLED:
+  //     Exits to Reset or LinkReset only.
+  //
+  //   default:
+  //     Any unrecognised state value falls back to F_RESET (defensive).
+  //
+  // Spec ref: UCIe 1.0, Section 8.2 - FDI LSM state transitions,
+  //           Section 8.1.5 - Exit-Link-Error.
+  // -------------------------------------------------------------------------
   always_comb begin
     case (fdi_q)
       F_RESET: begin

@@ -1,7 +1,67 @@
-// UCIe 1.0 Simplified Endpoint - adapter register file
-// UCIe Link Control, UCIe Link Status, Error Log 0/1, Electrical Parameter CSRs.
-// Per spec 7.1: configuration register access via sideband is supported, but no
-// analog/AFE circuits are implemented - parameters exist as CSR fields only.
+// ============================================================================
+// Module    : adapter_regfile
+// Project   : UCIe 1.0 Simplified Endpoint
+// File      : rtl/d2d_adapter/adapter_regfile.sv
+// ----------------------------------------------------------------------------
+//
+// SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 7.1 - Configuration Register Overview
+//   UCIe 1.0 Specification, Section 7.3 - UCIe Link Control Register
+//   UCIe 1.0 Specification, Section 7.4 - UCIe Link Status Register
+//   UCIe 1.0 Specification, Section 7.5 - Error Log 0 Register
+//   UCIe 1.0 Specification, Section 7.6 - Error Log 1 Register
+//   UCIe 1.0 Specification, Section 7.7 - Electrical Parameter Registers
+//   UCIe 1.0 Specification, Table 114 - RDI state encodings (rdi_state_sts)
+//
+// DESCRIPTION
+//   Adapter CSR (Configuration / Status Register) file. Contains six 64-bit
+//   registers at byte offsets within the Adapter CSR address space:
+//
+//   Offset  Register           Access  Description
+//   ------  -----------------  ------  ----------------------------------------
+//   0x00    UCIe Link Control  RW      Bit 0: start link training. Set by SW
+//                                       write or by the start_link_train_wr
+//                                       hardware trigger.
+//   0x08    UCIe Link Status   RO/HW   [0]   in-band presence (from RDI).
+//                                       [4:1] RDI state status.
+//                                       [6:5] link width (hardcoded 10b = x16).
+//   0x10    Error Log 0        RO/HW   [7:0] LTSM State N (current training
+//                                       sub-state reported by logical_phy).
+//                                       [63:8] reserved for local error bits.
+//   0x18    Error Log 1        RW1C    [8] trainerror sticky, [9] phyinrecenter
+//                                       sticky. Writing all-zeros clears
+//                                       (RW1C behaviour on sideband CfgWr).
+//   0x20    Electrical Params  RW      [3:0] max IO link speed (reset 0001b =
+//                                       4 GT/s only), [8:4] voltage swing,
+//                                       [9] clock mode, [12:11] clock phase,
+//                                       [17:13] module id, [19:18] lane map.
+//                                       CSR fields only - no analog/AFE.
+//   0x28    Electrical Params2 RW      Reserved expansion.
+//
+//   The register file is accessed via the CSR bus from adapter_sb_if:
+//     csr_wr / csr_addr / csr_wdata -> write path
+//     csr_rd / csr_addr -> read path -> csr_rdata / csr_rdata_vld
+//
+//   Hardware-write inputs (start_link_train_wr, in_band_pres, rdi_state_sts,
+//   ltsm_state, trainerror, phyinrecenter) come from the adapter and PHY
+//   status signals. Software-read outputs (start_link_train, link_status_active)
+//   are decoded from the register contents.
+//
+//   Per spec 7.1: configuration register access via sideband is supported,
+//   but no analog/AFE circuits are implemented in this simplified endpoint.
+//   Electrical parameters exist as CSR fields only.
+//
+// CLOCK / RESET
+//   lclk      - Main link clock (1 GHz).
+//   lreset_n  - Active-low asynchronous reset. All registers are cleared
+//               to their reset values.
+//
+// REVISION HISTORY
+//   v0.0.1  2025-08-15  Initial creation - first commit to git.
+//
+// LICENSE
+//   SPDX-License-Identifier: Apache-2.0
+// ============================================================================
 `ifndef AdapterRegfile_SV
 `define AdapterRegfile_SV
 `include "ucie_pkg.sv"
@@ -33,7 +93,16 @@ module adapter_regfile (
 
   import ucie_pkg::*;
 
-  // --- register offsets (byte offsets within the Adapter CSR block) ---------
+  // --------------------------------------------------------------------------
+  // Register Offset Definitions
+  // --------------------------------------------------------------------------
+  // Byte offsets within the Adapter CSR block. The sideband interface
+  // (adapter_sb_if) decodes the 27-bit address and compares against these
+  // values to select the target register. Each register is 64 bits wide
+  // (8-byte aligned), matching the sideband CfgRd/CfgWr data width.
+  //
+  // Spec ref: UCIe 1.0, Section 7.1 - register map layout.
+  // --------------------------------------------------------------------------
   localparam logic [26:0] A_LINK_CTRL  = 27'h0;
   localparam logic [26:0] A_LINK_STAT  = 27'h8;
   localparam logic [26:0] A_ERR_LOG0   = 27'h10;
@@ -41,7 +110,13 @@ module adapter_regfile (
   localparam logic [26:0] A_EL_PARAM   = 27'h20;   // electrical parameters
   localparam logic [26:0] A_EL_PARAM2  = 27'h28;
 
-  // Error Log 0 bits [7:0] = State N; the high bits are for local errors.
+  // --------------------------------------------------------------------------
+  // Register Storage
+  // --------------------------------------------------------------------------
+  // Six 64-bit registers. Each is maintained by its own always_ff block
+  // below. Error Log 0 bits [7:0] hold the LTSM State N value; the high
+  // bits are reserved for local error indications.
+  // --------------------------------------------------------------------------
   logic [63:0] reg_link_ctrl;
   logic [63:0] reg_link_stat;
   logic [63:0] reg_err_log0;
@@ -49,9 +124,29 @@ module adapter_regfile (
   logic [63:0] reg_el_param;
   logic [63:0] reg_el_param2;
 
-  // Electrical parameters, CSR fields only (no analog).
-  // [3:0] max IO link speed, [8:4] voltage swing, [9] clock mode,
-  // [12:11] clock phase, [17:13] module id, [19:18] lane map 0/1
+  // -------------------------------------------------------------------------
+  // always_ff: Electrical Parameter Registers (0x20, 0x28)
+  //
+  // These registers hold the electrical parameter CSR fields. Since no
+  // analog/AFE circuits are implemented in this simplified endpoint, the
+  // fields exist as software-programmable values only.
+  //
+  // Field map for reg_el_param (offset 0x20):
+  //   [3:0]   Max IO link speed (reset value 0xF = all speeds indicated,
+  //           but only 4 GT/s is functionally supported).
+  //   [8:4]   Voltage swing setting.
+  //   [9]     Clock mode (0 = strobe, 1 = clock).
+  //   [12:11] Clock phase setting.
+  //   [17:13] Module ID.
+  //   [19:18] Lane map 0/1.
+  //
+  // reg_el_param2 (offset 0x28) is reserved expansion, reset to zero.
+  //
+  // Both registers are RW via sideband CfgWr. The address decode selects
+  // which register receives the write data.
+  //
+  // Spec ref: UCIe 1.0, Section 7.7 - Electrical Parameter registers.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       reg_el_param  <= 64'h0000_0000_0000_001F; // speed 4 GT/s only (0001b)
@@ -63,7 +158,25 @@ module adapter_regfile (
     end
   end
 
-  // Error Log 0: State N in [7:0]. [63:8] hold local error indications.
+  // -------------------------------------------------------------------------
+  // always_ff: Error Log Registers (0x10, 0x18)
+  //
+  // Error Log 0 (offset 0x10):
+  //   [7:0]  LTSM State N - continuously updated from the ltsm_state input,
+  //          reflecting the current link-training sub-state. This is a
+  //          hardware-write-only field; sideband writes do not modify it.
+  //   [63:8] Reserved for additional local error indications.
+  //
+  // Error Log 1 (offset 0x18):
+  //   [8]    trainerror sticky bit - set by the trainerror hardware input
+  //          when the PHY reports a training error. The bit is sticky: once
+  //          set, it remains until cleared by a sideband CfgWr (RW1C).
+  //   [9]    phyinrecenter sticky bit - set by the phyinrecenter input.
+  //   A sideband CfgWr to offset 0x18 clears the entire register to zero
+  //   (RW1C clear-all behaviour).
+  //
+  // Spec ref: UCIe 1.0, Section 7.5 (Error Log 0), Section 7.6 (Error Log 1).
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       reg_err_log0 <= 64'h0;
@@ -78,7 +191,21 @@ module adapter_regfile (
     end
   end
 
-  // Link Control: bit 0 start UCIe link training, RW.
+  // -------------------------------------------------------------------------
+  // always_ff: UCIe Link Control Register (0x00)
+  //
+  // Bit 0: Start UCIe link training. This bit can be set by:
+  //   (a) A sideband CfgWr to offset 0x00 (software-initiated training).
+  //   (b) The start_link_train_wr hardware trigger from d2d_adapter.sv
+  //       (external controller or testbench-initiated training).
+  //
+  // The entire 64-bit register is writable via sideband CfgWr. The hardware
+  // trigger only sets bit 0 without disturbing other bits. There is no
+  // auto-clear: once set, bit 0 remains high until the register is
+  // explicitly rewritten or the module is reset.
+  //
+  // Spec ref: UCIe 1.0, Section 7.3 - UCIe Link Control Register.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       reg_link_ctrl <= 64'h0;
@@ -89,7 +216,21 @@ module adapter_regfile (
     end
   end
 
-  // Link Status: bit 0 in-band presence, [3:1] PHY state, [5:4] link width.
+  // -------------------------------------------------------------------------
+  // always_ff: UCIe Link Status Register (0x08)
+  //
+  // Hardware-written status register reflecting the current link state:
+  //   [0]   in_band_pres - in-band presence detected (sticky copy from RDI
+  //         pl_inband_pres, maintained by the FDI state machine).
+  //   [4:1] rdi_state_sts - current RDI state (4-bit encoding from Table 114).
+  //   [6:5] link width - hardcoded to 2'b10 (x16) since this simplified
+  //         endpoint does not support runtime width negotiation.
+  //
+  // This register is read-only from the sideband perspective; all fields
+  // are continuously updated by hardware every clock cycle.
+  //
+  // Spec ref: UCIe 1.0, Section 7.4 - UCIe Link Status Register.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       reg_link_stat <= 64'h0;
@@ -100,9 +241,46 @@ module adapter_regfile (
     end
   end
 
+  // -------------------------------------------------------------------------
+  // assign: Decoded Outputs from Register Contents
+  //
+  // start_link_train  : reflects bit 0 of the Link Control register. Used
+  //                     by the LTSM (via d2d_adapter) to know when software
+  //                     has requested link training to begin.
+  //
+  // link_status_active: decoded comparison of the RDI state field against
+  //                     RDI_STS_ACTIVE. Provides a single-bit "link is
+  //                     active" indication for observability and for the
+  //                     d2d_adapter wrapper's link_active_obs output.
+  //
+  // Spec ref: UCIe 1.0, Section 7.3 (Link Control), Section 7.4 (Link Status).
+  // -------------------------------------------------------------------------
   assign start_link_train    = reg_link_ctrl[0];
   assign link_status_active  = (rdi_state_sts == RDI_STS_ACTIVE);
 
+  // -------------------------------------------------------------------------
+  // always_ff: CSR Read Multiplexer
+  //
+  // Implements a registered read-data multiplexer for sideband CfgRd
+  // transactions. When csr_rd is asserted, the register addressed by
+  // csr_addr is selected and driven onto csr_rdata one cycle later
+  // (registered output). csr_rdata_vld qualifies the read data.
+  //
+  // The one-cycle read latency matches the sideband protocol's expected
+  // CfgRd completion timing: the adapter_sb_if transmits the completion
+  // packet on the cycle after csr_rdata_vld is asserted.
+  //
+  // Address decode:
+  //   0x00 -> reg_link_ctrl     (UCIe Link Control)
+  //   0x08 -> reg_link_stat     (UCIe Link Status)
+  //   0x10 -> reg_err_log0      (Error Log 0)
+  //   0x18 -> reg_err_log1      (Error Log 1)
+  //   0x20 -> reg_el_param      (Electrical Parameters)
+  //   0x28 -> reg_el_param2     (Electrical Parameters 2)
+  //   other -> 64'h0            (default / unmapped)
+  //
+  // Spec ref: UCIe 1.0, Section 7.1 - CSR read access.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       csr_rdata     <= 64'h0;

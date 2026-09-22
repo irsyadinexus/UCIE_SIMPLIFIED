@@ -1,19 +1,107 @@
-// UCIe 1.0 Simplified Endpoint - RDI link state machine
-// Spec 8.1.5 (state transitions) and 8.1.6 (Active entry handshake).
+// ============================================================================
+// File        : rdi_state_machine.sv
+// Module      : rdi_state_machine
+// Project     : UCIe 1.0 Simplified Endpoint
+// Description : Raw D2D Interface (RDI) Link State Machine. Mediates between
+//               the D2D Adapter (which requests state transitions via
+//               rdi_lp_state_req) and the Logical PHY (which reports physical
+//               link events: trained, reset, retrain, error).
 //
-// The RDI LSM sits between the D2D Adapter and the Logical PHY. The adapter
-// requests a state with rdi_lp_state_req; the logical PHY acknowledges with
-// rdi_pl_state_sts. RESET/RETRAIN are entered by the physical layer itself.
+// Spec refs   : UCIe 1.0 spec section 8.1.5 (RDI state transitions,
+//               Figure 111), section 8.1.6 (Active-entry handshake),
+//               section 8.3.1 (stall handshake), Table 114 (RDI signal
+//               definitions).
 //
-// Active-entry handshake (8.1.6):
-//   1. lp_state_req = ACTIVE is held until pl_state_sts = ACTIVE.
-//   2. The local side may only declare ACTIVE after the link is trained and
-//      the partner has also reached ACTIVE.
-// To avoid a deadlock where neither end can observe the partner's ACTIVE, the
-// local ACTIVE declaration is released when the partner reports ACTIVE
-// through the sideband LinkMgmt.RDI.Req.Active message. That message is
-// produced by the adapter, so this machine only supplies the hardware
-// handshake and the `adapter_active_req` gating.
+// --------------------------------------------------------------------------
+// RDI State Transition Diagram  (spec 8.1.5 / Figure 111)
+// --------------------------------------------------------------------------
+//
+//                         phy_link_reset
+//                    +---------------------+
+//                    |                     |
+//                    v                     |
+//               +----------+              |
+//          +--->|  RESET   |              |
+//          |    |  (0h)    |              |
+//          |    +----+-----+              |
+//          |         | REQ_ACTIVE &&      |
+//          |         | phy_link_trained   |
+//          |         v                    |
+//          |    +----------+              |
+//          |    |  ACTIVE  |<---------+   |
+//          |    |  (1h)    |          |   |
+//          |    +----+-----+          |   |
+//          |         |                |   |
+//          |    +----+----+----+      |   |
+//          |    |    |    |    |      |   |
+//          |    v    v    v    v      |   |
+//          | +--++ +--+ +--+ +----+  |   |
+//          | |L1 | |L2| |LR| |RET|  |   |
+//          | |(4)| |(8)| |(9)| |(B)|  |   |
+//          | +--++ +--+ +-+-+ +-+-+  |   |
+//          |  | |   |     |     |    |   |
+//          |  +-+---+-----+-----+----+   |
+//          |   REQ_ACTIVE                |
+//          |                             |
+//          |    +----------+             |
+//          |    | LINKERROR|<--- phy_train_error (preempts all)
+//          |    |  (Ah)    |             |
+//          |    +----+-----+             |
+//          |         | REQ_LINKRESET     |
+//          |         v                   |
+//          |    +----------+             |
+//          +----|LINKRESET |-------------+
+//          |    |  (9h)    |
+//          |    +----------+
+//          |
+//          |    +----------+    +----------+
+//          |    |  PMNAK   |    | DISABLED |
+//          +----|  (3h)    |    |  (Ch)    |
+//               +----------+    +----------+
+//                (REQ_ACTIVE     (REQ_ACTIVE
+//                 exits)          exits)
+//
+// --------------------------------------------------------------------------
+// Active-entry handshake  (spec 8.1.6)
+// --------------------------------------------------------------------------
+//   1. The adapter holds lp_state_req = ACTIVE until pl_state_sts = ACTIVE.
+//   2. The local side may only declare ACTIVE after the link is trained
+//      AND the partner has also reached ACTIVE.
+//   3. To avoid a deadlock where neither end can observe the partner's
+//      ACTIVE, the local ACTIVE declaration is released when the partner
+//      reports ACTIVE through the sideband LinkMgmt.RDI.Req.Active message.
+//      That message is produced by the adapter, so this machine supplies
+//      only the hardware handshake and the adapter_active_req gating.
+//
+// --------------------------------------------------------------------------
+// Stall handshake  (spec 8.3.1)
+// --------------------------------------------------------------------------
+//   stall_ack follows stall_req combinationally. The adapter observes
+//   stallack and stops driving the interface for the stall interval.
+//
+// --------------------------------------------------------------------------
+// Priority rules  (spec 8.1.5)
+// --------------------------------------------------------------------------
+//   1. phy_train_error  -> LINKERROR   (highest priority, preempts all)
+//   2. phy_link_reset   -> RESET       (preempts adapter requests)
+//   3. Adapter request  -> per-state case (lowest priority)
+//
+// --------------------------------------------------------------------------
+// Implementation notes
+// --------------------------------------------------------------------------
+//   1. cerror, nferror, and stall_req are pass-through signals in this
+//      build; they are tied to 1'b0 at the instantiation site.
+//   2. rdi_lp_stallack is declared as unused; the stall handshake is
+//      complete at the assign level.
+//   3. The DISABLED and PMNAK states are included for completeness; they
+//      are not exercised in the current test suite.
+//
+// --------------------------------------------------------------------------
+// Revision history
+// --------------------------------------------------------------------------
+//   v0.0.1  2025-XX-XX  First commit to git. Full RDI LSM per spec 8.1.5
+//                        with Active-entry handshake and stall pass-through.
+// ============================================================================
 `ifndef RdiStateMachine_SV
 `define RdiStateMachine_SV
 `include "ucie_pkg.sv"
@@ -56,13 +144,38 @@ module rdi_state_machine (
 
   rdi_sts_t state_q, state_d;
 
+  // =========================================================================
+  // State register  (spec 8.1.5 – RDI link state)
+  // =========================================================================
+  // Single flip-flop holding the current RDI state. Asynchronous active-low
+  // reset initialises the state to RDI_STS_RESET (4'h0), matching the
+  // physical-layer RESET condition. On each rising lclk edge the next-state
+  // value computed by the always_comb block is registered.
+  // =========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) state_q <= RDI_STS_RESET;
     else           state_q <= state_d;
   end
 
-  // --------------------------------------------------------- next state
-  // Physical RESET and TRAINERROR preempt every adapter request.
+  // =========================================================================
+  // Next-state combinational logic  (spec 8.1.5 / Figure 111)
+  // =========================================================================
+  // Computes state_d based on the current state, physical-layer events, and
+  // adapter requests. The priority order is:
+  //   1. phy_train_error  -> LINKERROR   (unconditional, spec 8.1.5)
+  //   2. phy_link_reset   -> RESET       (unconditional, spec 8.1.5)
+  //   3. Per-state adapter request processing (case statement).
+  //
+  // Each case branch implements the transition arrows of Figure 111:
+  //   RESET     : REQ_ACTIVE + trained -> ACTIVE; REQ_DISABLED -> DISABLED.
+  //   ACTIVE    : REQ_L1/L2/LINKRESET/RETRAIN/DISABLED -> respective states.
+  //   L1, L2    : Only ACTIVE or LINKRESET leave low-power. Spec 8.1.5.
+  //   LINKRESET : REQ_ACTIVE + trained -> ACTIVE; REQ_DISABLED -> DISABLED.
+  //   RETRAIN   : trained + REQ_ACTIVE -> ACTIVE. Spec 8.1.5.
+  //   LINKERROR : REQ_LINKRESET -> LINKRESET. Only recovery path. Spec 8.1.5.
+  //   PMNAK     : REQ_ACTIVE + trained -> ACTIVE. Terminal otherwise.
+  //   DISABLED  : REQ_ACTIVE + trained -> ACTIVE. Terminal otherwise.
+  // =========================================================================
   always_comb begin
     state_d = state_q;
 
@@ -135,7 +248,17 @@ module rdi_state_machine (
     end
   end
 
-  // ------------------------------------------------------- outputs
+  // =========================================================================
+  // RDI output assignments  (spec 8.1 / Table 114)
+  // =========================================================================
+  // rdi_pl_state_sts    : Current state encoding, registered.   Table 114.
+  // rdi_pl_inband_pres  : Partner is present on sideband.       Table 114.
+  // rdi_pl_linkerror    : Asserted in LINKERROR state.          Table 114.
+  // rdi_pl_phyinrecenter: Asserted in RETRAIN state.            Table 114.
+  // rdi_pl_cerror       : Correctable error pass-through.       Table 114.
+  // rdi_pl_nferror      : Non-fatal error pass-through.         Table 114.
+  // rdi_pl_trainerror   : Training error from LTSM.             Table 114.
+  // =========================================================================
   assign rdi_pl_state_sts     = state_q;
   assign rdi_pl_inband_pres   = phy_inband_pres;
   assign rdi_pl_linkerror     = (state_q == RDI_STS_LINKERROR);
@@ -144,17 +267,35 @@ module rdi_state_machine (
   assign rdi_pl_nferror       = nferror;
   assign rdi_pl_trainerror    = phy_train_error;
 
-  // 8.1.6: the local side may request ACTIVE only while the adapter asks for
-  // ACTIVE and the link is trained. The partner's ACTIVE is supplied by the
-  // adapter through the LinkMgmt.RDI.Req.Active sideband message.
+  // =========================================================================
+  // Active-entry gating  (spec 8.1.6)
+  // =========================================================================
+  // The local side may request ACTIVE only when all three conditions hold:
+  //   1. The RDI state machine is in ACTIVE (state_q == RDI_STS_ACTIVE).
+  //   2. The adapter has confirmed the partner reached ACTIVE
+  //      (adapter_active_req, from the LinkMgmt.RDI.Req.Active SB message).
+  //   3. The physical link is trained (phy_link_trained from the LTSM).
+  // This three-way AND prevents deadlock per spec 8.1.6.
+  // =========================================================================
   assign local_active_req = (state_q == RDI_STS_ACTIVE) &&
                             adapter_active_req && phy_link_trained;
 
-  // Stall handshake 8.3.1: ack follows the request. The adapter observes
-  // stallack and stops driving the interface for the stall interval.
+  // =========================================================================
+  // Stall handshake  (spec 8.3.1)
+  // =========================================================================
+  // stall_ack follows stall_req combinationally. The adapter observes
+  // stallack and stops driving the interface for the stall interval. In this
+  // build stall_req is tied to 1'b0 at the instantiation site, so stall_ack
+  // is always 0.
+  // =========================================================================
   assign stall_ack = stall_req;
 
-  // Unused for now; kept for completeness of the RDI port set.
+  // =========================================================================
+  // Unused signal suppression
+  // =========================================================================
+  // rdi_lp_stallack is declared as an input but not consumed by any logic
+  // in this build. An explicit always_comb reference prevents lint warnings.
+  // =========================================================================
   logic unused_rdi;
   always_comb begin
     unused_rdi = rdi_lp_stallack;

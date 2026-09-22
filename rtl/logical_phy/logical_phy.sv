@@ -1,11 +1,124 @@
-// UCIe 1.0 Simplified Endpoint - Logical PHY integration
-// Spec section 3.1. Holds the RDI link state machine, the link training and
-// status state machine, the sideband codec, the training pattern generator,
-// the byte-to-lane mapper and the PHY CSR block.
+// ============================================================================
+// File        : logical_phy.sv
+// Module      : logical_phy
+// Project     : UCIe 1.0 Simplified Endpoint
+// Description : Hierarchical integration wrapper for the UCIe Logical PHY
+//               layer. This module is the single counterpart to the D2D
+//               Adapter at the top level and owns every block between the
+//               RDI (Raw D2D Interface, spec 8.1) and the physical pins.
 //
-// This module presents the RDI to the D2D Adapter and the sideband and
-// main-band pins to the partner die. It is the only counterpart to
-// d2d_adapter in the top level.
+// Spec refs   : UCIe 1.0 spec section 3.1 (Logical PHY layer definition),
+//               section 8.1 (RDI signal table, Table 114), section 4.5.3
+//               (LTSM), section 6 (sideband framing), section 5.2 (byte-to-
+//               lane mapping), section 7.1 (PHY CSR).
+//
+// Capability  : Standard Package, x16, 4 GT/s, Streaming / Raw Mode
+//               (Format 1). Single stack (Stack-0). No retimer. Reduced-
+//               capability set for proof-of-concept verification.
+//
+// --------------------------------------------------------------------------
+// Architecture  (ASCII block diagram)
+// --------------------------------------------------------------------------
+//
+//   D2D Adapter (RDI)
+//      |                               lp_cfg/pl_cfg
+//      |  rdi_lp_*  / rdi_pl_*         (sideband register access)
+//      |                                    |
+//      v                                    v
+//  +---------------------------------------------------------------+
+//  | logical_phy                                                   |
+//  |                                                               |
+//  |  +------------------+      +--------------+                   |
+//  |  | rdi_state_machine|<---->|    ltsm      |                   |
+//  |  | (u_rdi_sm)       |      | (u_ltsm)     |                   |
+//  |  | Spec 8.1.5       |      | Spec 4.5.3   |                   |
+//  |  | Fig 111          |      | Link Training|                   |
+//  |  +------------------+      |  & Status SM |                   |
+//  |         ^                  +------+-------+                   |
+//  |         | phy_link_trained        |                           |
+//  |         | phy_train_error         | sb_tx/rx   pat_*          |
+//  |         | phy_link_reset          |            |              |
+//  |         v                  +------+------+  +-+----------+   |
+//  |  +-----------+             | sb_codec    |  | pattern_gen|   |
+//  |  | phy_csr   |             | (u_sb_codec)|  | (u_pat_gen)|   |
+//  |  | (u_phy_csr|             | Spec Ch 6   |  | Spec 4.5.3|   |
+//  |  | Spec 7.1  |             +-+----------++  |  .4/.6     |   |
+//  |  +-----------+               |          |    +-----+-----+   |
+//  |                              |          |          |          |
+//  |  +------------------+        |          |   mb_tx_data       |
+//  |  | byte_lane_mapper |        |          |          |          |
+//  |  | (u_mapper)       |        |          |          v          |
+//  |  | Spec 5.2/4.1.1   |        |          |   [NLANES-1:0]     |
+//  |  +------------------+        |          |          |          |
+//  |                              |          |          |          |
+//  |  +------------------+        |          |          |          |
+//  |  | ucie_timer       |        |          |          |          |
+//  |  | (u_resid_timer)  |--------+          |          |          |
+//  |  | 8 ms residency   |                   |          |          |
+//  |  +------------------+                   |          |          |
+//  +---------------------------------------------------------------+
+//      |               |                    |          |
+//      v               v                    v          v
+//   sb_tx_data     sb_rx_data           mb_tx_data  mb_rx_data
+//   sb_tx_valid    sb_rx_valid          (to partner)(from partner)
+//   (sideband      (sideband
+//    to partner)    from partner)
+//
+// --------------------------------------------------------------------------
+// Data flow (simplified)
+// --------------------------------------------------------------------------
+//   TX path : adapter -> rdi_lp_data -> rdi_pl_data pass-through (loopback).
+//             During training: ltsm -> pattern_gen -> mb_tx_data pins.
+//   RX path : mb_rx_data pins -> (future CRC / scrambler) -> rdi_pl_data.
+//   Sideband: ltsm -> sb_codec -> sb_tx_data pins; sb_rx_data -> sb_codec ->
+//             ltsm.
+//
+// --------------------------------------------------------------------------
+// Parameters
+// --------------------------------------------------------------------------
+//   NBYTES : Number of data bytes (default 16, x16 Standard Package).
+//   NLANES : Number of main-band lanes (default 16, NLANES_MAX).
+//
+// --------------------------------------------------------------------------
+// Interfaces
+// --------------------------------------------------------------------------
+//   RDI (Table 114) : rdi_lp_* inputs from the adapter, rdi_pl_* outputs to
+//                     the adapter. Implements the state machine of spec 8.1.5
+//                     and the Active-entry handshake of 8.1.6.
+//   Sideband pins   : sb_tx_data/valid, sb_rx_data/valid toward the partner
+//                     die. Serialised 64-bit packets per spec Chapter 6.
+//   Main-band pins  : mb_tx_data, mb_rx_data. One bit per lane per UI.
+//   CSR/cfg         : lp_cfg/pl_cfg sideband register access path (stubbed
+//                     in this reduced-capability build).
+//
+// --------------------------------------------------------------------------
+// Clock domains
+// --------------------------------------------------------------------------
+//   lclk     : 1 GHz link clock for the main-band data path and LTSM.
+//   sbclk    : 800 MHz sideband clock for sb_codec and sideband side of the
+//              LTSM.
+//
+// --------------------------------------------------------------------------
+// Implementation notes
+// --------------------------------------------------------------------------
+//   1. The byte_lane_mapper is instantiated but held disabled (enable=1'b0);
+//      the main-band TX data is driven entirely by pattern_gen during
+//      training, and loopback for the datapath.
+//   2. The CSR write/read path is stubbed to constants; the PHY CSR is
+//      reachable only through the csr_start_link_train output.
+//   3. Static RDI outputs (pl_lnk_cfg, pl_speedmode, pl_stallreq) are tied
+//      to the reduced-capability defaults: x16, 4 GT/s, no stall.
+//   4. The RDI datapath (rdi_pl_trdy, rdi_pl_valid, rdi_pl_data) is a
+//      pass-through from the adapter side, since the logical PHY does not
+//      terminate the streaming data in this model.
+//
+// --------------------------------------------------------------------------
+// Revision history
+// --------------------------------------------------------------------------
+//   v0.0.1  2025-XX-XX  First commit to git. Hierarchical wrapper with all
+//                        sub-module instantiations, static RDI outputs, and
+//                        CSR/config stub.
+// ============================================================================
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -124,7 +237,25 @@ module logical_phy #(
   logic [63:0] csr_rdata;
   logic        csr_rdata_vld;
 
-  // ------------------------------------------------- sideband codec
+  // ---------------------------------------------------------------------------
+  // Sideband Codec Instantiation  (u_sb_codec)
+  // ---------------------------------------------------------------------------
+  // Spec reference : Chapter 6 (sideband framing), Table 47 (opcodes),
+  //                  Tables 53/54/56 (message codes).
+  //
+  // The sb_codec serialises and deserialises 64-bit sideband packets at the
+  // sbclk rate. It is the only module that knows the bit-field layout of the
+  // sideband header; all other blocks see named, typed fields.
+  //
+  // The LTSM drives the TX side (sb_tx_load, sb_tx_opcode, etc.) and
+  // consumes the RX side (sb_rx_pkt_vld, sb_rx_opcode, etc.).
+  // The codec also computes and checks CP (command parity) and DP (data
+  // parity) per spec Chapter 6 parity rules.
+  //
+  // tx_cr is tied to 1'b0: credit return messages are not generated in this
+  // reduced-capability build. The rx_cr, rx_addr, and rx_data outputs are
+  // left unconnected for the same reason.
+  // ---------------------------------------------------------------------------
   sb_codec u_sb_codec (
     .sbclk        (sbclk),
     .sbreset_n    (sbreset_n),
@@ -161,7 +292,25 @@ module logical_phy #(
     .rx_dp_err    (sb_rx_dp_err)
   );
 
-  // ------------------------------------------------- link training FSM
+  // ---------------------------------------------------------------------------
+  // Link Training and Status Machine Instantiation  (u_ltsm)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 4.5.3 (LTSM overview), 4.5.3.1-4.5.3.9 (per-state
+  //                  descriptions). See ltsm.sv header for the full
+  //                  state/sub-state progression diagram.
+  //
+  // The LTSM is the sole sideband master in this logical PHY. It sequences
+  // through RESET -> SBINIT -> MBINIT.* -> MBTRAIN.* -> LINKINIT -> ACTIVE,
+  // exchanging sideband messages with the partner at each sub-state boundary.
+  // On entry, it receives start_link_train from either the top-level pin or
+  // the CSR TRAIN_CTL write. On exit, it reports link_trained, train_error,
+  // and link_reset_out to the RDI state machine and the CSR block.
+  //
+  // Control of the pattern generator (pat_enable, pat_select, etc.) is
+  // driven entirely by the LTSM based on the current training sub-state.
+  // The 8 ms residency timer (u_resid_timer) provides timeout enforcement
+  // per spec 4.5.3: any sub-state exceeding 8 ms escalates to TRAINERROR.
+  // ---------------------------------------------------------------------------
   ltsm #(.NLANES(NLANES)) u_ltsm (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
@@ -211,6 +360,18 @@ module logical_phy #(
     .tmr_expired     (tmr_expired)
   );
 
+  // ---------------------------------------------------------------------------
+  // 8 ms Residency Timer Instantiation  (u_resid_timer)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 4.5.3 – every training sub-state is bounded by an 8 ms
+  //                  residency window. The LTSM asserts tmr_start on entry to
+  //                  each new sub-state and holds tmr_run while the handshake
+  //                  is pending. If tmr_expired fires before the handshake
+  //                  completes, the LTSM escalates to TRAINERROR per 4.5.3.8.
+  //
+  // ucie_timer is parameterised with C_RESIDENCY = 8_000_000 lclk cycles
+  // (8 ms at 1 GHz).  DIV=1 means no prescaler.
+  // ---------------------------------------------------------------------------
   ucie_timer #(.DIV(1), .LIMIT_CYCLES(C_RESIDENCY)) u_resid_timer (
     .clk      (lclk),
     .reset_n  (lreset_n),
@@ -219,7 +380,23 @@ module logical_phy #(
     .expired  (tmr_expired)
   );
 
-  // ------------------------------------------------- RDI link state machine
+  // ---------------------------------------------------------------------------
+  // RDI Link State Machine Instantiation  (u_rdi_sm)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 8.1.5 (RDI state transitions, Figure 111), 8.1.6
+  //                  (Active-entry handshake).
+  //
+  // The RDI state machine mediates between the D2D Adapter (which drives
+  // rdi_lp_state_req) and the physical layer (which reports link_trained,
+  // link_reset_out, train_error). Physical RESET and TRAINERROR preempt
+  // every adapter request per 8.1.5. The ACTIVE entry follows the three-way
+  // handshake of 8.1.6.
+  //
+  // In this build:
+  //   - phy_retrain_req is derived from the adapter requesting RDI_REQ_RETRAIN.
+  //   - phy_inband_pres mirrors sb_rx_valid (partner alive on sideband).
+  //   - cerror, nferror, and stall_req are tied to zero.
+  // ---------------------------------------------------------------------------
   rdi_state_machine u_rdi_sm (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
@@ -245,7 +422,19 @@ module logical_phy #(
     .local_active_req(local_active_req)
   );
 
-  // ------------------------------------------------- training pattern gen
+  // ---------------------------------------------------------------------------
+  // Training Pattern Generator Instantiation  (u_pat_gen)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 4.5.3.4 (MBTRAIN sub-states), 4.5.3.6 (LINKINIT),
+  //                  Table 71 (training pattern sequence).
+  //
+  // The pattern generator produces per-lane training patterns on mb_tx_data
+  // during the MBTRAIN and LINKINIT sub-states. The LTSM selects the active
+  // pattern (PAT_PERLANEID, PAT_VALTRAIN, PAT_CLKREPAIR, PAT_LFSR) and
+  // controls the LFSR reseed via pat_lfsr_reset/pat_lfsr_enable. The
+  // pat_done signal fires on the final UI of the LFSR pattern (4096 UI) to
+  // allow the LTSM to advance from LINKINIT to ACTIVE.
+  // ---------------------------------------------------------------------------
   pattern_gen #(.NLANES(NLANES)) u_pat_gen (
     .lclk        (lclk),
     .lreset_n    (lreset_n),
@@ -257,9 +446,23 @@ module logical_phy #(
     .pat_done    (pat_done)
   );
 
-  // ------------------------------------------------- byte to lane mapper
-  // The main-band transmit data is the training pattern output; the mapper is
-  // instantiated so the byte-to-lane mapping is exercised in the loopback.
+  // ---------------------------------------------------------------------------
+  // Byte-to-Lane Mapper Instantiation  (u_mapper)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 5.2 / Figure 48 (byte-to-lane mapping), 4.1.1
+  //                  (lane and width definitions), width-degrade mechanism.
+  //
+  // The mapper translates NBYTES parallel bytes into NLANES lane-aligned
+  // bytes, handling x16 full-width and x8-degraded half-width modes. In
+  // degraded mode only lanes 0-7 or 8-15 carry data; the other half is
+  // zeroed. byte_reversal reverses the byte numbering within the active
+  // half.
+  //
+  // In this build the mapper is instantiated but held disabled (enable=1'b0)
+  // because the main-band TX data is driven entirely by the pattern
+  // generator during training. The instantiation exercises the byte-to-lane
+  // mapping logic for the loopback verification path.
+  // ---------------------------------------------------------------------------
   byte_lane_mapper #(.NLANES(NLANES)) u_mapper (
     .lclk          (lclk),
     .lreset_n      (lreset_n),
@@ -271,7 +474,24 @@ module logical_phy #(
     .data_out      (lane_bytes)
   );
 
-  // ------------------------------------------------- PHY CSR
+  // ---------------------------------------------------------------------------
+  // PHY CSR Block Instantiation  (u_phy_csr)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 7.1 (PHY electrical parameter registers).
+  //
+  // The PHY CSR block holds the local electrical parameters (supply voltage,
+  // termination impedance) that are advertised to the partner during
+  // MBINIT.PARAM, the negotiated link width, and the LTSM training status.
+  // The adapter reads these registers through the sideband register access
+  // path (cfg interface).
+  //
+  // start_link_train output: writing a 1 to CSR_TRAIN_CTL (offset 0x0)
+  // initiates the LTSM RESET exit, complementing the top-level
+  // start_link_train pin.
+  //
+  // NOTE: These are electrical *parameter* registers only. There is no
+  // analog/AFE implementation per the project scope constraint.
+  // ---------------------------------------------------------------------------
   phy_csr u_phy_csr (
     .lclk          (lclk),
     .lreset_n      (lreset_n),
@@ -288,34 +508,74 @@ module logical_phy #(
     .start_link_train(csr_start_link_train)
   );
 
-  // ------------------------------------------------- static RDI outputs
-  // Reduced capability set: x16, 4 GT/s, no stall request from the PHY.
+  // ---------------------------------------------------------------------------
+  // Static RDI outputs  (spec 8.1, Table 114)
+  // ---------------------------------------------------------------------------
+  // The reduced-capability set supports only x16, 4 GT/s, and no PHY-
+  // initiated stall. These outputs are tied to constant values and are
+  // never modified at runtime.
+  //
+  // rdi_pl_lnk_cfg  : LNKCFG_X16 (3'b010) – x16 link configuration.
+  // rdi_pl_speedmode : SPEED_4GT  (3'b000) – 4 GT/s, the only speed.
+  // rdi_pl_stallreq  : 1'b0 – the PHY never initiates a stall in this build.
+  // ---------------------------------------------------------------------------
   assign rdi_pl_lnk_cfg  = LNKCFG_X16;
   assign rdi_pl_speedmode= SPEED_4GT;
   assign rdi_pl_stallreq = 1'b0;
 
-  // The LTSM leaves RESET either on the top-level start input or on a CSR
-  // write to TRAIN_CTL. Both paths are spec 4.5.3.1 RESET exits.
+  // ---------------------------------------------------------------------------
+  // LTSM start-link-train OR gate  (spec 4.5.3.1 RESET exits)
+  // ---------------------------------------------------------------------------
+  // The LTSM exits RESET on either:
+  //   (a) the top-level start_link_train input pin (testbench / system
+  //       controller), or
+  //   (b) a CSR write to TRAIN_CTL[0] (software-initiated training start).
+  // Both paths are spec-compliant RESET exit stimuli per 4.5.3.1.
+  // ---------------------------------------------------------------------------
   assign ltsm_start_link_train = start_link_train | csr_start_link_train;
 
-  // The CSR access path is presented on the cfg interface so the adapter can
-  // reach the PHY registers through the sideband.
+  // ---------------------------------------------------------------------------
+  // CSR access path stub  (spec 7.1 sideband register access)
+  // ---------------------------------------------------------------------------
+  // The CSR write/read path is presented on the cfg interface so the adapter
+  // can reach the PHY registers through the sideband. In this reduced-
+  // capability build the path is stubbed to constants: no external register
+  // accesses are generated.
+  // ---------------------------------------------------------------------------
   assign csr_wr    = 1'b0;
   assign csr_rd    = 1'b0;
   assign csr_addr  = '0;
   assign csr_wdata = '0;
 
+  // ---------------------------------------------------------------------------
+  // Configuration interface stub  (spec 6.1 sideband cfg)
+  // ---------------------------------------------------------------------------
+  // The pl_cfg interface is unused in this build. Outputs are tied low so
+  // the cfg bus is inert.
+  // ---------------------------------------------------------------------------
   assign pl_cfg     = '0;
   assign pl_cfg_vld = 1'b0;
   assign pl_cfg_crd = 1'b0;
 
-  // RDI datapath pass-through: the logical PHY does not terminate the
-  // streaming data in this model; the adapter handles the RDI datapath.
+  // ---------------------------------------------------------------------------
+  // RDI datapath pass-through  (spec 8.1 / Table 114 data signals)
+  // ---------------------------------------------------------------------------
+  // The logical PHY does not terminate the streaming data in this model; the
+  // adapter handles the RDI datapath. rdi_pl_trdy echoes rdi_lp_irdy,
+  // rdi_pl_valid echoes rdi_lp_valid, and rdi_pl_data echoes rdi_lp_data.
+  // This provides a loopback path for simulation verification.
+  // ---------------------------------------------------------------------------
   assign rdi_pl_trdy  = rdi_lp_irdy;
   assign rdi_pl_valid = rdi_lp_valid;
   assign rdi_pl_data  = rdi_lp_data;
 
-  // Lint suppression. Continuous so iverilog evaluates the bit selects.
+  // ---------------------------------------------------------------------------
+  // Lint suppression
+  // ---------------------------------------------------------------------------
+  // Continuous assign so Icarus Verilog evaluates all bit-select references.
+  // Every signal listed here is either an output of a sub-module that is not
+  // consumed externally, or an input that is not used in this stub build.
+  // ---------------------------------------------------------------------------
   logic unused;
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |
                   csr_rdata[0] | phy_retrain_done | sb_msg_timeout |

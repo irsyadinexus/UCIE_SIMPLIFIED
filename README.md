@@ -18,18 +18,19 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - PCIE Protocol : Not supported
 - Retimer : Not supported
 - Electrical PHY : Not supported (Implement the negotiated parameters but not the analog circuits)
-- Sideband Frequency : 800 MHz
-- Mainband Frequency : 2 GHz (lclk : 1 GHz) higher frequency is not supported
+- Sideband Frequency : 800 MHz (spec accurate; asynchronous CDC between lclk and sbclk)
+- Mainband Frequency : 2 GHz forwarded clock (fCK), DDR transfer (4 GT/s effective per lane)
+- RDI / Adapter Clock (lclk) : 500 MHz (exact bandwidth match: 16 bytes @ 500 MHz = 64 Gbps for x16 @ 4 GT/s)
 - Standard Package width : x16 only (no x8 degrade negotiated on the main line;
   the byte-to-lane mapper implements both x8 degrade halves and is covered by
   a directed unit test)
 - Data width : parameterized `NBYTES`, default 16 bytes, on both FDI and RDI
 - Data link : no CRC, no retry/replay, no sequence numbers (legal at 4 GT/s)
 - Sideband packet : 64-bit header, one bit per UI, 32-UI inter-packet gap
-- Timer constants : 4 ms RESET minimum and 8 ms residency/message timeouts are
-  implemented at their true spec values in `rtl/rtl_common/timer.sv`; no RTL
-  timer constant is divided for simulation speed
-
+- Physical Layer RESET : minimum 4 ms residency enforced upon entry to RESET (spec 4.5.3.1)
+- Timer constants : 4 ms RESET minimum, 8 ms residency/message timeouts, and 4 ms stall keep-alive
+  are implemented at their true spec physical values in `rtl/rtl_common/timer.sv` calibrated to lclk = 500 MHz;
+  no RTL timer constant is divided for simulation speed
 ## Topology
 
 Implemented module tree (every file below is synthesizable SystemVerilog,

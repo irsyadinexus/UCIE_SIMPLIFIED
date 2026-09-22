@@ -93,6 +93,7 @@
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module pattern_gen #(
   parameter int unsigned NLANES = NLANES_MAX
 ) (

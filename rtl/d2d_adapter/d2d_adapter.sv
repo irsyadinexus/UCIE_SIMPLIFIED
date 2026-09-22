@@ -105,7 +105,7 @@
 //            which matches the x16 Standard Package at 128 bits per UI.
 //
 // CLOCK / RESET
-//   lclk      - Main link clock, 1 GHz (4 GT/s DDR -> 1 GHz SDR lclk).
+//   lclk      - Main link clock, 500 MHz (16 B @ 500 MHz = 64 Gbps for x16 @ 4 GT/s).
 //   lreset_n  - Active-low synchronous reset, deasserted synchronously to
 //               lclk by the reset controller upstream.
 //
@@ -128,6 +128,7 @@
 //
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
+//   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -137,6 +138,7 @@
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module d2d_adapter #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES
 ) (
@@ -368,23 +370,17 @@ module d2d_adapter #(
   // Module Instantiation: adapter_datapath (u_datapath)
   //
   // Pure Streaming pass-through datapath in Raw Mode Format 1 (spec 4.1.x).
-  // Provides a single registered pipeline stage in each direction:
-  //   - FDI -> RDI (Tx): lp_data/lp_valid/lp_irdy are registered, then
-  //     forwarded to rdi_lp_data/rdi_lp_valid/rdi_lp_irdy.
-  //   - RDI -> FDI (Rx): rdi_pl_data/rdi_pl_valid are registered, then
-  //     forwarded to pl_data/pl_valid.
-  //   - x8 width degrade: when lnk_is_x8 is asserted, the upper 64 bits
-  //     of rdi_lp_data are zeroed (lanes 8-15 carry no data).
-  //   - Stall gate: stall_active prevents new data from entering the
-  //     pipeline while the stall handshake is in progress.
+  // Single registered pipeline stage in each direction:
+  //   - FDI -> RDI (Tx): lp_data/valid/irdy registered to rdi_lp_*.
+  //   - RDI -> FDI (Rx): rdi_pl_data/valid registered to pl_*.
+  //   - x8 width degrade: upper 64 bits of rdi_lp_data zeroed when lnk_is_x8.
+  //   - Stall gate: stall_active gates data during stall handshake.
   //
-  // There is intentionally no CRC engine, no retry buffer, no sequence-
-  // number logic, no flit-header insertion, and no DLLP path. The 4 GT/s
-  // rate does not require Retry, and Raw Mode Format 1 is the only format
-  // supported by this simplified endpoint.
+  // No CRC engine, retry buffer, or sequence numbers: legal for 4 GT/s
+  // Raw Mode Format 1 in this simplified endpoint.
   //
-  // Spec ref: UCIe 1.0, Section 4.1.x (byte/valid framing), Section 8.1
-  //           (pipeline stage requirement), Table 115 (FDI signals).
+  // Spec ref: UCIe 1.0, Section 4.1.x (framing), Section 8.1 (pipeline stage),
+  //           Table 115 (FDI signals).
   // -------------------------------------------------------------------------
   adapter_datapath #(.NBYTES(NBYTES)) u_datapath (
     .lclk(lclk),
@@ -412,25 +408,17 @@ module d2d_adapter #(
   // -------------------------------------------------------------------------
   // Module Instantiation: adapter_sb_if (u_sb_if)
   //
-  // Adapter-side sideband interface per spec 6.1.3. Handles:
-  //   - FDI credit loop: lp_cfg / lp_cfg_vld / lp_cfg_crd inbound from
-  //     the Protocol Layer; pl_cfg / pl_cfg_vld / pl_cfg_crd outbound.
-  //   - Remote credit loop: up to SB_CRD_MAX (4) outstanding credits,
-  //     tracked in crd_remote_q; Cr bit in received packets returns credits.
-  //   - 8 ms message timeout (C_SB_MSG cycles): fires sb_msg_timeout when
-  //     an outstanding request is not acknowledged within the timeout.
-  //   - 4 ms stall keep-alive (C_STALL cycles): fires sb_stall_sent.
-  //   - Link management message decoding: LinkMgmt.RDI.Req.Active sets
-  //     adapter_active_req; LinkReset/Disable clears it.
-  //   - CSR read/write path: incoming sideband packets addressed to
-  //     SRCID_ADAPT are decoded as CfgRd/CfgWr and forwarded to u_regfile.
+  // Adapter-side sideband interface per spec 6.1:
+  //   - FDI credit loop: lp_cfg/pl_cfg credit handshakes with Protocol Layer.
+  //   - Remote credit loop: up to SB_CRD_MAX (4) remote credits.
+  //   - Reduced-model monitor hooks: 8 ms message timeout & 4 ms stall hook.
+  //   - Link management: LinkMgmt.RDI.Req.Active sets adapter_active_req.
+  //   - CSR access: packets for SRCID_ADAPT routed to u_regfile.
   //
-  // partner_active_req is tied to 1'b0: in this design the sideband module
-  // itself latches the partner's Active request from the received packet
-  // stream, so the top-level tie-off is harmless.
+  // partner_active_req is tied to 1'b0 (u_sb_if latches Active from stream).
   //
-  // Spec ref: UCIe 1.0, Section 4.5.x (packet format), Section 6.1.3
-  //           (credit model), Table 47 (sideband opcodes).
+  // Spec ref: UCIe 1.0, Section 4.5.x (packet format), Section 6.1
+  //           (sideband protocol/timers), Table 47 (opcodes).
   // -------------------------------------------------------------------------
   adapter_sb_if u_sb_if (
     .lclk(lclk),

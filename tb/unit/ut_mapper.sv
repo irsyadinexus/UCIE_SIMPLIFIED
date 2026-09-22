@@ -1,9 +1,9 @@
 // Unit test: byte_lane_mapper. Exercises x16, both x8-degrade halves, the
 // inactive-half zeroing, byte reversal, and the enable gate.
-`timescale 1ns/1ps
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ut_mapper;
   logic        lclk, lreset_n;
   logic        enable;
@@ -23,7 +23,7 @@ module ut_mapper;
   );
 
   initial lclk = 1'b0;
-  always #0.5 lclk = ~lclk;
+  always #1.0 lclk = ~lclk;
 
   task chk_lane;
     input int        lane;

@@ -74,7 +74,7 @@
 //
 // Port Description
 // ~~~~~~~~~~~~~~~~
-//   lclk        : Main-band link clock (1 GHz at 4 GT/s).
+//   lclk        : Main-band link clock (500 MHz at 4 GT/s).
 //   lreset_n    : Asynchronous active-low reset; re-seeds the LFSR and
 //                 clears the output register.
 //   lfsr_reset  : Synchronous re-seed on LINKINIT entry (spec 4.4.1).
@@ -98,12 +98,14 @@
 //   Rev   Date        Author      Description
 //   ----- ----------  ----------  ------------------------------------------
 //   0.0.1 2026-09-22  -           First commit to git.
+//   0.0.2 2026-09-22  -           Update lclk documentation to 500 MHz.
 //
 // ============================================================================
 `ifndef Scrambler_SV
 `define Scrambler_SV
 `include "ucie_pkg.sv"
 
+`timescale 1ns/1ps
 module scrambler #(
   parameter int unsigned LANE_ID = 0
 ) (

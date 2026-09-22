@@ -193,12 +193,14 @@
 //   v0.0.1  2025-XX-XX  First commit to git. Full LTSM sequencer with 24
 //                        states, sideband handshake, pattern control, and
 //                        timer interface.
+//   v0.0.2  2026-09-22  Fix tmr_start to pulse for 1 cycle on sub-state entry.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ltsm #(
   parameter int unsigned NLANES = NLANES_MAX
 ) (
@@ -484,15 +486,14 @@ module ltsm #(
 
 
   // =========================================================================
-  // Residency timer interface  (spec 4.5.3 – 8 ms per sub-state)
+  // Residency timer interface  (spec 4.5 – 8 ms per sub-state timeout)
   // =========================================================================
-  // Each sub-state arms the 8 ms residency timer on entry (timer_start_q
-  // asserted when state_q != state_q_prev). The timer runs while the
-  // handshake is pending (timer_start_q && !resp_rcvd_q). If tmr_expired
-  // fires before the handshake completes, the always_comb block transitions
-  // to TRAINERROR (spec 4.5.3.8).
+  // Each sub-state pulses tmr_start for 1 cycle on entry (state_q != state_q_prev).
+  // The timer runs while the handshake is pending (timer_start_q && !resp_rcvd_q).
+  // If tmr_expired fires before the handshake completes, the always_comb
+  // block transitions to TRAINERROR (spec 4.5.3.8).
   // =========================================================================
-  assign tmr_start = timer_start_q;
+  assign tmr_start = (state_q != state_q_prev);
   assign tmr_run   = timer_start_q && !resp_rcvd_q;
 
   // =========================================================================

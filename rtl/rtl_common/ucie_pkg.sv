@@ -6,15 +6,15 @@
 // This package is the single source of truth for every compile-time constant
 // and shared type used across the UCIe Simplified Endpoint RTL.  It covers:
 //
-//   1. Clock frequencies       – Sideband (800 MHz) and main-band / lclk
-//                                (1 GHz for the 4 GT/s-only profile).
+//   1. Clock frequencies       – Sideband (800 MHz), main-band fCK (2 GHz),
+//                                and RDI / adapter lclk (500 MHz for 4 GT/s).
 //   2. Data-path geometry      – Number of bytes (NBYTES = 16 for x16
 //                                Standard Package), data width (128 b),
 //                                and sideband configuration width (8 b).
-//   3. Timer intervals         – Spec-compliant residency (8 ms per
-//                                sub-state), RESET minimum (4 ms), sideband
-//                                message timeout (8 ms), and stall interval
-//                                (4 ms).  These are expressed in both
+//   3. Timer intervals         – Spec-compliant residency timeout (8 ms
+//                                per sub-state), RESET minimum (4 ms),
+//                                sideband message timeout (8 ms), and stall
+//                                interval (4 ms).  These are expressed in both
 //                                nanoseconds and lclk cycle counts.
 //   4. Sideband framing        – Packet width (64 b) and inter-packet gap
 //                                (32 UI).
@@ -92,23 +92,24 @@
 //   Rev   Date        Author      Description
 //   ----- ----------  ----------  ------------------------------------------
 //   0.0.1 2026-09-22  -           First commit to git.
+//   0.0.2 2026-09-22  -           Re-anchor lclk to 500 MHz, recalibrate timers, and update spec refs.
 //
 // ============================================================================
 `ifndef UciePkg_SV
 `define UciePkg_SV
 
+`timescale 1ns/1ps
 package ucie_pkg;
 
   // ========================================================================
   // Clock Frequencies
   // ========================================================================
   // Spec mandates an 800 MHz sideband clock and, for 4 GT/s operation,
-  // a 2 GHz main-band clock with lclk at 1 GHz (DDR signalling yields
-  // 2 GT/s per UI → 4 GT/s effective with dual-edge sampling).
-  // Only lclk and SB clock are used in the simplified endpoint.
-  // (UCIe 1.0 spec, Table 4, section 3.2.)
+  // a 2 GHz main-band clock (fCK). With a 16-byte RDI bus, lclk is set
+  // to 500 MHz for an exact bandwidth match (16 B * 500 MHz = 64 Gbps).
+  // (UCIe 1.0 spec, Table 4, section 3.2, section 8.1.2.)
   localparam int unsigned CLK_SB_HZ    = 32'd800_000_000;
-  localparam int unsigned LCLK_HZ      = 32'd1_000_000_000;
+  localparam int unsigned LCLK_HZ      = 32'd500_000_000;
 
   // ========================================================================
   // Data Bus Widths
@@ -125,20 +126,18 @@ package ucie_pkg;
   // ========================================================================
   // Timer Intervals (nanoseconds)
   // ========================================================================
-  // All timer values are true to the UCIe 1.0 specification.  The project
-  // README explicitly forbids substituting faster simulation timers; only
-  // the DIV parameter on the timer module may be used in testbenches.
+  // All timer values are true to the UCIe 1.0 specification.
+  // Fast-testing shortcuts and artificial simulation timers are prohibited;
+  // all timers run true to spec.
   //
   // T_RESET_MIN_NS  : 4 ms – minimum time in RESET before exiting
-  //                   (spec 4.2.2.1, "RESET state").
-  // T_RESIDENCY_NS  : 8 ms – minimum residency per training sub-state
-  //                   (spec 4.2, general training state requirements).
-  // T_SB_MSG_NS     : 8 ms – sideband message timeout; if no handshake
-  //                   completes within this window, the LTSM transitions
-  //                   to TRAINERROR (spec 4.2.1).
-  // T_STALL_NS      : 4 ms – stall interval; a training state that has
-  //                   been running for 4 ms must initiate a stall
-  //                   (spec 4.5.3).
+  //                   (spec 4.5.3.1, "RESET state").
+  // T_RESIDENCY_NS  : 8 ms – sub-state residency timeout window
+  //                   (spec 4.5, general training state timeout).
+  // T_SB_MSG_NS     : 8 ms – sideband message timeout; requests expecting
+  //                   a response time out after 8 ms (spec 6.1).
+  // T_STALL_NS      : 4 ms – stall interval; when stalling to prevent
+  //                   timeout, stall response cadence is 4 ms (spec 6.1).
   localparam int unsigned T_RESET_MIN_NS = 32'd4_000_000;   // 4 ms
   localparam int unsigned T_RESIDENCY_NS = 32'd8_000_000;   // 8 ms per sub-state
   localparam int unsigned T_SB_MSG_NS    = 32'd8_000_000;   // 8 ms message timeout
@@ -147,13 +146,14 @@ package ucie_pkg;
   // ========================================================================
   // Timer Intervals (lclk cycle counts)
   // ========================================================================
-  // At lclk = 1 GHz the period is 1 ns, so the cycle count equals the
-  // nanosecond value numerically.  These are the values passed to the
-  // ucie_timer LIMIT_CYCLES parameter.
-  localparam int unsigned C_RESET_MIN = T_RESET_MIN_NS;
-  localparam int unsigned C_RESIDENCY = T_RESIDENCY_NS;
-  localparam int unsigned C_SB_MSG    = T_SB_MSG_NS;
-  localparam int unsigned C_STALL     = T_STALL_NS;
+  // Calibrated to LCLK_HZ using 64-bit arithmetic to prevent truncation:
+  //   cycles = T_ns * LCLK_HZ / 1_000_000_000
+  // At lclk = 500 MHz (period 2 ns), 4 ms = 2,000,000 cycles and
+  // 8 ms = 4,000,000 cycles.
+  localparam int unsigned C_RESET_MIN = int'(longint'(T_RESET_MIN_NS) * LCLK_HZ / 32'd1_000_000_000);
+  localparam int unsigned C_RESIDENCY = int'(longint'(T_RESIDENCY_NS) * LCLK_HZ / 32'd1_000_000_000);
+  localparam int unsigned C_SB_MSG    = int'(longint'(T_SB_MSG_NS)    * LCLK_HZ / 32'd1_000_000_000);
+  localparam int unsigned C_STALL     = int'(longint'(T_STALL_NS)     * LCLK_HZ / 32'd1_000_000_000);
 
   // ========================================================================
   // Sideband Framing

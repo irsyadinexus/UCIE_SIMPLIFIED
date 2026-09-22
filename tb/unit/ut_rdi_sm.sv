@@ -1,10 +1,10 @@
 // Unit test: rdi_state_machine. Walks RESET -> ACTIVE -> L1 -> ACTIVE ->
 // LINKRESET -> ACTIVE -> RETRAIN -> ACTIVE -> LINKERROR -> LINKRESET ->
 // DISABLED, and checks the 8.1.6 active-entry gating.
-`timescale 1ns/1ps
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ut_rdi_sm;
   logic        lclk, lreset_n;
   logic [3:0]  rdi_lp_state_req;
@@ -50,7 +50,7 @@ module ut_rdi_sm;
   );
 
   initial lclk = 1'b0;
-  always #0.5 lclk = ~lclk;
+  always #1.0 lclk = ~lclk;
 
   task chk;
     input [64*8-1:0] label;

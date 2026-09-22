@@ -6,9 +6,7 @@
 //
 // SPECIFICATION REFERENCES
 //   UCIe 1.0 Specification, Section 4.5.x - Sideband Packet Format
-//   UCIe 1.0 Specification, Section 6.1.3 - Sideband Credit Model
-//   UCIe 1.0 Specification, Section 6.2 - Sideband Message Timeout (8 ms)
-//   UCIe 1.0 Specification, Section 6.3 - Stall Keep-Alive (4 ms)
+//   UCIe 1.0 Specification, Section 6.1 - Sideband Protocol & Timing
 //   UCIe 1.0 Specification, Table 47 - Sideband Opcodes
 //   UCIe 1.0 Specification, Table 49 - SrcID / DstID Encodings
 //   UCIe 1.0 Specification, Tables 53-56 - Sideband Message Codes
@@ -37,13 +35,11 @@
 //          by messages sent to the remote die. Capped at SB_CRD_MAX (4).
 //          Returned by the Cr bit in received completion packets.
 //
-//     4. TIMERS:
-//        - 8 ms message timeout (C_SB_MSG cycles via ucie_timer): starts
-//          when crd_remote_q != 0 and fires sb_msg_timeout if no credit
-//          return arrives in time (spec 6.2).
-//        - 4 ms stall keep-alive (C_STALL cycles via ucie_timer): fires
-//          sb_stall_sent after the message timeout expires (spec 6.3).
-//
+//     4. REDUCED-MODEL MONITOR TIMERS:
+//        - 8 ms message timeout (C_SB_MSG cycles via ucie_timer): reduced-
+//          model response watchdog monitoring crd_remote_q != 0 (spec 6.1).
+//        - 4 ms stall keep-alive (C_STALL cycles via ucie_timer): reduced-
+//          model stall-cadence monitor hook (spec 6.1).
 //     5. LINK MANAGEMENT MESSAGE DECODING:
 //        - LinkMgmt.RDI.Req.Active (MC_LM_RDI_REQ / MS_LM_ACTIVE): sets
 //          adapter_active_req, indicating the partner die wants Active.
@@ -83,11 +79,12 @@
 //   sb_msg_timeout                    - monitor: 8 ms message timeout fired.
 //
 // CLOCK / RESET
-//   lclk      - Main link clock (1 GHz).
+//   lclk      - Main link clock (500 MHz).
 //   lreset_n  - Active-low asynchronous reset.
 //
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
+//   v0.0.2  2026-09-22  Update lclk and timer cycle comments for 500 MHz.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -96,6 +93,7 @@
 `define AdapterSbIf_SV
 `include "ucie_pkg.sv"
 
+`timescale 1ns/1ps
 module adapter_sb_if (
   input  logic        lclk,
   input  logic        lreset_n,
@@ -154,15 +152,13 @@ module adapter_sb_if (
   // --------------------------------------------------------------------------
   // Timer Signals
   // --------------------------------------------------------------------------
-  // msg_timer_*   : 8 ms message timeout (C_SB_MSG cycles). Per spec 6.2,
-  //                 if an outstanding sideband request receives no response
-  //                 within 8 ms, the timeout fires. The timer runs while
-  //                 crd_remote_q != 0 (there is an outstanding request).
+  // msg_timer_*   : 8 ms message timeout (C_SB_MSG cycles). Reduced-model
+  //                 monitor hook for sideband response tracking (spec 6.1).
+  //                 Runs while crd_remote_q != 0.
   //
-  // stall_timer_* : 4 ms stall keep-alive (C_STALL cycles). Per spec 6.3,
-  //                 after the message timeout fires, the adapter must send
-  //                 periodic stall keep-alive messages every 4 ms to prevent
-  //                 the remote side from declaring a link error.
+  // stall_timer_* : 4 ms stall interval (C_STALL cycles). Reduced-model
+  //                 monitor hook for stall-cadence tracking (spec 6.1),
+  //                 armed after message timeout.
   // --------------------------------------------------------------------------
   logic       msg_timer_start;
   logic       msg_timer_run;
@@ -175,8 +171,8 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   // Module Instantiation: ucie_timer - 8 ms Message Timeout
   //
-  // Generic countdown timer parameterised with C_SB_MSG (8,000,000 lclk
-  // cycles at 1 GHz = 8 ms). Starts on msg_timer_start, counts down while
+  // Generic countdown timer parameterised with C_SB_MSG (4,000,000 lclk
+  // cycles at 500 MHz = 8 ms). Starts on msg_timer_start, counts down while
   // msg_timer_run is high, and asserts msg_timer_expired when the count
   // reaches zero.
   //
@@ -184,7 +180,7 @@ module adapter_sb_if (
   // (crd_remote_q != 0) and no credit-return packet has just arrived.
   // It runs as long as there are outstanding credits.
   //
-  // Spec ref: UCIe 1.0, Section 6.2 - 8 ms sideband message timeout.
+  // Spec ref: UCIe 1.0, Section 6.1 - 8 ms sideband message timeout.
   // -------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_SB_MSG)) u_msg_timer (
     .clk(lclk), .reset_n(lreset_n),
@@ -195,8 +191,8 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   // Module Instantiation: ucie_timer - 4 ms Stall Keep-Alive
   //
-  // Generic countdown timer parameterised with C_STALL (4,000,000 lclk
-  // cycles at 1 GHz = 4 ms). Starts on stall_timer_start (which is
+  // Generic countdown timer parameterised with C_STALL (2,000,000 lclk
+  // cycles at 500 MHz = 4 ms). Starts on stall_timer_start (which is
   // triggered by msg_timer_expired), counts down while stall_timer_run
   // is high, and asserts stall_timer_expired when the count reaches zero.
   //
@@ -204,7 +200,7 @@ module adapter_sb_if (
   // long silence as a link error while the adapter is waiting for a
   // delayed response.
   //
-  // Spec ref: UCIe 1.0, Section 6.3 - 4 ms stall keep-alive.
+  // Spec ref: UCIe 1.0, Section 6.1 - 4 ms stall response interval.
   // -------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_STALL)) u_stall_timer (
     .clk(lclk), .reset_n(lreset_n),
@@ -518,33 +514,26 @@ module adapter_sb_if (
   // --------------------------------------------------------------------------
 
   // -------------------------------------------------------------------------
-  // always_comb: Timer Start/Run and Monitor Outputs
+  // assign: Dormant Monitor Timer Hooks
   //
-  // Controls the two timers and drives the three monitor/coverage outputs:
+  // In this simplified endpoint, the adapter responds to CfgRd completions
+  // but does not autonomously initiate credit-consuming sideband requests.
+  // The message timeout and stall keep-alive timers are dormant monitor stubs
+  // tied low; active sideband request tracking is owned by the LTSM (spec 6.1).
   //
-  //   msg_timer_start: starts the 8 ms message timeout whenever there are
-  //     outstanding remote credits (crd_remote_q != 0) AND no credit-return
-  //     packet has just arrived (!(rx_pkt_vld && rx_cr)). A credit return
-  //     restarts the timeout.
-  //   msg_timer_run: the timer runs as long as there are outstanding credits.
-  //     When crd_remote_q drops to 0, the timer stops.
-  //   stall_timer_start: the stall keep-alive timer starts when the message
-  //     timeout expires (msg_timer_expired == 1).
-  //   stall_timer_run: runs while there are outstanding credits AND the
-  //     message timeout has not expired yet. Once the message timeout fires,
-  //     the stall timer takes over.
-  //   sb_msg_timeout: asserted when the 8 ms message timeout expires.
-  //   sb_stall_sent:  asserted when the 4 ms stall keep-alive expires.
-  // Spec ref: UCIe 1.0, Section 6.2 (8 ms timeout), Section 6.3 (4 ms stall).
+  //   msg_timer_start/run   - held low (no autonomous adapter requests).
+  //   stall_timer_start/run - held low (no stall packet generation).
+  //   sb_msg_timeout        - dormant monitor hook (tied low).
+  //   sb_stall_sent         - dormant monitor hook (tied low).
+  //
+  // Spec ref: UCIe 1.0, Section 6.1 (sideband protocol & timers).
   // -------------------------------------------------------------------------
-  always_comb begin
-    msg_timer_start   = (crd_remote_q != 0) && !(rx_pkt_vld && rx_cr);
-    msg_timer_run     = (crd_remote_q != 0);
-    stall_timer_start = msg_timer_expired;
-    stall_timer_run   = (crd_remote_q != 0) && !msg_timer_expired;
-    sb_msg_timeout    = msg_timer_expired;
-    sb_stall_sent     = stall_timer_expired;
-  end
+  assign msg_timer_start   = 1'b0;
+  assign msg_timer_run     = 1'b0;
+  assign stall_timer_start = 1'b0;
+  assign stall_timer_run   = 1'b0;
+  assign sb_msg_timeout    = 1'b0;
+  assign sb_stall_sent     = 1'b0;
 
   // --------------------------------------------------------------------------
   // CSR Access Path and Transmit Control

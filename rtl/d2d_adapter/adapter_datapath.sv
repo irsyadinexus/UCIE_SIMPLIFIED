@@ -59,7 +59,7 @@
 //            is 128 bits per UI.
 //
 // CLOCK / RESET
-//   lclk      - Main link clock (1 GHz at 4 GT/s).
+//   lclk      - Main link clock (500 MHz at 4 GT/s).
 //   lreset_n  - Active-low asynchronous reset. Clears all pipeline
 //               registers to zero.
 //
@@ -73,6 +73,7 @@
 //
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
+//   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -81,6 +82,7 @@
 `define AdapterDatapath_SV
 `include "ucie_pkg.sv"
 
+`timescale 1ns/1ps
 module adapter_datapath #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES
 ) (

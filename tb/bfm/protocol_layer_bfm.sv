@@ -8,12 +8,12 @@
 // The BFM is strictly an FDI device. It never reaches into the adapter or the
 // PHY. Stall is honoured by waiting for pl_stallreq to fall before offering
 // the next UI, per spec 8.3.1.
-`timescale 1ns/1ps
 `ifndef ProtLayerBfm_SV
 `define ProtLayerBfm_SV
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module protocol_layer_bfm #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES
 ) (

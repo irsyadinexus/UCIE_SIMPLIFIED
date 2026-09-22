@@ -1,10 +1,10 @@
 // Unit test: fdi_state_machine. Drives the FDI mirror of the RDI through
 // RESET -> ACTIVE -> PMNAK -> ACTIVE -> L1 -> LINKRESET -> LINKERROR ->
 // RESET, and checks the four-way active-entry handshake of 8.2.6.
-`timescale 1ns/1ps
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ut_fdi_sm;
   logic        lclk, lreset_n;
   logic [3:0]  lp_state_req;
@@ -59,7 +59,7 @@ module ut_fdi_sm;
   );
 
   initial lclk = 1'b0;
-  always #0.5 lclk = ~lclk;
+  always #1.0 lclk = ~lclk;
 
   task chk;
     input [64*8-1:0] label;

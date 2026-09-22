@@ -1,10 +1,10 @@
 // Unit test: ltsm. A single LTSM is driven through the full training
 // sequence. The partner is a second sb_codec plus a responder that echoes
 // each received request back as the matching response.
-`timescale 1ns/1ps
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ut_ltsm;
   logic        lclk, lreset_n, sbclk, sbreset_n;
   logic        start_link_train, adapter_active_req;
@@ -121,6 +121,7 @@ module ut_ltsm;
     .rx_cp_err(par_rx_cp_err), .rx_dp_err(par_rx_dp_err)
   );
 
+  logic par_enable_resp = 1'b1;
   // Responder: on each received request, send the paired response with the
   // same subcode. The LTSM accepts a request whose subcode matches its own as
   // a response, so a symmetric echo completes the handshake either way.
@@ -141,7 +142,7 @@ module ut_ltsm;
       par_tx_has_data<= 1'b0;
     end else begin
       par_tx_load  <= 1'b0;
-      if (par_rx_pkt_vld && !par_tx_busy && !par_tx_load) begin
+      if (par_enable_resp && par_rx_pkt_vld && !par_tx_busy && !par_tx_load) begin
         par_tx_load    <= 1'b1;
         par_tx_opcode  <= par_rx_opcode;
         par_tx_srcid   <= par_rx_dstid;
@@ -181,8 +182,8 @@ module ut_ltsm;
   assign pat_done = pat_enable && pat_lfsr_enable &&
                     (pat_ui == LFSR_PATTERN_UI-1);
 
-  // Timer: DIV keeps the test fast. LIMIT_CYCLES stays at the spec value.
-  ucie_timer #(.DIV(64)) u_tmr (
+  // Timer: True to spec (LIMIT_CYCLES=C_RESIDENCY = 4,000,000 lclk cycles = 8 ms).
+  ucie_timer #(.LIMIT_CYCLES(C_RESIDENCY)) u_tmr (
     .clk(lclk), .reset_n(lreset_n), .start(tmr_start),
     .running(tmr_run), .expired(tmr_expired)
   );
@@ -190,9 +191,9 @@ module ut_ltsm;
   initial lclk  = 1'b0;
   initial sbclk = 1'b0;
   // Single clock domain: the PoC samples the sideband on the same edge as
-  // the training logic, so a 1.0 ns load pulse cannot be missed.
-  always #0.5 lclk  = ~lclk;
-  always #0.5 sbclk = ~sbclk;
+  // the training logic, so a load pulse cannot be missed (staged before Phase 3 CDC).
+  always #1.0 lclk  = ~lclk;
+  always #1.0 sbclk = ~sbclk;
 
   // Record the sequence of states the LTSM walks through.
   ltsm_state_t seen [0:63];
@@ -337,6 +338,71 @@ module ut_ltsm;
       end
     end
 
+    // -----------------------------------------------------------------------
+    // Sideband Timeout Test: Partner never responds -> LTSM escalates to TRAINERROR
+    // -----------------------------------------------------------------------
+    par_enable_resp  = 1'b0; // Silence partner
+    start_link_train = 1'b0; // Clear trigger before reset
+    lreset_n  = 1'b0;
+    sbreset_n = 1'b0;
+    repeat (10) @(posedge lclk);
+    lreset_n  = 1'b1;
+    sbreset_n = 1'b1;
+    repeat (10) @(posedge lclk);
+
+    // Issue clean negedge-aligned 1-cycle training trigger
+    @(negedge lclk);
+    start_link_train = 1'b1;
+    // Wait for the LTSM to enter LT_SBINIT and pulse tmr_start.
+    @(posedge tmr_start);
+    
+    // De-assert trigger on the following negedge
+    @(negedge lclk);
+    start_link_train = 1'b0;
+    
+    // Pipeline Stage 1 (Reload Edge): 
+    // The posedge that ends this cycle samples tmr_start=1. The timer clears its 
+    // count and re-arms. It does not count this edge.
+    @(posedge lclk);
+    #0.1;
+    if (tmr_expired !== 1'b0 || ltsm_state !== LT_SBINIT) begin
+      $display("FAIL ut_ltsm: premature expiry on reload edge (state %02h)", ltsm_state);
+      errors = errors + 1;
+    end
+
+    // Pipeline Stage 2 (Running Edges 1 .. C_RESIDENCY-1):
+    // The timer is now actively counting. tmr_expired must remain 0.
+    repeat (C_RESIDENCY - 1) begin
+      @(posedge lclk);
+      #0.1;
+      if (tmr_expired !== 1'b0 || ltsm_state !== LT_SBINIT || tmr_run !== 1'b1) begin
+        $display("FAIL ut_ltsm: premature expiry or timer stalled during count (state %02h, expired %b, run %b)",
+                 ltsm_state, tmr_expired, tmr_run);
+        errors = errors + 1;
+      end
+    end
+
+    // Pipeline Stage 3 (Expiry Edge / Running Edge C_RESIDENCY):
+    // The timer reaches LIMIT_CYCLES - 1. tmr_expired pulses high for exactly one cycle.
+    @(posedge lclk);
+    #0.1;
+    if (tmr_expired !== 1'b1 || ltsm_state !== LT_SBINIT) begin
+      $display("FAIL ut_ltsm: tmr_expired did not assert at cycle %0d (state %02h, expired %b)",
+               C_RESIDENCY, ltsm_state, tmr_expired);
+      errors = errors + 1;
+    end
+
+    // Pipeline Stage 4 (TRAINERROR Transition Edge):
+    // The LTSM registers the expiry pulse and transitions to LT_TRAINERROR. tmr_expired drops.
+    @(posedge lclk);
+    #0.1;
+    if (ltsm_state !== LT_TRAINERROR || !train_error || tmr_expired !== 1'b0) begin
+      $display("FAIL ut_ltsm: did not transition to TRAINERROR (state %02h, te %b, expired %b)",
+               ltsm_state, train_error, tmr_expired);
+      errors = errors + 1;
+    end else begin
+      $display("PASS ut_ltsm: sideband timeout strictly verified for full 8 ms (cycle-exact %0d)", C_RESIDENCY);
+    end
     if (errors == 0) $display("TEST PASSED ut_ltsm");
     else             $display("FAIL ut_ltsm: %0d errors", errors);
     $finish;

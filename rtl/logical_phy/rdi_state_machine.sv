@@ -109,6 +109,7 @@ import ucie_pkg::*;
 
 
 
+`timescale 1ns/1ps
 module rdi_state_machine (
   input  logic        lclk,
   input  logic        lreset_n,

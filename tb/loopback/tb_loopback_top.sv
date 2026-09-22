@@ -11,18 +11,18 @@
 // pl_data of die A after the round trip through the adapter. The scoreboard
 // checks that round trip on each die, one direction named forward on die 0
 // and one direction named reverse on die 1.
-`timescale 1ns/1ps
 `ifndef TbLoopbackTop_SV
 `define TbLoopbackTop_SV
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module tb_loopback_top;
 
   // ------------------------------------------------------- clocks
-  // 1 GHz lclk. The sideband clock is the same domain; an async sideband
+  // 500 MHz lclk. The sideband clock is the same domain; an async sideband
   // clock would sample the single-UI sb_tx_load pulse unreliably in a
-  // functional model.
+  // functional model before Phase 3 CDC is added.
   logic lclk;
   logic sbclk;
 
@@ -30,8 +30,8 @@ module tb_loopback_top;
     lclk  = 1'b0;
     sbclk = 1'b0;
   end
-  always #0.5 lclk  = ~lclk;
-  always #0.5 sbclk = ~sbclk;
+  always #1.0 lclk  = ~lclk;
+  always #1.0 sbclk = ~sbclk;
 
   // ------------------------------------------------------- reset
   logic lreset_n;

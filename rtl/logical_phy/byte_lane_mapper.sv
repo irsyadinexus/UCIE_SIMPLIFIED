@@ -76,6 +76,7 @@
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module byte_lane_mapper #(
   parameter int unsigned NLANES = NLANES_MAX
 ) (

@@ -98,6 +98,7 @@
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module phy_csr (
   input  logic        lclk,
   input  logic        lreset_n,

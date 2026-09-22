@@ -94,7 +94,7 @@
 // --------------------------------------------------------------------------
 // Clock domains
 // --------------------------------------------------------------------------
-//   lclk     : 1 GHz link clock for the main-band data path and LTSM.
+//   lclk     : 500 MHz link clock for the main-band data path and LTSM.
 //   sbclk    : 800 MHz sideband clock for sb_codec and sideband side of the
 //              LTSM.
 //
@@ -118,12 +118,14 @@
 //   v0.0.1  2025-XX-XX  First commit to git. Hierarchical wrapper with all
 //                        sub-module instantiations, static RDI outputs, and
 //                        CSR/config stub.
+//   v0.0.2  2026-09-22  Update lclk and timer cycle comments for 500 MHz.
 // ============================================================================
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module logical_phy #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES,
   parameter int unsigned NLANES = NLANES_MAX
@@ -363,16 +365,16 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   // 8 ms Residency Timer Instantiation  (u_resid_timer)
   // ---------------------------------------------------------------------------
-  // Spec reference : 4.5.3 – every training sub-state is bounded by an 8 ms
+  // Spec reference : 4.5 – every training sub-state is bounded by an 8 ms
   //                  residency window. The LTSM asserts tmr_start on entry to
   //                  each new sub-state and holds tmr_run while the handshake
   //                  is pending. If tmr_expired fires before the handshake
   //                  completes, the LTSM escalates to TRAINERROR per 4.5.3.8.
   //
-  // ucie_timer is parameterised with C_RESIDENCY = 8_000_000 lclk cycles
-  // (8 ms at 1 GHz).  DIV=1 means no prescaler.
+  // ucie_timer is parameterised with C_RESIDENCY = 4_000_000 lclk cycles
+  // (8 ms at 500 MHz).
   // ---------------------------------------------------------------------------
-  ucie_timer #(.DIV(1), .LIMIT_CYCLES(C_RESIDENCY)) u_resid_timer (
+  ucie_timer #(.LIMIT_CYCLES(C_RESIDENCY)) u_resid_timer (
     .clk      (lclk),
     .reset_n  (lreset_n),
     .start    (tmr_start),

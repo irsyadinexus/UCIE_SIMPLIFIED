@@ -52,12 +52,13 @@
 //   Electrical parameters exist as CSR fields only.
 //
 // CLOCK / RESET
-//   lclk      - Main link clock (1 GHz).
+//   lclk      - Main link clock (500 MHz).
 //   lreset_n  - Active-low asynchronous reset. All registers are cleared
 //               to their reset values.
 //
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
+//   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -66,6 +67,7 @@
 `define AdapterRegfile_SV
 `include "ucie_pkg.sv"
 
+`timescale 1ns/1ps
 module adapter_regfile (
   input  logic        lclk,
   input  logic        lreset_n,

@@ -8,6 +8,7 @@
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module cov_monitor #(
   parameter int unsigned NSTATES = LT_NUM_STATES
 ) (

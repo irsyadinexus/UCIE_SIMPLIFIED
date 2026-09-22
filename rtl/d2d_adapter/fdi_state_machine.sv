@@ -81,11 +81,12 @@
 //   d2d_adapter and adapter_sb_if for the Active handshake coordination.
 //
 // CLOCK / RESET
-//   lclk      - Main link clock (1 GHz).
+//   lclk      - Main link clock (500 MHz).
 //   lreset_n  - Active-low asynchronous reset.
 //
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
+//   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -94,6 +95,7 @@
 `define FdiStateMachine_SV
 `include "ucie_pkg.sv"
 
+`timescale 1ns/1ps
 module fdi_state_machine (
   input  logic        lclk,
   input  logic        lreset_n,

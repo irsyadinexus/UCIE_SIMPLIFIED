@@ -1,10 +1,10 @@
 // Unit test: stall handshake (spec 8.3.1) and the streaming pass-through
 // datapath. The adapter asserts stall; the datapath must stop offering data
 // to the PHY and must not forward trdy to the Protocol Layer.
-`timescale 1ns/1ps
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ut_stall;
   logic        lclk, lreset_n;
   logic        lp_irdy, lp_valid;
@@ -39,7 +39,7 @@ module ut_stall;
   );
 
   initial lclk = 1'b0;
-  always #0.5 lclk = ~lclk;
+  always #1.0 lclk = ~lclk;
 
   initial begin
     errors = 0;

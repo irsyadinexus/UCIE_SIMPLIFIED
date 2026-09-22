@@ -113,6 +113,7 @@
 `define SbCodec_SV
 `include "ucie_pkg.sv"
 
+`timescale 1ns/1ps
 module sb_codec (
   input  logic        sbclk,         // 800 MHz sideband clock
   input  logic        sbreset_n,

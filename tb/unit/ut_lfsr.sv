@@ -1,9 +1,9 @@
 // Unit test: scrambler (per-lane LFSR) and ucie_timer.
 // Directed checks against a software reference model.
-`timescale 1ns/1ps
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ut_lfsr;
   logic        lclk, lreset_n;
   logic        data_out;
@@ -30,9 +30,8 @@ module ut_lfsr;
   initial lclk = 1'b0;
   always #1 lclk = ~lclk;
 
-  // LIMIT_CYCLES = 8 ticks, DIV = 4, so one tick per 4 tclk edges: expiry is
-  // at the 32nd edge after a clean start.
-  ucie_timer #(.LIMIT_CYCLES(8), .DIV(4)) u_timer (
+  // True to spec: C_RESET_MIN = 2,000,000 cycles.
+  ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN)) u_timer (
     .clk     (tclk),
     .reset_n (treset_n),
     .start   (tstart),
@@ -41,7 +40,7 @@ module ut_lfsr;
   );
 
   initial tclk = 1'b0;
-  always #2 tclk = ~tclk;
+  always #1.0 tclk = ~tclk;
 
   // Reference: G(x) = x^23 + x^21 + x^16 + x^8 + x^5 + x^2 + 1.
   task step_ref;
@@ -114,16 +113,29 @@ module ut_lfsr;
     @(posedge tclk);                 // edge 0: start is sampled
     @(negedge tclk);
     tstart = 1'b0;                   // deassert between edges: no race
-    repeat (31) @(posedge tclk);     // edges 1..31
+    repeat (C_RESET_MIN - 1) @(posedge tclk);
     #0.1;
     if (texpired !== 1'b0) begin
       $display("FAIL ut_lfsr: timer expired early");
       errors = errors + 1;
     end
-    @(posedge tclk);                 // edge 32
+    @(posedge tclk);                 // edge 2,000,000
     #0.1;
     if (texpired !== 1'b1) begin
       $display("FAIL ut_lfsr: timer did not expire at LIMIT_CYCLES");
+      errors = errors + 1;
+    end
+    // 4b. Verify expired is a strict one-cycle pulse while running remains high
+    @(posedge tclk);                 // edge 33
+    #0.1;
+    if (texpired !== 1'b0) begin
+      $display("FAIL ut_lfsr: timer expired held high (not a one-cycle pulse)");
+      errors = errors + 1;
+    end
+    repeat (3) @(posedge tclk);      // edges 34..36
+    #0.1;
+    if (texpired !== 1'b0) begin
+      $display("FAIL ut_lfsr: timer expired re-fired while holding count");
       errors = errors + 1;
     end
 
@@ -142,7 +154,7 @@ module ut_lfsr;
     @(negedge tclk);
     tstart = 1'b0;
     trun   = 1'b1;
-    repeat (31) @(posedge tclk);
+    repeat (C_RESET_MIN - 1) @(posedge tclk);
     #0.1;
     if (texpired !== 1'b0) begin
       $display("FAIL ut_lfsr: restart did not reload the count");
@@ -161,7 +173,7 @@ module ut_lfsr;
   end
 
   initial begin
-    #200000;
+    #40000000;
     $display("FAIL ut_lfsr: watchdog timeout");
     $finish;
   end

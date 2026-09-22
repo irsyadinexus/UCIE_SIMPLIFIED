@@ -35,7 +35,7 @@
 //   * 4 GT/s main-band rate       -- higher data rates not supported.
 //   * No CRC / retry / replay     -- legal at 4 GT/s per spec 5.10.
 //   * 800 MHz sideband clock.
-//   * 1 GHz lclk (2 GHz UI rate).
+//   * 500 MHz lclk (2 GHz main-band fCK).
 //
 // The source of truth for all spec references is UCIE.md at the repo root,
 // which is the markdown rendition of UCIE.pdf (UCIe Specification Rev 1.0,
@@ -190,7 +190,7 @@
 //                       CLOCK DOMAINS
 // ============================================================================
 //
-//   lclk       -- 1 GHz link clock.  Drives all RDI/FDI transfers and both
+//   lclk       -- 500 MHz link clock.  Drives all RDI/FDI transfers and both
 //                 the adapter and the PHY's data-path logic.  Spec 8.1.2.
 //   sbclk      -- 800 MHz sideband clock.  Drives only the sideband codec
 //                 inside the Logical PHY.  Spec 5.13.
@@ -229,13 +229,14 @@
 //                                           Raw Mode, x16 Standard Package,
 //                                           4 GT/s, no retimer, no analog PHY,
 //                                           no CXL/PCIe protocol layer.
+//   v0.0.2    2026-09-22    -               Update lclk documentation to 500 MHz.
 //
 // ============================================================================
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
-
+`timescale 1ns/1ps
 module ucie_main #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES,
   parameter int unsigned NLANES = NLANES_MAX
@@ -377,40 +378,18 @@ module ucie_main #(
   // ==========================================================================
   // D2D Adapter Instantiation  --  Spec 1.1.2, Chapter 3, Sections 8.1 / 8.2
   // ==========================================================================
+  // Bridge between protocol FDI (spec 8.2, Table 115) and PHY RDI (spec 8.1,
+  // Table 114). Sub-blocks inside d2d_adapter.sv:
+  //   - fdi_state_machine (spec 8.2.5): mirrors RDI states onto FDI.
+  //   - adapter_datapath (spec 3.2.1): Raw Mode 1:1 pass-through datapath.
+  //   - adapter_regfile (spec 7.5.3): link control, status, and error CSRs.
+  //   - adapter_sb_if (spec 6.1): FDI configuration sideband interface.
   //
-  // The D2D Adapter (spec section 1.1.2, Chapter 3 "Die-to-Die Adapter") is
-  // the bridge between the protocol layer's Flit-Aware Die-to-Die Interface
-  // (FDI, spec 8.2, Table 115) and the Raw Die-to-Die Interface (RDI,
-  // spec 8.1, Table 114) that connects to the Logical PHY.
+  // LTSM lives entirely in Logical PHY and is opaque to the adapter (spec 3.4).
   //
-  // Internal sub-blocks (all inside d2d_adapter.sv):
-  //   - FDI State Machine (fdi_state_machine.sv, spec 8.2.5, Figure 119):
-  //     Mirrors RDI state transitions onto the FDI status outputs and
-  //     forwards protocol-layer state requests to the RDI.
-  //   - Streaming Datapath (adapter_datapath.sv, spec 3.2.1, Figure 26):
-  //     Raw Mode pass-through between FDI data and RDI data.  In Streaming
-  //     Raw Mode the adapter performs no CRC, no framing, and no retry;
-  //     data bytes are forwarded 1:1.
-  //   - Adapter Register File (adapter_regfile.sv, spec 7.5.3):
-  //     Holds Link Control, Link Status, Error Log 0 and Error Log 1.
-  //   - Adapter Sideband Interface (adapter_sb_if.sv, spec 6.1.4):
-  //     Drives lp_cfg / pl_cfg toward the Logical PHY's configuration
-  //     sideband so the adapter can send and receive sideband messages
-  //     (AdvCap, FinCap, LinkMgmt) through the PHY's sideband codec.
-  //
-  // The LTSM is NOT in this block.  It lives entirely inside the Logical PHY
-  // and is opaque to the adapter -- the adapter never sees LTSM sub-states.
-  // This opacity is by design (spec 3.4, Figure 34).
-  //
-  // Port mapping groups:
-  //   (1) Clocks and reset -> lclk, lreset_n.
-  //   (2) FDI data & control -> lp_*/pl_* signals, directly connected to the
-  //       module boundary (protocol layer pins).
-  //   (3) RDI data & control -> rdi_lp_*/rdi_pl_* internal nets, connected
-  //       to the corresponding ports on u_lphy.
-  //   (4) Configuration sideband -> lp_cfg/pl_cfg with valid/credit.
-  //   (5) Trigger / observation -> start_link_train, ltsm_state_obs (unused
-  //       at top level), link_active_obs (feeds adapter_active_req).
+  // Ports:
+  //   Clocks/reset (lclk, lreset_n), FDI (lp_*/pl_*), RDI (rdi_lp_*/rdi_pl_*),
+  //   sideband config (lp_cfg/pl_cfg), and trigger/active status signals.
   // ==========================================================================
   d2d_adapter #(.NBYTES(NBYTES)) u_adapter (
     .lclk            (lclk),
@@ -470,53 +449,21 @@ module ucie_main #(
   );
 
   // ==========================================================================
-  // Logical PHY Instantiation  --  Spec 1.1.3, Chapter 4, Sections 8.1 / 8.2
+  // Logical PHY Instantiation  --  Spec 1.1.3, Chapter 4, Section 8.1
   // ==========================================================================
+  // Implements the PHY half of the RDI (Table 114) and drives external bump pins.
+  // Sub-blocks inside logical_phy.sv:
+  //   - rdi_state_machine (spec 8.1.5): manages RDI state transitions.
+  //   - ltsm (spec 4.5.3): link training sequencer across 24 spec states.
+  //   - sb_codec (spec 6.1): 800 MHz 64-bit sideband packet codec with CP/DP.
+  //   - pattern_gen (spec 4.4): training patterns (Lane-ID, VALTRAIN, LFSR).
+  //   - byte_lane_mapper (spec 4.1.1): byte-to-lane mapping and degrade modes.
+  //   - phy_csr (spec 7.5.3): electrical parameters and training control CSRs.
   //
-  // The Logical PHY (spec section 1.1.3, Chapter 4 "Logical Physical Layer")
-  // is the counterpart to the D2D Adapter on the physical side.  It presents
-  // the PHY-side half of the RDI (spec 8.1, Table 114) toward the adapter
-  // and drives the sideband serial pins and main-band data lanes toward the
-  // partner die.
-  //
-  // Internal sub-blocks (all inside logical_phy.sv):
-  //   - RDI State Machine (rdi_state_machine.sv, spec 8.1.5, Figure 111):
-  //     Manages the RDI state transitions (RESET -> ACTIVE -> L1/L2/etc.)
-  //     and publishes rdi_pl_state_sts to the adapter.
-  //   - LTSM (ltsm.sv, spec 4.5.3, Figure 69):
-  //     Link Training and Status Machine with all 24 state encodings defined
-  //     in ucie_pkg (21 reachable in this reduced scope).  The LTSM
-  //     orchestrates sideband handshakes (SBINIT, MBINIT, MBTRAIN) and
-  //     drives the pattern generator for main-band training.  It is
-  //     completely opaque to the adapter.
-  //   - Sideband Codec (sb_codec.sv, spec 6.1, Figure 46/47):
-  //     Serialises/deserialises 64-bit sideband packets at 800 MHz with
-  //     CP (command parity) and DP (data parity) protection.
-  //   - Training Pattern Generator (pattern_gen.sv, spec 4.4):
-  //     Generates Per-Lane-ID, VALTRAIN, clock-repair, and LFSR patterns
-  //     for main-band initialisation and training.
-  //   - Byte-to-Lane Mapper (byte_lane_mapper.sv, spec 4.1.1, Figures 40-43):
-  //     Maps data bytes to physical lanes for x16 and both x8 degrade halves.
-  //   - PHY CSR (phy_csr.sv, spec 7.5.3):
-  //     Electrical parameter registers (no analog circuits modelled).
-  //     Provides csr_start_link_train for software-triggered LTSM exit
-  //     from RESET.
-  //
-  // Port mapping groups:
-  //   (1) Clocks and resets -> lclk, lreset_n, sbclk, sbreset_n.
-  //   (2) Link training trigger -> start_link_train (OR'd internally with
-  //       the CSR trigger to form ltsm_start_link_train).
-  //   (3) RDI data & control -> rdi_lp_*/rdi_pl_* internal nets, connected
-  //       to the corresponding ports on u_adapter.
-  //   (4) Sideband to partner die -> sb_tx_data, sb_tx_valid, sb_rx_data,
-  //       sb_rx_valid, directly connected to module boundary pins.
-  //   (5) Main band to partner die -> mb_tx_data, mb_rx_data, directly
-  //       connected to module boundary pins.
-  //   (6) Configuration sideband -> lp_cfg/pl_cfg.  Note: the adapter
-  //       drives pl_cfg, so the PHY's observation outputs are left
-  //       unconnected (open) here.
-  //   (7) Adapter active request -> adapter_active_req, forwarded from the
-  //       adapter's link_active_obs.
+  // Ports:
+  //   Clocks/reset (lclk, sbclk), start_link_train, RDI bus (rdi_lp_*/rdi_pl_*),
+  //   external sideband (sb_tx_*/sb_rx_*), external mainband (mb_tx/mb_rx),
+  //   configuration sideband (lp_cfg/pl_cfg), and adapter_active_req.
   // ==========================================================================
   logical_phy #(.NBYTES(NBYTES), .NLANES(NLANES)) u_lphy (
     .lclk            (lclk),

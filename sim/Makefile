@@ -24,8 +24,8 @@ UNIT_TESTS := $(wildcard $(TB)/unit/*.sv)
 
 INCLUDES := -I $(RTL)/rtl_common -I $(TB)/monitors
 
-# Every file carries its own timescale; the inherited-warning is benign.
-FILTER  := grep -v inherited
+# Ensure all files explicitly compile warning-free without suppression
+FILTER  := cat
 
 .PHONY: all compile unit loopback coverage clean
 
@@ -52,22 +52,22 @@ compile:
 unit: compile
 	@mkdir -p $(OUT) $(LOGS)
 	@echo "== Unit tests"
-	@rm -f $(LOGS)/*_evidence.json
+	@rm -f $(LOGS)/*_evidence.json $(LOGS)/unit.txt
 	@status=0; \
 	for t in $(UNIT_TESTS); do \
 	  name=$$(basename $$t .sv); \
 	  echo "  $$name"; \
 	  $(IVERILOG) -g2012 -Wall $(INCLUDES) -o $(OUT)/$$name.vvp $$t \
 	      $(RTL_COMMON) $(RTL_PHY) $(RTL_ADAPT) \
-	      >> $(LOGS)/unit.txt 2>&1 || status=1; \
-	  if [ $$status -ne 0 ]; then \
-	    $(FILTER) $(LOGS)/unit.txt | tail -20; \
-	    echo "UNIT TESTS FAILED (compile)"; exit 1; \
+	      > $(LOGS)/unit_comp_$$name.txt 2>&1 || status=1; \
+	  if [ $$status -ne 0 ] || [ -s $(LOGS)/unit_comp_$$name.txt ]; then \
+	    cat $(LOGS)/unit_comp_$$name.txt; \
+	    echo "UNIT TESTS FAILED (compile/warnings on $$name)"; exit 1; \
 	  fi; \
-	  $(VVP) $(OUT)/$$name.vvp 2>&1 | $(FILTER) >> $(LOGS)/unit.txt || status=1; \
+	  $(VVP) $(OUT)/$$name.vvp 2>&1 | tee -a $(LOGS)/unit.txt || status=1; \
 	  grep -q "^TEST PASSED $$name" $(LOGS)/unit.txt || status=1; \
 	  if [ $$status -ne 0 ]; then \
-	    tail -20 $(LOGS)/unit.txt; echo "UNIT TESTS FAILED ($$name)"; exit 1; \
+	    echo "UNIT TESTS FAILED ($$name)"; exit 1; \
 	  fi; \
 	done; \
 	echo "ALL UNIT TESTS PASSED"
@@ -80,20 +80,22 @@ loopback: compile
 	@$(IVERILOG) -g2012 -Wall $(INCLUDES) -o $(OUT)/loopback.vvp \
 	    $(TB)/loopback/tb_loopback_top.sv $(TB)/monitors/cov_monitor.sv \
 	    $(TB)/bfm/protocol_layer_bfm.sv $(RTL_TOP) $(RTL_PHY) $(RTL_COMMON) \
-	    $(RTL_ADAPT) > $(LOGS)/loopback.txt 2>&1; \
+	    $(RTL_ADAPT) > $(LOGS)/loopback_comp.txt 2>&1; \
 	  status=$$?; \
-	  $(FILTER) $(LOGS)/loopback.txt; \
-	  if [ $$status -ne 0 ]; then echo "LOOPBACK FAILED (compile)"; exit 1; fi
-	@$(VVP) $(OUT)/loopback.vvp 2>&1 | $(FILTER) | tee $(LOGS)/loopback.txt
-	@grep -q "LINK ACTIVE (die 0)"  $(LOGS)/loopback.txt || \
+	  if [ $$status -ne 0 ] || [ -s $(LOGS)/loopback_comp.txt ]; then \
+	    cat $(LOGS)/loopback_comp.txt; \
+	    echo "LOOPBACK FAILED (compile/warnings)"; exit 1; \
+	  fi
+	@$(VVP) $(OUT)/loopback.vvp 2>&1 | tee $(LOGS)/loopback_run.txt
+	@grep -q "LINK ACTIVE (die 0)"  $(LOGS)/loopback_run.txt || \
 	  { echo "LOOPBACK FAILED: die 0 not active"; exit 1; }
-	@grep -q "LINK ACTIVE (die 1)"  $(LOGS)/loopback.txt || \
+	@grep -q "LINK ACTIVE (die 1)"  $(LOGS)/loopback_run.txt || \
 	  { echo "LOOPBACK FAILED: die 1 not active"; exit 1; }
-	@grep -q "RAW MODE TRANSFER OK (die0->die1)" $(LOGS)/loopback.txt || \
+	@grep -q "RAW MODE TRANSFER OK (die0->die1)" $(LOGS)/loopback_run.txt || \
 	  { echo "LOOPBACK FAILED: no die0->die1 transfer"; exit 1; }
-	@grep -q "RAW MODE TRANSFER OK (die1->die0)" $(LOGS)/loopback.txt || \
+	@grep -q "RAW MODE TRANSFER OK (die1->die0)" $(LOGS)/loopback_run.txt || \
 	  { echo "LOOPBACK FAILED: no die1->die0 transfer"; exit 1; }
-	@grep -q "^TEST PASSED" $(LOGS)/loopback.txt || \
+	@grep -q "^TEST PASSED" $(LOGS)/loopback_run.txt || \
 	  { echo "LOOPBACK FAILED"; exit 1; }
 	@echo "LOOPBACK OK"
 

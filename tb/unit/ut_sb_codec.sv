@@ -1,9 +1,9 @@
 // Unit test: sb_codec round-trip and parity error injection.
 // One codec transmits; its serial output feeds a second codec's receive input.
-`timescale 1ns/1ps
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
+`timescale 1ns/1ps
 module ut_sb_codec;
   logic        sbclk, sbreset_n;
   logic        tx_load, tx_busy;

@@ -192,7 +192,7 @@ module phy_csr (
   // =========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      csr_rdata     <= '0;
+      csr_rdata     <= 64'h0;
       csr_rdata_vld <= 1'b0;
     end else begin
       csr_rdata_vld <= csr_rd;
@@ -201,7 +201,7 @@ module phy_csr (
         CSR_ELEC_PARAM: csr_rdata <= elec_param_q;
         CSR_LINK_STS  : csr_rdata <= {48'b0, ltsm_state, 7'b0, lnk_is_x8};
         CSR_TRAIN_STS : csr_rdata <= {61'b0, degrade_lanes, train_error};
-        default       : csr_rdata <= '0;
+        default       : csr_rdata <= 64'h0;
       endcase
     end
   end

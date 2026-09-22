@@ -123,9 +123,9 @@ module pattern_gen #(
   // =========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      ui_q <= '0;
+      ui_q <= 16'h0000;
     end else if (!enable) begin
-      ui_q <= '0;
+      ui_q <= 16'h0000;
     end else begin
       ui_q <= ui_q + 1'b1;
     end

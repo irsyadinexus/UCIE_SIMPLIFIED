@@ -151,9 +151,9 @@ module adapter_datapath #(
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      tx_data_q  <= '0;
+      tx_data_q  <= {NBYTES*8{1'b0}};
       tx_valid_q <= 1'b0;
-      rx_data_q  <= '0;
+      rx_data_q  <= {NBYTES*8{1'b0}};
       rx_valid_q <= 1'b0;
     end else begin
       // While the PHY is stalled, lp_valid and lp_irdy are held low by the
@@ -193,7 +193,7 @@ module adapter_datapath #(
     // Bytes 8-15 carry no data in that mode and are driven to zero so the
     // scoreboard can verify a clean byte-for-byte compare.
     if (rdi_lnk_is_x8) begin
-      rdi_lp_data[NBYTES*8-1:NBYTES*4] = '0;
+      rdi_lp_data[NBYTES*8-1:NBYTES*4] = {NBYTES*4{1'b0}};
     end
 
     // RDI -> FDI

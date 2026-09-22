@@ -264,8 +264,8 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      rx_hdr_q  <= '0;
-      rx_ui_q   <= '0;
+      rx_hdr_q  <= 64'h0;
+      rx_ui_q   <= 4'h0;
       rx_pkt_vld <= 1'b0;
     end else if (lp_cfg_vld) begin
       rx_hdr_q  <= rx_hdr_d;
@@ -353,7 +353,7 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      tx_ui_q <= '0;
+      tx_ui_q <= 4'h0;
     end else if (tx_send) begin
       tx_ui_q <= tx_ui_q + 1'b1;
     end
@@ -373,11 +373,11 @@ module adapter_sb_if (
   // Spec ref: UCIe 1.0, Section 4.5.x - sideband inter-packet gap.
   // -------------------------------------------------------------------------
   logic [5:0] gap_q;
-  wire       in_gap = (gap_q != '0);
+  wire       in_gap = (gap_q != 6'h00);
 
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      gap_q <= '0;
+      gap_q <= 6'h00;
     end else if (tx_send && tx_ui_q == 4'd7) begin
       gap_q <= SB_GAP_UI[5:0];
     end else if (in_gap) begin
@@ -430,8 +430,8 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      crd_fdi_q   <= '0;
-      crd_remote_q<= '0;
+      crd_fdi_q   <= 2'h0;
+      crd_remote_q<= 3'h0;
     end else if (rx_pkt_vld && rx_cr) begin
       // Cr is a credit return to the requester, which is the Adapter.
       crd_remote_q <= (crd_remote_q > 0) ? crd_remote_q - 1'b1 : crd_remote_q;

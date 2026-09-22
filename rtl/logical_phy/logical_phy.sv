@@ -544,8 +544,8 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   assign csr_wr    = 1'b0;
   assign csr_rd    = 1'b0;
-  assign csr_addr  = '0;
-  assign csr_wdata = '0;
+  assign csr_addr  = 27'h0;
+  assign csr_wdata = 64'h0;
 
   // ---------------------------------------------------------------------------
   // Configuration interface stub  (spec 6.1 sideband cfg)
@@ -553,7 +553,7 @@ module logical_phy #(
   // The pl_cfg interface is unused in this build. Outputs are tied low so
   // the cfg bus is inert.
   // ---------------------------------------------------------------------------
-  assign pl_cfg     = '0;
+  assign pl_cfg     = {NC{1'b0}};
   assign pl_cfg_vld = 1'b0;
   assign pl_cfg_crd = 1'b0;
 

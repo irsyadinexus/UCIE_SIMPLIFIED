@@ -232,13 +232,13 @@ module sb_codec (
   // =========================================================================
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
-      hdr_q        <= '0;
-      payload_q    <= '0;
+      hdr_q        <= 64'h0;
+      payload_q    <= 64'h0;
       has_data_q   <= 1'b0;
-      bit_q        <= '0;
+      bit_q        <= 7'h00;
       in_gap_q     <= 1'b0;
       in_payload_q <= 1'b0;
-      gap_q        <= '0;
+      gap_q        <= 6'h00;
       sb_tx_valid  <= 1'b0;
     end else if (tx_load && !tx_busy_i) begin
       hdr_q        <= assemble_hdr(tx_opcode, tx_srcid, tx_dstid, tx_msginfo,
@@ -247,7 +247,7 @@ module sb_codec (
       hdr_q[37]    <= dp_calc;      // DP is outside the CP coverage
       payload_q    <= tx_data_in;
       has_data_q   <= tx_has_data;
-      bit_q        <= '0;
+      bit_q        <= 7'h00;
       in_payload_q <= 1'b0;
       in_gap_q     <= 1'b0;
       sb_tx_valid  <= 1'b1;
@@ -255,7 +255,7 @@ module sb_codec (
       if (!in_payload_q && bit_q == 7'd63) begin
         if (has_data_q) begin
           // Header sent and a payload follows.
-          bit_q        <= '0;
+          bit_q        <= 7'h00;
           in_payload_q <= 1'b1;
         end else begin
           sb_tx_valid  <= 1'b0;
@@ -346,13 +346,13 @@ module sb_codec (
   // =========================================================================
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
-      shift_q      <= '0;
-      cnt_q        <= '0;
+      shift_q      <= 64'h0;
+      cnt_q        <= 7'h00;
       collecting_q <= 1'b0;
       hdr_done_q   <= 1'b0;
       rx_pkt_vld   <= 1'b0;
-      hdr_lat_q    <= '0;
-      data_lat_q   <= '0;
+      hdr_lat_q    <= 64'h0;
+      data_lat_q   <= 64'h0;
     end else begin
       rx_pkt_vld <= 1'b0;
 

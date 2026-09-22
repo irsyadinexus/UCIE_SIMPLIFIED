@@ -115,9 +115,9 @@ module ucie_timer #(
   // Spec reference: N/A (DIV is a testbench convenience, not spec-defined).
   // The spec timer intervals are enforced by LIMIT_CYCLES alone.
   always_ff @(posedge clk or negedge reset_n) begin
-    if (!reset_n)        div_q <= '0;
-    else if (start)      div_q <= '0;
-    else if (tick)       div_q <= '0;
+    if (!reset_n)        div_q <= {DIV_W{1'b0}};
+    else if (start)      div_q <= {DIV_W{1'b0}};
+    else if (tick)       div_q <= {DIV_W{1'b0}};
     else if (DIV > 1)    div_q <= div_q + 1'b1;
   end
 
@@ -151,10 +151,10 @@ module ucie_timer #(
   // ref: spec 4.5.3 (timer reset on stall).
   always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
-      cnt_q    <= '0;
+      cnt_q    <= {DIV_W{1'b0}};
       expired  <= 1'b0;
     end else if (start) begin
-      cnt_q    <= '0;
+      cnt_q    <= {DIV_W{1'b0}};
       expired  <= 1'b0;
     end else if (!running) begin
       // Spec 4.5.3: Stall resets the requester timer. Holding the count while

@@ -738,11 +738,11 @@ module ltsm #(
   assign sb_tx_msginfo   = msg_info(state_q);
   assign sb_tx_msgcode   = msg_req_code(state_q);
   assign sb_tx_msgsubcode= msg_subcode(state_q);
-  assign sb_tx_be        = '0;
-  assign sb_tx_tag       = '0;
+  assign sb_tx_be        = 8'h00;
+  assign sb_tx_tag       = 5'h00;
   assign sb_tx_ep        = 1'b0;
-  assign sb_tx_addr      = '0;
-  assign sb_tx_data_in   = '0;
+  assign sb_tx_addr      = 12'h000;
+  assign sb_tx_data_in   = 64'h0;
   assign sb_tx_has_data  = 1'b0;
   assign sb_msg_timeout  = 1'b0;
   assign sb_stall_sent   = 1'b0;

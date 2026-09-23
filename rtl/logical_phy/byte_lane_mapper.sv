@@ -137,12 +137,23 @@ module byte_lane_mapper #(
   endgenerate
 
   // =========================================================================
-  // Unused signal suppression
+  // always_comb: Unused Signal Suppression
   // =========================================================================
   // lclk and lreset_n are present in the port list for interface consistency
-  // (all sub-modules of logical_phy share the same clock/reset ports) but
-  // are not used in this purely combinational mapper. An explicit always_comb
-  // reference prevents lint warnings.
+  // (all sub-modules of logical_phy share the same clock/reset ports) but are
+  // not used in this purely combinational mapper.
+  //
+  // The mapper is deliberately combinational: spec 4.1.1 defines the byte-to-
+  // lane relationship as a fixed wiring permutation, not a clocked operation.
+  // There is no state to hold, so a clock would have nothing to do. Keeping
+  // the ports anyway means the parent can instantiate every logical_phy child
+  // the same way, rather than special-casing this one.
+  //
+  // An explicit always_comb reference keeps both inputs live for the
+  // elaborator so the zero-warning compile gate passes. The assigned value is
+  // never read, so synthesis discards the whole block.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
   // =========================================================================
   logic unused;
   always_comb begin

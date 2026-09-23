@@ -6,6 +6,51 @@ accumulates counters in tb/monitors/cov_monitor.sv and writes them to
 sim/logs/coverage.json as JSON. This script reads that file and reports
 the result.
 
+Specification references
+------------------------
+  UCIe 1.0 Specification, Section 4.5.3 - Link Training State Machine
+  UCIe 1.0 Specification, Section 4.5.3.1 - RESET
+  UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping
+  UCIe 1.0 Specification, Section 4.3.7 - Width Degrade in Standard Package
+  UCIe 1.0 Specification, Section 8.3.1 - Stallreq/Ack Mechanism
+  UCIe 1.0 Specification, Section 6.1.1 - Packet Types
+  UCIe 1.0 Specification, Table 47 - sideband opcodes
+
+Purpose
+-------
+Turn raw simulation counters into a single pass/fail statement about how much
+of the reduced capability set the test suite actually exercised. The script
+exits 0 only when every reachable counter is non-zero and every documented
+unreachable state is accounted for.
+
+Inputs
+------
+  sim/logs/coverage.json          written by the loopback monitor at the end of
+                                  the run: LTSM state histogram, RDI state
+                                  histogram, sideband opcode and MsgCode
+                                  histograms, and event counters.
+  sim/logs/stall_evidence.json    written by ut_stall.sv on success.
+  sim/logs/mapper_evidence.json   written by ut_mapper.sv on success.
+
+The two evidence fragments are needed because the two test layers observe
+disjoint behaviour; see "Why two sources" below.
+
+Outputs
+-------
+A human-readable report on stdout, grouped as LTSM state coverage, RDI state
+coverage, sideband MsgCode coverage, and event coverage. The final line is
+either
+
+  COVERAGE: 100%  (21/21 reachable states, all event counters non-zero)
+
+or
+
+  COVERAGE: INCOMPLETE (N missing)
+    missing: <counter name>
+
+with one `missing:` line per hole. The process exit code is 0 for complete and
+1 for incomplete, so the Makefile needs no parsing.
+
 Coverage definition
 -------------------
 The reduced capability set is x16-only, single module, Streaming / Raw Mode.
@@ -23,6 +68,66 @@ Not every enumerated state in ucie_pkg is reachable in this configuration:
 Coverage is therefore reported over the 21 bring-up states 00h-12h, 14h,
 15h, plus the active-loopback and sideband metrics. 100% means every one of
 those counters is non-zero.
+
+Unreachable states are printed with "n/a (unreachable in this capability set)"
+and are kept out of the denominator entirely. They are never counted as holes,
+because reporting an unreachable state as a coverage gap would make 100%
+impossible to reach by construction and would hide a real regression behind a
+permanently red line.
+
+Why two sources
+---------------
+The loopback runs two real ucie_main instances and therefore exercises the
+LTSM, the RDI path, the adapter, and both sideband directions. But it is
+x16-only, and its PHY never asserts rdi_pl_stallreq. Three behaviours are
+therefore invisible to it:
+
+  * the stall four-phase handshake        (spec 8.3.1)
+  * the x8 width-degrade halves           (spec 4.3.7)
+  * the byte-reversal detection path      (spec 4.1.1)
+
+Those are exercised by the directed unit tests, which drive their DUTs
+directly and have no LTSM to reach ACTIVE first. Each writes a small JSON
+fragment when it passes. The Makefile deletes stale fragments before running,
+so a fragment present at report time can only mean that test passed in this
+same run.
+
+This is deliberate: it keeps the loopback honest (a single integrated scenario
+rather than a pile of special cases) while still proving the paths that need
+fault injection to reach.
+
+Flow
+----
+    coverage.json      (loopback)  --+
+                                      |
+    stall_evidence.json (ut_stall) --+--> cov_report.py --> stdout + exit code
+                                      |
+    mapper_evidence.json (ut_mapper)-+
+
+Design notes
+------------
+  * REACHABLE_STATES is written as an explicit literal list rather than derived
+    from STATE_NAMES. The denominator is the thing being asserted, so it should
+    be visible and reviewable at a glance, not computed.
+  * STATE_NAMES is a plain dict covering all 24 encodings, including the three
+    unreachable ones, so a report can always name a state it prints.
+  * The script is intentionally tolerant of a missing coverage.json: it prints
+    a clear instruction to run the loopback first and returns 1, rather than
+    raising a traceback. A missing input is a build-ordering problem, not a
+    crash.
+  * Counter lookups are guarded so a JSON file written by an older monitor
+    revision (missing a key) reports a hole instead of throwing KeyError.
+
+Revision history
+----------------
+  v0.0.1  2025-XX-XX  Initial creation - LTSM state and event coverage report.
+  v0.0.2  2026-09-22  Add unit-test evidence merge for stall, width degrade
+                      and lane reversal.
+  v0.0.3  2026-09-23  Documentation: expand header, add revision history.
+
+License
+-------
+  SPDX-License-Identifier: Apache-2.0
 """
 
 import json

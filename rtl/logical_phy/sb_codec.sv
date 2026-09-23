@@ -108,6 +108,10 @@
 // --------------------------------------------------------------------------
 //   v0.0.1  2025-XX-XX  First commit to git. Full TX/RX codec with CP/DP
 //                        parity, 32-UI gap, and field extraction.
+//   v0.0.2  2026-09-23  Documentation pass: added per-construct comment
+//                        blocks for tx_busy output, remaining RX field
+//                        extractions, and CP parity check assign, citing
+//                        UCIe 1.0 Section 6.1.2, 6.1.3, and Table 47.
 // ============================================================================
 `ifndef SbCodec_SV
 `define SbCodec_SV
@@ -303,6 +307,19 @@ module sb_codec (
   // tx_busy is high.
   // =========================================================================
   assign tx_busy_i = sb_tx_valid | in_gap_q;
+  // -------------------------------------------------------------------------
+  // assign: TX busy output port
+  //
+  // tx_busy is the module-level output that mirrors the internal tx_busy_i
+  // signal. The separation exists so that tx_busy_i can be used as a
+  // feedback guard inside the TX serialiser FSM (the always_ff block reads
+  // tx_busy_i to qualify tx_load) while still exporting a clean output
+  // port to the LTSM. The LTSM must treat tx_busy == 1 as a back-pressure
+  // indication: no new tx_load may be asserted until the current packet
+  // and its 32-UI inter-packet gap have completed.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity.
+  // -------------------------------------------------------------------------
   assign tx_busy   = tx_busy_i;
 
   // =========================================================================
@@ -410,6 +427,29 @@ module sb_codec (
   // rx_data      : Full 64-bit data payload from data_lat_q.
   // =========================================================================
   assign rx_opcode    = hdr_lat_q[4:0];
+  // -------------------------------------------------------------------------
+  // assign (group): Remaining RX header field extractions
+  //
+  // Each signal below is a combinational slice of the latched 64-bit RX
+  // header word (hdr_lat_q).  The bit positions correspond to the sideband
+  // header layout defined in Section 6.1.2:
+  //   rx_srcid      [7:5]   - source stack ID (Table 49)
+  //   rx_dstid      [10:8]  - destination stack ID (Table 49)
+  //   rx_msginfo    [18:11] - message-specific info field
+  //   rx_msgcode    [26:19] - message code (Tables 53/54/56)
+  //   rx_msgsubcode [34:27] - message sub-code (Tables 53/54/56)
+  //   rx_cr         [35]    - credit-return bit
+  //   rx_addr       [63:52] - 12-bit address field
+  //   rx_be         [45:38] - byte enables
+  //   rx_tag        [50:46] - 5-bit transaction tag
+  //   rx_ep         [51]    - error / poison indicator
+  //   rx_data                - full 64-bit payload from data_lat_q
+  // These outputs are stable from the rising edge that sets rx_pkt_vld
+  // until the next packet reception begins.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.2 - Packet Formats;
+  //           Table 47 - sideband opcodes.
+  // -------------------------------------------------------------------------
   assign rx_srcid     = hdr_lat_q[7:5];
   assign rx_dstid     = hdr_lat_q[10:8];
   assign rx_msginfo   = hdr_lat_q[18:11];
@@ -431,6 +471,18 @@ module sb_codec (
   // coincident with rx_pkt_vld.
   // =========================================================================
   wire [63:0] hdr_cp_mask = {hdr_lat_q[63:38], 2'b00, hdr_lat_q[35:0]};
+  // -------------------------------------------------------------------------
+  // assign: Command-parity error flag (rx_cp_err)
+  //
+  // Compares the re-computed even parity of the received header (with
+  // CP and DP bit-positions masked to zero) against the received CP
+  // value stored in hdr_lat_q[36].  A mismatch means the header was
+  // corrupted in transit.  rx_cp_err is asserted for exactly one cycle,
+  // coincident with rx_pkt_vld, so consumers can register the error
+  // together with the packet fields.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity.
+  // -------------------------------------------------------------------------
   assign rx_cp_err = rx_pkt_vld && (^hdr_cp_mask != hdr_lat_q[36]);
 
   // =========================================================================

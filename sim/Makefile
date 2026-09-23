@@ -1,9 +1,143 @@
-# UCIe 1.0 Simplified Endpoint - simulation driver.
+# ============================================================================
+# File      : sim/Makefile
+# Project   : UCIe 1.0 Simplified Endpoint
+# Purpose   : Simulation driver for the UCIe 1.0 Simplified Endpoint RTL.
+# ----------------------------------------------------------------------------
 #
-# Targets: compile / unit / loopback / coverage / clean / all
+# SPECIFICATION REFERENCES
+#   UCIe 1.0 Specification, Section 8.0 - Interface Definitions
+#   UCIe 1.0 Specification, Section 8.1 - Raw Die-to-Die Interface (RDI)
+#   UCIe 1.0 Specification, Section 8.2 - Flit-Aware Die-to-Die Interface (FDI)
+#   UCIe 1.0 Specification, Section 8.3.1 - Stallreq/Ack Mechanism
+#   UCIe 1.0 Specification, Section 4.5.3 - Link Training State Machine
+#   UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping
 #
-# Requires Icarus Verilog 12.0 and Python 3 on PATH. Developed and verified
-# under WSL Ubuntu 24.04 with /usr/bin/iverilog.
+# DESCRIPTION
+#   This Makefile is the single entry point for building and exercising the
+#   whole UCIe endpoint. It compiles every RTL file, runs the directed unit
+#   tests, runs the two-die loopback bring-up, and produces the coverage
+#   report. It is deliberately the only place that knows the source file
+#   lists and the pass/fail strings, so the tests themselves stay free of
+#   build knowledge.
+#
+#   The verification strategy has three independent layers:
+#
+#     1. compile  - Elaborates the full RTL with -g2012 -Wall. ZERO warnings
+#                   is the gate, not merely zero errors. Warnings are read
+#                   back from a log file rather than trusted from the exit
+#                   code, because Icarus returns 0 for some diagnostics.
+#
+#     2. unit     - Eight directed testbenches in tb/unit/, one per FSM and
+#                   datapath block. Each drives its DUT directly and prints
+#                   the literal line "TEST PASSED <name>". The recipe checks
+#                   for that exact string, so a test that merely compiles but
+#                   never asserts success still fails the gate.
+#
+#     3. loopback - Two real ucie_main instances with the sideband and main
+#                   band crossed die-to-die. This is the only test that
+#                   exercises the whole stack together: adapter, logical PHY,
+#                   LTSM bring-up, and Raw Mode streaming in both directions.
+#
+#   Coverage is computed by sim/cov_report.py from a JSON file that the
+#   loopback monitor writes, combined with per-test evidence fragments. See
+#   the coverage target below for why two sources are required.
+#
+# FLOW DIAGRAM
+#
+#                        make -C sim all
+#                              |
+#                              v
+#                   +----------------------+
+#                   |  compile (gate)      |
+#                   |  iverilog -g2012     |
+#                   |  -Wall, zero warn    |
+#                   +----------+-----------+
+#                              |
+#              +---------------+---------------+
+#              |                               |
+#              v                               v
+#     +------------------+           +--------------------+
+#     |  unit            |           |  loopback          |
+#     |  tb/unit/*.sv    |           |  tb/loopback/      |
+#     |  8 directed DUT  |           |  2x ucie_main      |
+#     |  testbenches     |           |  crossed die-to-die|
+#     +--------+---------+           +---------+----------+
+#              |                               |
+#              |  TEST PASSED <name>           |  LINK ACTIVE (die 0/1)
+#              |  *_evidence.json              |  RAW MODE TRANSFER OK
+#              |                               |  coverage.json
+#              +---------------+---------------+
+#                              |
+#                              v
+#                   +----------------------+
+#                   |  cov_report.py       |
+#                   |  merges both sources |
+#                   |  prints COVERAGE:    |
+#                   +----------------------+
+#
+# TARGETS
+#   all       - compile + unit + loopback + coverage. The full gate.
+#   compile   - Elaborate all RTL with -Wall. Fails on any warning.
+#   unit      - Build and run every tb/unit/*.sv testbench.
+#   loopback  - Build and run the two-die bring-up plus streaming test.
+#   coverage  - Run unit and loopback, then report merged coverage.
+#   clean     - Remove out/ and logs/.
+#
+# DIRECTORY LAYOUT
+#   ROOT   = ..                        repository root
+#   RTL    = ../rtl                    all synthesizable SystemVerilog
+#   TB     = ../tb                     all testbench code
+#   OUT    = out                       compiled .vvp simulation binaries
+#   LOGS   = logs                      compile logs, run logs, coverage JSON
+#
+#   RTL is split into three source groups that are always compiled together:
+#   rtl_common (package, scrambler, timer), logical_phy (the physical layer),
+#   and d2d_adapter (the adapter). ucie_main.sv is the single top level.
+#
+# TOOLCHAIN
+#   Requires Icarus Verilog 12.0 and Python 3 on PATH. Developed and verified
+#   under WSL Ubuntu 24.04 with /usr/bin/iverilog. Override the tools on the
+#   command line if needed, for example: make IVERILOG=/opt/iverilog/bin/iverilog
+#
+#   INCLUDES puts rtl/rtl_common and tb/monitors on the include search path so
+#   ucie_pkg.sv and the coverage monitor header resolve without relative paths.
+#
+# DESIGN NOTES
+#   - FILTER is `cat`: the log is passed through unchanged. It exists as a
+#     single knob so the filtering policy is explicit and cannot silently
+#     suppress a diagnostic.
+#   - The compile target reads the log back with `[ -s ... ]` rather than
+#     relying on the exit status alone, because some Icarus diagnostics do not
+#     set a non-zero status. Warnings therefore cannot slip past the gate.
+#   - The unit target deletes stale *_evidence.json fragments before running,
+#     so a fragment can only exist because that test passed in THIS run. This
+#     is what stops a previous green run from faking coverage.
+#   - Each unit test is verified by grepping for the literal string
+#     "TEST PASSED <name>" in the combined log. A test whose assertions were
+#     skipped still fails the gate because the line never appears.
+#   - The loopback target greps for four distinct success strings plus the
+#     final "TEST PASSED". Checking the intermediate strings localises a
+#     failure: "no die0->die1 transfer" tells you bring-up worked but the
+#     forward datapath did not.
+#   - Coverage depends on BOTH unit and loopback. The loopback is x16-only and
+#     its PHY never asserts rdi_pl_stallreq, so the stall four-phase
+#     (spec 8.3.1), the x8 width-degrade halves and the byte reversal
+#     (spec 4.1.1) are observable only in the directed unit tests. The report
+#     needs both sources to reach 100%.
+#   - Simulator performance is a deliberate design concern. The main-band
+#     forwarded clock runs at 2 GHz (Req.2), which is 16 million edges across
+#     the 4 ms RESET dwell it must observe (Req.1). Testbenches gate that clock
+#     while the link is idle so Icarus does not evaluate an idle event queue
+#     for the whole reset period.
+#
+# REVISION HISTORY
+#   v0.0.1  2025-XX-XX  Initial creation - compile, unit and loopback targets.
+#   v0.0.2  2026-09-22  Add the coverage target and cov_report.py integration.
+#   v0.0.3  2026-09-23  Documentation: expand header, add revision history.
+#
+# LICENSE
+#   SPDX-License-Identifier: Apache-2.0
+# ============================================================================
 
 IVERILOG ?= iverilog
 VVP     ?= vvp

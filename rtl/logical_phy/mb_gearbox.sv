@@ -79,6 +79,8 @@
 //                                    always @* with a case on cyc_q, and use
 //                                    an NBA on the DDR pin mux, so Icarus
 //                                    keeps the 2 GHz event queue small.
+//   0.0.3 2026-09-23  -           Documentation: add per-construct comment
+//                                    blocks with spec references.
 // ============================================================================
 `ifndef MbGearbox_SV
 `define MbGearbox_SV
@@ -107,10 +109,20 @@ module tx_gearbox #(
   localparam int unsigned CYC_W = 2;            // 0..3 cycle counter
   localparam logic [CYC_W-1:0] LAST_CYC = CYC_W'(NCYC-1);
 
-  // -----------------------------------------------------------------------
-  // lclk domain: word and framing registers. Single writer each. valid_q
-  // clears whenever no word is loaded, so an idle lclk deasserts framing.
-  // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // always_ff: lclk Domain Word and Framing Registers
+  //
+  // Captures the 128-bit TX word and its valid qualifier from the RDI /
+  // logical-PHY datapath on each posedge lclk.  word_q holds the data
+  // and valid_q holds the framing flag.  Both are single-writer
+  // registers in the lclk domain.
+  //
+  // valid_q is set only when both tx_load and tx_valid are asserted in
+  // the same cycle; otherwise it clears, ensuring the framing bit on
+  // the mainband deasserts during idle lclk cycles.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   logic [NBYTES*8-1:0] word_q;
   logic                valid_q;
 
@@ -124,11 +136,25 @@ module tx_gearbox #(
     end
   end
 
-  // -----------------------------------------------------------------------
-  // mbclk domain: word snapshot, framing snapshot and cycle counter. Single
-  // writer for each. The snapshot is preloaded at the last cycle so all four
-  // cycles of the next word read one stable copy (no tearing).
-  // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // always_ff: mbclk Domain Snapshot and Cycle Counter
+  //
+  // Runs on posedge mbclk (2 GHz forwarded clock, spec Section 5.2).
+  // Maintains three registers:
+  //   ser_q     — 128-bit word snapshot used by the phase-gather mux.
+  //   ser_val_q — framing-valid snapshot, driven to mb_tx_valid.
+  //   cyc_q     — 2-bit cycle counter (0..3), one count per mbclk cycle.
+  //
+  // Single-edge-flop snapshot discipline: ser_q and ser_val_q are
+  // PRELOADED on the last cycle (cyc_q == LAST_CYC) from the lclk-
+  // domain registers word_q and valid_q.  This ensures the snapshot is
+  // stable for all four mbclk cycles of the next word — no tearing is
+  // possible because the lclk register is written only once per four
+  // mbclk cycles and the snapshot is taken at a deterministic phase.
+  //
+  // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock);
+  //           Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   logic [NBYTES*8-1:0] ser_q;
   logic                ser_val_q;
   logic [CYC_W-1:0]    cyc_q;
@@ -147,11 +173,24 @@ module tx_gearbox #(
     end
   end
 
-  // -----------------------------------------------------------------------
-  // I/O wrapper region: per-lane gather for the two phases. At UI u lane L
-  // drives bit (8*L + u) of the word snapshot. Constant bit indices per
-  // cycle keep the selectors synthesizable.
-  // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // always @*: Per-Lane Phase-Gather Combinational Mux
+  //
+  // Implements the spec 4.1.1 equation:  mb_tx_data[lane] = word[8*lane + u]
+  //
+  // At each mbclk cycle c (c = cyc_q = 0..3), two UIs are transmitted
+  // per lane:
+  //   hi_w[L] = ser_q[8*L + 2*c]     (rising / high phase, even UI)
+  //   lo_w[L] = ser_q[8*L + 2*c + 1] (falling / low phase, odd UI)
+  //
+  // The case statement selects constant bit indices per cycle so the
+  // gather is a pure wiring mux with no barrel shifter, keeping the
+  // combinational depth minimal.  Each lane independently picks one
+  // bit from its own byte — this is the GATHER operation (not a
+  // contiguous-slice shift).
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   logic [NLANES-1:0] hi_w, lo_w;
 
   always @* begin
@@ -182,10 +221,47 @@ module tx_gearbox #(
       end
     endcase
   end
+
+  // -------------------------------------------------------------------------
+  // always: DDR Pin Mux — Level-Sensitive Output Selection
+  //
+  // Selects hi_w (rising-phase data) when mbclk is high and lo_w
+  // (falling-phase data) when mbclk is low.  Uses a non-blocking
+  // assignment (NBA) so the output transitions cleanly in the inactive
+  // region of the simulation event queue, avoiding glitches in Icarus
+  // Verilog's 2 GHz scheduler.  This is NOT a registered flop — it is
+  // an event-driven latch-like construct that models the DDR output
+  // buffer behaviour on the forwarded clock.
+  //
+  // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock DDR).
+  // -------------------------------------------------------------------------
   // Uses NBA so output transitions cleanly in the inactive region of the edge.
   logic [NLANES-1:0] tx_mux;
   always @(mbclk or hi_w or lo_w) tx_mux <= mbclk ? hi_w : lo_w;
+
+  // -------------------------------------------------------------------------
+  // assign: Main-Band TX Data Output
+  //
+  // Drives the 16-lane main-band transmit data bus from the DDR pin
+  // mux (tx_mux).  This is a direct wire alias with no additional
+  // logic — the per-lane bit selection is handled entirely by the
+  // phase-gather combinational mux and the DDR pin mux above.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   assign mb_tx_data  = tx_mux;
+
+  // -------------------------------------------------------------------------
+  // assign: Main-Band TX Valid / Framing Output
+  //
+  // Drives the framing-valid indicator for the main-band transmit bus.
+  // ser_val_q is the mbclk-domain snapshot of valid_q (lclk domain),
+  // preloaded at the last mbclk cycle so it remains stable for all four
+  // cycles of the word.  The receiver uses this bit to determine
+  // whether the data on the mainband lanes constitutes a valid beat.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   assign mb_tx_valid = ser_val_q;
 endmodule
 
@@ -211,11 +287,22 @@ module rx_gearbox #(
   localparam int unsigned CYC_W = 2;
   localparam logic [CYC_W-1:0] LAST_CYC = CYC_W'(NCYC-1);
 
-  // -----------------------------------------------------------------------
-  // negedge mbclk: capture the high-phase lane vector. The pin carries the
-  // even UI for the whole high phase, so this register takes bit 2c of every
-  // lane. Single writer.
-  // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // always_ff (negedge mbclk): High-Phase Lane Capture Register
+  //
+  // Samples the mainband receive data on the falling edge of mbclk.
+  // During the high phase of each mbclk cycle the DDR pins carry the
+  // even UI (bit 2c of every lane byte).  The negedge captures this
+  // value into even_cap_q so it is available to the posedge assembler
+  // below alongside the odd UI.
+  //
+  // This is a single-edge flop (negedge mbclk) — not a dual-edge
+  // construct — consistent with the synthesis discipline described in
+  // the file header.
+  //
+  // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock DDR);
+  //           Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   logic [NLANES-1:0] even_cap_q;
 
   always_ff @(negedge mbclk or negedge lreset_n) begin
@@ -223,13 +310,26 @@ module rx_gearbox #(
     else           even_cap_q <= mb_rx_data;
   end
 
-  // -----------------------------------------------------------------------
-  // posedge mbclk: scatter one UI pair per cycle. Just before this edge the
-  // pin carries the odd UI, so lane L supplies bit 2c+1 from mb_rx_data and
-  // bit 2c from even_cap_q. A completed word is copied whole into
-  // word_hold_q on the last cycle so the lclk domain never reads a partially
-  // assembled buffer.
-  // -----------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // always_ff (posedge mbclk): Word Assembler and Cycle Counter
+  //
+  // On each posedge mbclk, scatters one UI pair (even from even_cap_q,
+  // odd from mb_rx_data) into the correct bit positions of the 128-bit
+  // assembly register asm_q.  The scatter follows the spec 4.1.1
+  // byte-to-lane mapping:
+  //   asm_q[8*L + 2*c]   <= even_cap_q[L]   (even UI)
+  //   asm_q[8*L + 2*c+1] <= mb_rx_data[L]   (odd UI)
+  //
+  // On the last cycle (cyc_q == LAST_CYC = 3), the fully assembled
+  // word is copied into word_hold_q and asm_val_q captures the framing
+  // valid.  word_hold_q is a complete, non-tearing snapshot: it
+  // explicitly builds each byte from the current pair (bits 7:6) plus
+  // the six bits already accumulated in asm_q, so the lclk domain
+  // never reads a partially assembled buffer.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping;
+  //           Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   logic [NBYTES*8-1:0] asm_q;
   logic [NBYTES*8-1:0] word_hold_q;
   logic [CYC_W-1:0]    cyc_q;
@@ -266,8 +366,23 @@ module rx_gearbox #(
       cyc_q <= (cyc_q == LAST_CYC) ? {CYC_W{1'b0}} : cyc_q + 1'b1;
     end
   end
-  // lclk domain: present the completed, stable word and its framing strobe.
-  // -----------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // always_ff (posedge lclk): RX Output Registers — lclk Domain Transfer
+  //
+  // Captures word_hold_q and asm_val_q from the mbclk domain into the
+  // lclk domain on each posedge lclk.  Because word_hold_q is a
+  // complete non-tearing snapshot (written only on the last mbclk cycle
+  // of each word), and lclk is phase-locked at fCK/4, this register
+  // always samples a fully assembled 128-bit word.
+  //
+  // rx_word_vld acts as a one-cycle strobe indicating that rx_word
+  // contains a valid received beat.  Downstream RDI logic uses this as
+  // the rdi_pl_valid qualifier.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
+  //           Section 8.1.2 - Interface clocking requirements.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       rx_word     <= {NBYTES*8{1'b0}};

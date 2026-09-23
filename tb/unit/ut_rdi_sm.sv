@@ -1,6 +1,93 @@
-// Unit test: rdi_state_machine. Walks RESET -> ACTIVE -> L1 -> ACTIVE ->
-// LINKRESET -> ACTIVE -> RETRAIN -> ACTIVE -> LINKERROR -> LINKRESET ->
-// DISABLED, and checks the 8.1.6 active-entry gating.
+// ============================================================================
+// Module    : ut_rdi_sm
+// Project   : UCIe 1.0 Simplified Endpoint
+// File      : tb/unit/ut_rdi_sm.sv
+// ----------------------------------------------------------------------------
+//
+// SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 8.1 - Raw Die-to-Die Interface (RDI)
+//   UCIe 1.0 Specification, Section 8.1.5 - RDI State Status Machine
+//   UCIe 1.0 Specification, Section 8.1.6 - RDI bring up flow
+//   UCIe 1.0 Specification, Section 8.1.7 - RDI PM flow
+//   UCIe 1.0 Specification, Section 8.3.2 - State Request and Status
+//   UCIe 1.0 Specification, Table 114 - RDI Signal List
+//
+// DESCRIPTION
+//   Directed unit test for the RDI state machine (rtl/logical_phy/
+//   rdi_state_machine.sv). The DUT is instantiated directly and driven
+//   pin-by-pin; there is no LTSM and no link, so every state transition is
+//   requested explicitly by the stimulus and observed on the status outputs.
+//
+//   This is the only test that exercises the RDI state machine in isolation.
+//   The loopback test reaches ACTIVE and stops there, so the return paths
+//   (ACTIVE -> L1 -> ACTIVE), the re-entry paths (LINKRESET, RETRAIN) and the
+//   error paths (LINKERROR, DISABLED) are reachable only here.
+//
+//   The test walks this sequence:
+//
+//     RESET -> ACTIVE -> L1 -> ACTIVE -> LINKRESET -> ACTIVE
+//           -> RETRAIN -> ACTIVE -> LINKERROR -> LINKRESET -> DISABLED
+//
+//   and, in addition to the state sequence itself, checks the active-entry
+//   gating described in spec 8.1.6: the machine must not report ACTIVE until
+//   the protocol layer, the adapter and the PHY all assert their respective
+//   active requests. That gating is the reason `chk` alone is insufficient
+//   here and the test also drives the three request inputs independently.
+//
+// INTERNAL BLOCK DIAGRAM
+//
+//   +======================================================================+
+//   |                            ut_rdi_sm                                 |
+//   |                                                                      |
+//   |   stimulus (initial)                    scoreboard (task chk)        |
+//   |   +------------------------+            +------------------------+   |
+//   |   | drives:                |            | compares               |   |
+//   |   |  rdi_lp_state_req[3:0] |            |  rdi_pl_state_sts[3:0] |   |
+//   |   |  rdi_lp_stallack       |            |  against the expected  |   |
+//   |   |  phy_link_trained      |            |  encoding, per step    |   |
+//   |   |  phy_link_reset        |            +-----------+------------+   |
+//   |   |  phy_retrain_req       |                        |                |
+//   |   |  phy_train_error       |                        |                |
+//   |   |  adapter_active_req    |                        |                |
+//   |   |  local_active_req      |                        |                |
+//   |   +-----------+------------+                        |                |
+//   |               |                                     |                |
+//   |               v                                     ^                |
+//   |     +----------------------------------------------+  |              |
+//   |     |        rdi_state_machine  (u_dut)            |  |              |
+//   |     |  RESET/ACTIVE/L1/LINKRESET/RETRAIN/          |--+              |
+//   |     |  LINKERROR/DISABLED   spec 8.1.5             |                 |
+//   |     +----------------------------------------------+                 |
+//   |               ^                                                      |
+//   |   lclk = 500 MHz (always #1.0), lreset_n driven by stimulus          |
+//   +======================================================================+
+//
+// STIMULUS SEQUENCE
+//   The `initial` block asserts a fixed state request on rdi_lp_state_req,
+//   waits a bounded number of clocks, then calls `chk` to confirm the DUT
+//   reached the corresponding status encoding before moving on. Each step is
+//   therefore a request/observe pair, and a wrong or late transition stops
+//   the walk at the step that failed.
+//
+// PASS / FAIL CRITERIA
+//   Every `chk` call compares rdi_pl_state_sts against the expected encoding
+//   and increments the shared `errors` count on a mismatch. The test prints
+//   "TEST PASSED ut_rdi_sm" only when `errors` is zero at the end; the Makefile
+//   greps for exactly that string, so a run that skips assertions still fails.
+//
+// CLOCK / RESET
+//   lclk is generated at 500 MHz (2.0 ns period) to match the interface
+//   clocking requirement of spec 8.1.2. lreset_n is driven low at the start
+//   and released by the stimulus, so the RESET status encoding is observed
+//   before any transition is requested.
+//
+// REVISION HISTORY
+//   v0.0.1  2025-XX-XX  Initial creation - RDI state walk and active gating.
+//   v0.0.2  2026-09-23  Documentation: expand header, add per-block comments.
+//
+// LICENSE
+//   SPDX-License-Identifier: Apache-2.0
+// ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
@@ -27,6 +114,27 @@ module ut_rdi_sm;
   logic        local_active_req;
   int          errors;
 
+  // -------------------------------------------------------------------------
+  // Instantiation: rdi_state_machine (u_dut) - device under test
+  //
+  // The only instance in this file. Every port is wired either to a stimulus
+  // register driven by the `initial` block or to a monitor wire read by `chk`;
+  // nothing is tied off, so the test cannot accidentally pass because an input
+  // was permanently strapped to a convenient value.
+  //
+  // The three request inputs are deliberately separate signals rather than one
+  // shared driver. Spec 8.1.6 requires the machine to withhold ACTIVE until the
+  // protocol layer (rdi_lp_state_req), the adapter (adapter_active_req) and the
+  // local PHY (local_active_req) have all requested it, and keeping them
+  // distinct is what lets the stimulus assert them one at a time and prove the
+  // gate actually holds.
+  //
+  // The status output under observation is rdi_pl_state_sts, compared against
+  // the expected encoding after each request.
+  //
+  // Spec ref: UCIe 1.0, Section 8.1.5 - RDI State Status Machine; Section 8.1.6
+  // - RDI bring up flow.
+  // -------------------------------------------------------------------------
   rdi_state_machine u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
     .rdi_lp_state_req(rdi_lp_state_req),
@@ -49,6 +157,17 @@ module ut_rdi_sm;
     .local_active_req(local_active_req)
   );
 
+  // -------------------------------------------------------------------------
+  // Clock generator: lclk - 500 MHz RDI interface clock
+  //
+  // Toggles every 1.0 ns, giving a 2.0 ns period and therefore 500 MHz, which
+  // is the RDI interface clock rate of this configuration. The RDI is a
+  // synchronous interface: state requests are sampled and status is updated on
+  // this edge, so the stimulus always changes its inputs away from the edge to
+  // avoid a race between the driver and the DUT.
+  //
+  // Spec ref: UCIe 1.0, Section 8.1.2 - Interface clocking requirements.
+  // -------------------------------------------------------------------------
   initial lclk = 1'b0;
   always #1.0 lclk = ~lclk;
 

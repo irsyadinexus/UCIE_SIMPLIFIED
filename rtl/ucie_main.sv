@@ -544,6 +544,9 @@ module ucie_main #(
   // The OR reduction ensures every bit contributes to a single unused wire,
   // which the synthesis tool will optimise away, silencing -Wunused-variable
   // and -Wunused-port warnings in Icarus Verilog 12.0 and commercial tools.
+  //
+  // Spec ref: UCIe 1.0, Table 114 - RDI Signal List (full-width RDI port map);
+  //           UCIe 1.0, Table 68 - Sideband and Configuration signal list.
   // --------------------------------------------------------------------------
   logic unused;
   assign unused = sbreset_n | rdi_lp_stallack | pl_cfg[0] | pl_cfg_vld |

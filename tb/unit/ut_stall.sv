@@ -1,6 +1,137 @@
-// Unit test: stall handshake (spec 8.3.1) and the streaming pass-through
-// datapath. The adapter asserts stall; the datapath must stop offering data
-// to the PHY and must not forward trdy to the Protocol Layer.
+// ============================================================================
+// File        : ut_stall.sv
+// Project     : UCIe Simplified RTL
+// Unit        : Unit Test — Stall Handshake and Streaming Datapath
+// ----------------------------------------------------------------------------
+//
+// SPDX-License-Identifier: Proprietary
+//
+// Copyright (c) 2025–2026.  All rights reserved.
+//
+// ============================================================================
+//
+// DESCRIPTION
+// -----------
+// This unit test exercises the adapter_datapath module to verify that:
+//
+//   1. Stall handshake operates correctly per UCIe Specification
+//      Section 8.3.1 — Stallreq/Ack Mechanism.
+//      When stall_active is asserted by the testbench, the DUT must
+//      de-assert rdi_lp_irdy (blocking data towards the PHY) and
+//      de-assert pl_trdy (blocking acknowledgement towards the
+//      Protocol Layer).  Once stall_active is released, normal
+//      flow resumes within one clock cycle.
+//
+//   2. Streaming pass-through datapath:
+//      In the absence of a stall condition, FDI-side transmit data
+//      (lp_data, lp_valid, lp_irdy) is forwarded through the
+//      pipeline register to the RDI-side outputs (rdi_lp_data,
+//      rdi_lp_valid, rdi_lp_irdy).  Likewise, RDI-side receive
+//      data (rdi_pl_data, rdi_pl_valid, rdi_pl_trdy) is forwarded
+//      to the FDI-side outputs (pl_data, pl_valid, pl_trdy).
+//      The stream sideband (lp_stream → pl_stream) is also checked.
+//
+//   3. Data preservation through the pipeline register:
+//      Transmit data written on the FDI side must appear at the
+//      RDI output unchanged after one pipeline stage.  Receive
+//      data from the PHY must appear at the FDI output unchanged.
+//
+//   4. Stall blocks irdy/trdy:
+//      While stall_active == 1, rdi_lp_irdy must be low (no new
+//      data offered to the PHY) and pl_trdy must be low (Protocol
+//      Layer sees back-pressure).
+//
+//   5. Data held across stall:
+//      Data presented at the FDI input while stall_active is high
+//      must not be lost.  When the stall is released, the held
+//      data must flow through the pipeline and appear on the
+//      RDI output with correct values.
+//
+//   6. x8 width degrade zeroes upper bytes:
+//      When rdi_lnk_is_x8 is asserted, the upper half of the
+//      NBYTES-wide data bus on the RDI side must be forced to
+//      zero, while the lower half carries the valid data pattern.
+//
+// DUT
+// ---
+//   adapter_datapath  u_dut
+//
+// STIMULUS
+// --------
+//   The testbench directly drives:
+//     - FDI-side signals : lp_irdy, lp_valid, lp_data, lp_stream,
+//                          lp_stallack, lp_rx_active_sts
+//     - RDI-side signals : rdi_pl_trdy, rdi_pl_valid, rdi_pl_data
+//     - Control          : stall_active  (toggled by testbench)
+//                          rdi_lnk_is_x8 (toggled by testbench)
+//
+//   No protocol-level BFM is used; all inputs are directly driven
+//   from an initial block.  Reset is held for 5 ns, then released.
+//
+// PASS / FAIL CRITERIA
+// --------------------
+//   The test checks the following DUT outputs against expected values:
+//
+//     Signal          | What is verified
+//     ----------------+------------------------------------------------
+//     rdi_lp_data     | TX data integrity after pipeline register
+//     rdi_lp_valid    | Asserted one cycle after lp_valid sampled
+//     rdi_lp_irdy     | Tracks lp_irdy when unstalled; forced low
+//                     |   when stall_active == 1
+//     pl_data         | RX data integrity from PHY to Protocol Layer
+//     pl_valid        | Forwarded from rdi_pl_valid
+//     pl_trdy         | Tracks rdi_pl_trdy when unstalled; forced
+//                     |   low when stall_active == 1
+//
+//   Any mismatch increments an error counter.  The test prints
+//   "TEST PASSED ut_stall" when errors == 0 and
+//   "FAIL ut_stall: N errors" otherwise.
+//
+//   On success, a JSON evidence file (logs/stall_evidence.json)
+//   is written for coverage-report merging.
+//
+// CLOCK / RESET
+// -------------
+//   Clock  : always #1.0 lclk = ~lclk  →  2 ns period  →  500 MHz
+//   Reset  : lreset_n driven low at time 0, released after 5 ns.
+//
+// BLOCK DIAGRAM
+// -------------
+//
+//         FDI (Protocol-Layer side)         RDI (PHY-Layer side)
+//        ┌─────────────────────┐           ┌─────────────────────┐
+//        │                     │           │                     │
+//  lp_irdy  ──────────►┐      │           │      ┌──────────► rdi_lp_irdy
+//  lp_valid ──────────►│      │           │      │──────────► rdi_lp_valid
+//  lp_data  ──────────►│      │           │      │──────────► rdi_lp_data
+//  lp_stream ─────────►│      │           │      │
+//  lp_stallack ────────►│ DUT  │           │      │
+//  lp_rx_active_sts ──►│      │           │      │
+//        │              │ adapter_datapath │      │
+//  pl_trdy  ◄──────────┤      │           │      ├◄────────── rdi_pl_trdy
+//  pl_valid ◄──────────┤      │           │      ├◄────────── rdi_pl_valid
+//  pl_data  ◄──────────┤      │           │      ├◄────────── rdi_pl_data
+//  pl_stream ◄─────────┤      │           │      │
+//        │              │      │           │      │
+//        └─────────────┤      ├───────────┤      ├────────────┘
+//                       │      │           │      │
+//                       └──┬───┘           └──────┘
+//                          │
+//          stall_active ───┘
+//          rdi_lnk_is_x8 ──┘
+//          lclk ────────────┘
+//          lreset_n ────────┘
+//
+// REFERENCES
+// ----------
+//   UCIe Specification, Section 8.3.1 - Stallreq/Ack Mechanism
+//
+// REVISION HISTORY
+// ----------------
+//   v0.0.1  2025-XX-XX  Initial creation.
+//   v0.0.2  2026-09-23  Documentation: expand header, add per-block comments.
+//
+// ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
@@ -23,6 +154,18 @@ module ut_stall;
   int          errors;
   integer fd;
 
+// ---------------------------------------------------------------------------
+// DUT Instantiation — adapter_datapath
+// ---------------------------------------------------------------------------
+// The adapter_datapath module is the design under test.  All FDI-side
+// transmit signals (lp_*) and RDI-side receive signals (rdi_pl_*) are
+// driven directly by the testbench initial block.  DUT outputs
+// (rdi_lp_*, pl_*) are compared against expected values at each
+// checkpoint.  stall_active and rdi_lnk_is_x8 are control knobs
+// toggled by the testbench to exercise the stall handshake (spec
+// Section 8.3.1 - Stallreq/Ack Mechanism) and x8 width-degrade
+// masking paths respectively.
+// ---------------------------------------------------------------------------
   adapter_datapath u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
     .lp_irdy(lp_irdy), .lp_valid(lp_valid), .lp_data(lp_data),
@@ -39,6 +182,15 @@ module ut_stall;
   );
 
   initial lclk = 1'b0;
+// ---------------------------------------------------------------------------
+// Clock Generator
+// ---------------------------------------------------------------------------
+// Free-running 500 MHz clock with a 2 ns period (1 ns high, 1 ns low).
+// The initial value is set to 0 in the preceding initial block so that
+// the first posedge occurs at t = 1 ns.  All stimulus in the test is
+// synchronised to posedge lclk; checkers sample at posedge + 0.1 ns
+// (#0.1) to allow combinational outputs to settle.
+// ---------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
 
   initial begin

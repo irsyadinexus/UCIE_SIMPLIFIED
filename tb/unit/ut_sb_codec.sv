@@ -1,5 +1,142 @@
-// Unit test: sb_codec round-trip and parity error injection.
-// One codec transmits; its serial output feeds a second codec's receive input.
+// ============================================================================
+// File        : ut_sb_codec.sv
+// Description : Unit test for the sideband codec (sb_codec) module.
+// ============================================================================
+//
+// PURPOSE
+// -------
+// This testbench exercises the sb_codec module in a transmit-to-receive serial
+// loopback configuration.  It verifies round-trip serialization and
+// deserialization of sideband messages, as well as parity-error detection on
+// a deliberately corrupted link.
+//
+// Two sb_codec instances are instantiated:
+//
+//   u_tx  – configured as the transmitter.  The testbench drives the
+//           parallel message fields (opcode, srcid, dstid, msgcode, data,
+//           etc.) into u_tx, which serialises them onto its sb_tx_data /
+//           sb_tx_valid outputs.
+//
+//   u_rx  – configured as the receiver.  Its sb_rx_data / sb_rx_valid
+//           inputs are fed from u_tx's serial output (optionally through
+//           a corruption mux — see below).  On reception of a complete
+//           message it asserts rx_pkt_vld for one clock and presents the
+//           deserialised fields.
+//
+// The serial link between u_tx and u_rx passes through an explicit XOR
+// corruption mux controlled by the testbench signal `corrupt_en`.  When
+// `corrupt_en` is high for exactly one UI the received bit pattern is
+// inverted, injecting a single-bit error that the codec's parity checker
+// must detect.
+//
+//   Spec ref: Section 6.1.2 – Packet Formats
+//             (defines the header and data-parity bit positions that the
+//              codec serialises/deserialises and that this test verifies)
+//
+//   Spec ref: Section 6.1.3 – Flow Control and Data Integrity
+//             (defines the CP / DP parity check that must flag corrupted
+//              packets; test 4 below validates this requirement)
+//
+//
+// BLOCK DIAGRAM
+// -------------
+// The loopback topology with corruption injection is shown below.
+//
+//         Testbench parallel IF              Serial link
+//    ┌──────────────────────┐
+//    │   Stimulus fields    │
+//    │  (opcode, srcid, …)  │
+//    └──────────┬───────────┘
+//               │  tx_load
+//               ▼
+//    ┌─────────────────────┐    sb_wire     ┌────────────┐   sb_wire_rx
+//    │       u_tx          ├───────────────►│ corrupt_en │──────────────►┐
+//    │    (sb_codec #0)    │  sb_wire_valid │   XOR mux  │              │
+//    └─────────────────────┘                └────────────┘              │
+//                                                                      │
+//                                                              sb_rx_valid
+//                                                                      │
+//                                                                      ▼
+//                                                      ┌──────────────────────┐
+//                                                      │        u_rx          │
+//                                                      │     (sb_codec #1)    │
+//                                                      └──────────┬───────────┘
+//                                                                 │ rx_pkt_vld
+//                                                                 ▼
+//                                                      ┌──────────────────────┐
+//                                                      │  Snapshot & compare  │
+//                                                      │   (check_fields)     │
+//                                                      └──────────────────────┘
+//
+//
+// CLOCK RATE – SIMULATION CONCESSION
+// -----------------------------------
+// The sideband clock (sbclk) in this testbench runs at 250 MHz (2 ns
+// half-period, 4 ns period).  This is a simulation-only reduced rate chosen
+// for convenience and faster simulation turn-around.  The production
+// sideband signalling rate is 800 MHz as specified in Section 5.13 –
+// Sideband signaling.  Because the codec logic is fully synchronous to
+// sbclk with no cycle-count-dependent timing, functional correctness at
+// 250 MHz implies correctness at 800 MHz; only gate-level timing closure
+// is affected.
+//
+//   Spec ref: Section 5.13 – Sideband signaling
+//             (defines the 800 MHz production sideband rate)
+//
+//
+// STIMULUS (DIRECTED TESTS)
+// -------------------------
+// Four directed tests exercise increasing complexity:
+//
+//   Test 1 – Header-only message
+//            A LinkMgmt no-data request (SB_OP_MSG_NODATA) is sent with
+//            representative field values.  All deserialised header fields
+//            must match the transmitted values, and neither cp_err nor
+//            dp_err may be asserted.
+//
+//   Test 2 – Message with 64-bit payload
+//            A data-bearing message (SB_OP_MSG_DATA64) is sent.  Both the
+//            header and the 64-bit data word must round-trip correctly.
+//            The data pattern (BEEF_DEAD_BEEF_DEAD) has odd popcount to
+//            exercise the data-parity path.
+//
+//   Test 3 – Back-to-back packets
+//            Two header-only packets are transmitted in immediate
+//            succession (the second tx_load is issued as soon as tx_busy
+//            deasserts after the first).  This verifies that the mandatory
+//            inter-packet gap does not corrupt the following header.
+//
+//   Test 4 – Parity error injection via corrupt_en mux
+//            A header-only packet is transmitted, but the corruption mux
+//            is enabled for exactly one header UI (UI 10) during
+//            serialisation.  The receiver must still deliver the packet
+//            (rx_pkt_vld asserted) but with cp_err flagged HIGH, proving
+//            that the parity checker detects the injected bit-flip.
+//
+//   Spec ref: Section 6.1.2 – Packet Formats
+//             (header and data field layout exercised by tests 1-3)
+//   Spec ref: Section 6.1.3 – Flow Control and Data Integrity
+//             (parity error detection exercised by test 4)
+//
+//
+// PASS CRITERIA
+// -------------
+// The test passes if and only if:
+//   - All transmitted header / data fields match after round-trip
+//     deserialisation (tests 1-3).
+//   - cp_err is NOT asserted for clean transmissions (tests 1-3).
+//   - cp_err IS asserted when the corruption mux flips a header bit
+//     (test 4).
+//   - The test completes before the 2 ms watchdog timeout.
+//
+//
+// REVISION HISTORY
+// ----------------
+//   v0.0.1  2025-XX-XX  Initial creation.
+//   v0.0.2  2026-09-23  Documentation: expand header, add per-block
+//                        comments throughout the testbench.
+//
+// ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
@@ -52,6 +189,21 @@ module ut_sb_codec;
   logic [63:0] sn_data;
   logic        sn_cp_err, sn_dp_err;
 
+  // --------------------------------------------------------------------------
+  // DUT Instance: u_tx – Transmitting sideband codec
+  // --------------------------------------------------------------------------
+  // This sb_codec instance is wired for transmit-only operation.  The
+  // testbench drives the parallel message interface (tx_opcode, tx_srcid,
+  // tx_data_in, etc.) and asserts tx_load to begin serialisation.
+  //
+  // The serial output pair (sb_tx_data / sb_tx_valid) is routed to the
+  // corruption mux and then into u_rx.  The receive-side ports
+  // (sb_rx_data, sb_rx_valid) are tied low because u_tx is never used
+  // as a receiver in this testbench.
+  //
+  //   Spec ref: Section 6.1.2 – Packet Formats
+  //             (u_tx serialises the header/data according to this format)
+  // --------------------------------------------------------------------------
   sb_codec u_tx (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
     .tx_load(tx_load), .tx_opcode(tx_opcode),
@@ -69,6 +221,26 @@ module ut_sb_codec;
     .rx_addr(), .rx_data(), .rx_cp_err(), .rx_dp_err()
   );
 
+  // --------------------------------------------------------------------------
+  // DUT Instance: u_rx – Receiving sideband codec
+  // --------------------------------------------------------------------------
+  // This sb_codec instance is wired for receive-only operation.  Its
+  // sb_rx_data input comes from the corruption mux (sb_wire_rx), which is
+  // normally a pass-through of u_tx's serial output.
+  //
+  // All transmit-side ports are tied to zero / left unconnected because
+  // u_rx never originates traffic in this testbench.
+  //
+  // On reception of a complete sideband message the instance asserts
+  // rx_pkt_vld for one sbclk cycle and presents the deserialised fields
+  // (rx_opcode, rx_data, rx_cp_err, etc.) which the testbench snapshots
+  // and checks.
+  //
+  //   Spec ref: Section 6.1.2 – Packet Formats
+  //             (u_rx deserialises packets per this format)
+  //   Spec ref: Section 6.1.3 – Flow Control and Data Integrity
+  //             (u_rx computes and reports parity errors via cp_err/dp_err)
+  // --------------------------------------------------------------------------
   sb_codec u_rx (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
     .tx_load(1'b0), .tx_opcode(5'b0),
@@ -89,10 +261,43 @@ module ut_sb_codec;
     .rx_cp_err(rx_cp_err), .rx_dp_err(rx_dp_err)
   );
 
+  // --------------------------------------------------------------------------
+  // Clock generator – sbclk at 250 MHz (simulation concession)
+  // --------------------------------------------------------------------------
+  // The `always #2` toggle produces a clock with a 4 ns period (2 ns
+  // half-period), corresponding to 250 MHz.
+  //
+  // IMPORTANT: 250 MHz is a simulation-only reduced rate.  The production
+  // sideband signalling rate is 800 MHz per Section 5.13 – Sideband
+  // signaling.  The sb_codec is fully synchronous to sbclk and contains
+  // no hard-coded cycle-count timing assumptions, so functional behaviour
+  // is identical at any frequency.  The lower simulation rate simply
+  // reduces event counts and accelerates regression runs.
+  //
+  //   Spec ref: Section 5.13 – Sideband signaling
+  //             (defines 800 MHz as the production sideband clock rate)
+  // --------------------------------------------------------------------------
   initial sbclk = 1'b0;
   always #2 sbclk = ~sbclk;     // 250 MHz sideband
 
-  // Latch the receiver outputs on the single-cycle valid pulse.
+  // --------------------------------------------------------------------------
+  // Receiver output latch – snapshot on rx_pkt_vld pulse
+  // --------------------------------------------------------------------------
+  // rx_pkt_vld is a single-cycle pulse generated by u_rx when a complete
+  // sideband packet has been deserialised.  Because the codec may
+  // overwrite its output registers on the very next clock edge, we must
+  // capture every field in the same delta cycle.
+  //
+  // The #0.1 delay ensures we sample after all blocking assignments in
+  // the codec have settled (NBA vs. BA race avoidance).  The snapshot
+  // registers (sn_opcode, sn_data, sn_cp_err, etc.) are then compared
+  // at leisure by the check_fields task.
+  //
+  //   Spec ref: Section 6.1.2 – Packet Formats
+  //             (defines the fields that are latched here)
+  //   Spec ref: Section 6.1.3 – Flow Control and Data Integrity
+  //             (cp_err / dp_err flags captured for parity-error checks)
+  // --------------------------------------------------------------------------
   always @(posedge rx_pkt_vld) begin
     #0.1;
     sn_vld       = rx_pkt_vld;

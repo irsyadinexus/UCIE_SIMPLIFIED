@@ -124,6 +124,9 @@
 //   v0.0.5  2026-09-23  Req.2: feed the 128-bit pattern word straight into the
 //                            TX gearbox; pattern engine now emits 8 UIs per
 //                            lclk cycle at the 4 GT/s physical rate.
+//   v0.0.6  2026-09-23  Documentation pass: add per-construct comment blocks
+//                        for every always, assign, and instantiation per the
+//                        project documentation contract.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -461,6 +464,16 @@ module logical_phy #(
   // allow the LTSM to advance from LINKINIT to ACTIVE.
   // ---------------------------------------------------------------------------
   logic [DATA_W-1:0] pat_data_out;
+  // -------------------------------------------------------------------------
+  // Instantiation: pattern_gen (u_pat_gen)
+  //
+  // Produces per-lane training patterns (Per-Lane-ID, VALTRAIN, clock-
+  // repair, LFSR) under LTSM control.  The 128-bit output pat_data_out
+  // feeds the TX gearbox for serialisation onto the main-band lanes.
+  //
+  // Spec ref: UCIe 1.0, Section 4.4.1 - Scrambling and training pattern
+  //           generation.
+  // -------------------------------------------------------------------------
   pattern_gen #(.NLANES(NLANES)) u_pat_gen (
     .lclk        (lclk),
     .lreset_n    (lreset_n),
@@ -545,7 +558,25 @@ module logical_phy #(
   // rdi_pl_stallreq  : 1'b0 – the PHY never initiates a stall in this build.
   // ---------------------------------------------------------------------------
   assign rdi_pl_lnk_cfg  = LNKCFG_X16;
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_speedmode – static 4 GT/s speed advertisement
+  //
+  // Tied to SPEED_4GT (3'b000).  This reduced-capability build supports
+  // only the lowest UCIe main-band data rate.
+  //
+  // Spec ref: UCIe 1.0, Section 8.1 - Raw Die-to-Die Interface (RDI),
+  //           Table 114 - RDI Signal List.
+  // -------------------------------------------------------------------------
   assign rdi_pl_speedmode= SPEED_4GT;
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_stallreq – PHY stall request (disabled)
+  //
+  // Tied to 1'b0.  The PHY never initiates a stall in this build because
+  // no recalibration or power-management flow requires one.
+  //
+  // Spec ref: UCIe 1.0, Section 8.1 - Raw Die-to-Die Interface (RDI),
+  //           Table 114 - RDI Signal List.
+  // -------------------------------------------------------------------------
   assign rdi_pl_stallreq = 1'b0;
 
   // ---------------------------------------------------------------------------
@@ -634,14 +665,57 @@ module logical_phy #(
     .rx_word_vld(rx_gearbox_valid)
   );
 
+  // ---------------------------------------------------------------------------
+  // RDI Physical-Layer Outputs: trdy / valid / data
+  // ---------------------------------------------------------------------------
+  // These three continuous assigns form the physical-layer half of the RDI
+  // transmit handshake. They are the only path by which received main-band
+  // data leaves this module, so they are what makes the receive datapath
+  // observable to the adapter.
+  //
+  //   rdi_pl_trdy  - transmit ready. The PHY is always ready in this
+  //                  simplified endpoint, so trdy simply mirrors the protocol
+  //                  layer's irdy. There is no flow-control state to model
+  //                  because the loopback never backpressures.
+  //
+  //   rdi_pl_valid - receive valid. Driven directly by the receive gearbox
+  //                  framing output. It pulses once per reassembled 128-bit
+  //                  word, which is once per lclk cycle while data flows.
+  //                  This is the framing boundary of spec 4.1.2: valid marks
+  //                  the cycle on which rdi_pl_data carries a complete word.
+  //
+  //   rdi_pl_data  - receive data. The reassembled word straight from the
+  //                  receive gearbox, with no intervening register, so that
+  //                  valid and data always describe the same word. Adding a
+  //                  register here would delay data but not the valid pulse
+  //                  and silently corrupt the pairing.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing; Section 8.1 - Raw
+  // Die-to-Die Interface (RDI); Table 114 - RDI Signal List.
+  // ---------------------------------------------------------------------------
   assign rdi_pl_trdy  = rdi_lp_irdy;
   assign rdi_pl_valid = rx_gearbox_valid;
   assign rdi_pl_data  = rx_gearbox_word;
 
   // ---------------------------------------------------------------------------
-  // Lint suppression
+  // Lint Suppression: `unused` (continuous assign)
   // ---------------------------------------------------------------------------
   // Continuous assign so Icarus Verilog evaluates all bit-select references.
+  //
+  // A reduced endpoint leaves several ports and signals intentionally
+  // unimplemented: the stall handshake, the CSR read data bus, the retrain and
+  // sideband timeout hooks, and the per-lane byte map are all wired for
+  // interface completeness but carry no logic in this proof of concept. Without
+  // a reference, `iverilog -Wall` reports them as unused and the zero-warning
+  // compile gate fails.
+  //
+  // Folding every one of them into a single catch-all assign keeps them live
+  // for the elaborator while adding no logic: the expression is never read, so
+  // synthesis discards it entirely. It is a deliberate, documented suppression
+  // rather than a hidden one.
+  //
+  // Spec ref: UCIe 1.0, Table 115 - lp_state_req / pl_stallreq handshake
+  //              (not modelled in this simplified endpoint).
   // ---------------------------------------------------------------------------
   logic unused;
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |

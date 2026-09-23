@@ -74,6 +74,9 @@
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
 //   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
+//   v0.0.3  2026-09-23  Documentation: add per-construct comment blocks with
+//                        spec references for streaming datapath and stall
+//                        handshake gating.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0

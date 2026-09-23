@@ -1,5 +1,174 @@
-// Unit test: byte_lane_mapper. Exercises x16, both x8-degrade halves, the
-// inactive-half zeroing, byte reversal, and the enable gate.
+// ============================================================================
+// File        : ut_mapper.sv
+// Module      : ut_mapper
+// Project     : UCIe 1.0 Simplified Endpoint
+// Description : Unit test for the byte_lane_mapper module. Verifies that the
+//               byte-to-lane mapping block correctly handles every operating
+//               mode specified in the UCIe 1.0 standard:
+//
+//                 1. x16 full-width mode: each of 16 lanes carries its
+//                    correspondingly-indexed byte.
+//                 2. x8 degrade to lanes 0-7: the lower half carries bytes
+//                    0-7 and the upper half (lanes 8-15) is forced to zero.
+//                 3. x8 degrade to lanes 8-15: the upper half carries bytes
+//                    0-7 and the lower half (lanes 0-7) is forced to zero.
+//                 4. Inactive-half zeroing: in every x8 mode the idle half
+//                    outputs deterministic 0x00 bytes so the partner die
+//                    observes a clean pattern and does not interpret stale
+//                    data.
+//                 5. Byte reversal: when byte_reversal is asserted, lane l
+//                    sources byte NBYTES-1-l instead of byte l. This applies
+//                    in both x16 and x8 modes.
+//                 6. Enable gate: when enable is de-asserted, every lane
+//                    outputs zero regardless of the mode and byte inputs.
+//                 7. Reserved degrade code handling: a degrade_lanes value of
+//                    2'b11 is undefined in the spec; the mapper must not
+//                    produce active lanes in the upper half.
+//
+// ----------------------------------------------------------------------------
+//
+// SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping
+//     Defines the byte-to-lane mapping for x16 and x8 Standard Package
+//     interfaces, active-lane selection, and lane numbering conventions.
+//   UCIe 1.0 Specification, Section 4.3.7 - Width Degrade in Standard
+//     Package Interfaces
+//     Describes the mechanism by which a link degrades from x16 to x8 after
+//     a failed repair, the degrade_lanes selector encoding, and the
+//     requirement to zero inactive lanes.
+//
+// ----------------------------------------------------------------------------
+//
+// DUT
+//   byte_lane_mapper #(.NLANES(NLANES_MAX)) u_dut
+//
+//   The mapper is instantiated with NLANES = NLANES_MAX (16) to exercise the
+//   full x16 lane width. All inputs (enable, lnk_is_x8, degrade_lanes,
+//   byte_reversal, bytes_in) are driven directly from the testbench initial
+//   block; the DUT is purely combinational so the outputs settle within the
+//   same delta cycle after each input change.
+//
+// ----------------------------------------------------------------------------
+//
+// STIMULUS
+//   All stimulus is directed (not random). The initial block walks through
+//   the following sequence:
+//
+//     a. Reset phase: lreset_n low for 5 ns, then deasserted.
+//     b. Disable test: enable = 0, bytes_in filled with 0xFF. Assert all
+//        lanes produce 0x00.
+//     c. x16 identity test: enable = 1, byte i = 0xA0+i. Assert lane i
+//        carries byte 0xA0+i.
+//     d. x16 byte-reversal test: byte_reversal = 1. Assert lane i carries
+//        byte 0xA0 + (NBYTES-1-i).
+//     e. x8 degrade lower half: lnk_is_x8 = 1, degrade_lanes =
+//        DEGRADE_LANES_0_7. Assert lanes 0-7 carry bytes 0-7, lanes 8-15
+//        all zero.
+//     f. x8 degrade upper half: degrade_lanes = DEGRADE_LANES_8_15. Assert
+//        lanes 0-7 all zero, lanes 8-15 carry bytes 0-7.
+//     g. x8 byte reversal: degrade_lanes = DEGRADE_LANES_0_7 with
+//        byte_reversal = 1. Assert reversed ordering in the surviving half.
+//     h. Reserved code test: degrade_lanes = 2'b11. Assert lanes 8-15 are
+//        all zero (reserved encoding must not activate upper lanes).
+//
+//   The signals driven are: enable, lnk_is_x8, degrade_lanes[1:0],
+//   byte_reversal, bytes_in[NBYTES-1:0][7:0].
+//
+// ----------------------------------------------------------------------------
+//
+// PASS / FAIL CRITERIA
+//   The `chk_lane` task compares each lane's output (data_out[lane]) against
+//   the expected byte value. On mismatch, the task prints a FAIL message
+//   identifying the test label, lane index, actual value, and expected value,
+//   and increments the `errors` counter. At the end of the initial block,
+//   if `errors` is zero the test prints "TEST PASSED ut_mapper"; otherwise
+//   it prints "FAIL ut_mapper: <N> errors".
+//
+//   On success, the testbench also writes a JSON evidence file
+//   (logs/mapper_evidence.json) recording width-degrade and lane-reversal
+//   coverage counts for the coverage report.
+//
+// ----------------------------------------------------------------------------
+//
+// CLOCK / RESET
+//   lclk      : 500 MHz free-running clock generated by `always #1.0`.
+//               The half-period is 1.0 ns, yielding a full period of 2.0 ns
+//               (500 MHz). The DUT is combinational, so the clock serves only
+//               as a synchronisation reference for the `repeat (2) @(posedge
+//               lclk)` settling delays.
+//   lreset_n  : Active-low synchronous reset. Asserted (low) at time 0,
+//               deasserted after 5 ns.
+//
+// ----------------------------------------------------------------------------
+//
+// INTERNAL BLOCK DIAGRAM
+//
+//                      ut_mapper testbench
+//   +======================================================+
+//   |                                                      |
+//   |   initial block (stimulus driver)                    |
+//   |     |                                                |
+//   |     |  enable  ----+                                 |
+//   |     |  lnk_is_x8 -+---+                             |
+//   |     |  degrade    -+---+---+                         |
+//   |     |  byte_rev  -+---+---+---+                     |
+//   |     |             |   |   |   |                     |
+//   |     |      +------v---v---v---v---------+           |
+//   |     |      |                            |           |
+//   |     |      |   byte_lane_mapper         |           |
+//   |     |      |   #(.NLANES(NLANES_MAX))   |           |
+//   |     |      |        u_dut               |           |
+//   |     |      |                            |           |
+//   |  bytes_in  |   bytes_in[15:0][7:0]      |           |
+//   |  [15:0] -->|     (16 input bytes)       |           |
+//   |  [7:0]     |                            |           |
+//   |            |   data_out[15:0][7:0] ---->|--+        |
+//   |            |     (16 output lanes)      |  |        |
+//   |            +----------------------------+  |        |
+//   |                                            |        |
+//   |   chk_lane task  <-------------------------+        |
+//   |     compares data_out[lane] vs expected             |
+//   |     increments `errors` on mismatch                 |
+//   |                                                     |
+//   |   lclk: always #1.0  (500 MHz, 2 ns period)        |
+//   |                                                     |
+//   +=====================================================+
+//
+// ----------------------------------------------------------------------------
+//
+// PARAMETERS
+//   This testbench uses the default values from `ucie_pkg`:
+//     NBYTES     - Number of bytes per beat (16).
+//     NLANES_MAX - Maximum number of main-band lanes (16).
+//     NLANES_X8  - Number of lanes in x8 mode (8).
+//   The DUT is instantiated with NLANES = NLANES_MAX.
+//
+// ----------------------------------------------------------------------------
+//
+// DESIGN NOTES
+//   - The byte_lane_mapper is purely combinational. The testbench inserts
+//     `repeat (2) @(posedge lclk)` delays between stimulus changes to allow
+//     delta-cycle settling, but no pipeline latency is involved.
+//   - The loopback testbench (tb_loopback_top) exercises only the x16 path
+//     because the PoC never degrades. This unit test is the sole coverage
+//     source for x8-degrade, byte reversal, and the enable gate.
+//   - The reserved degrade_lanes code (2'b11) is tested to ensure the mapper
+//     fails safe by zeroing the upper half.
+//   - The evidence JSON file written on success is consumed by the coverage
+//     merge step to credit width-degrade and lane-reversal bins.
+//
+// ----------------------------------------------------------------------------
+//
+// REVISION HISTORY
+//   Version   Date          Author          Description
+//   -------   ----------    -----------     ----------------------------------
+//   v0.0.1    2025-XX-XX    —               Initial creation.
+//   v0.0.2    2026-09-23    —               Documentation: expand header, add
+//                                           per-block comments.
+//
+// LICENSE
+//   SPDX-License-Identifier: Apache-2.0
+// ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
@@ -15,6 +184,29 @@ module ut_mapper;
   int          errors;
   integer fd;
 
+// -------------------------------------------------------------------------
+// Instantiation: byte_lane_mapper #(.NLANES(NLANES_MAX)) u_dut
+//
+// Device under test. The byte_lane_mapper is instantiated at the full x16
+// lane width (NLANES = NLANES_MAX = 16). All control and data inputs are
+// driven from the testbench initial block. The DUT is combinational: its
+// outputs (data_out) reflect the current input values after delta-cycle
+// settling.
+//
+// Port connections:
+//   lclk, lreset_n      — clock and reset (unused inside the DUT but kept
+//                          for interface consistency with the PHY).
+//   enable               — output gate; when low, all lanes are zeroed.
+//   lnk_is_x8            — selects x8 degraded mode.
+//   degrade_lanes[1:0]   — selects surviving half in x8 mode.
+//   byte_reversal        — reverses byte ordering on the input.
+//   bytes_in[15:0][7:0]  — 16 input bytes from the adapter datapath.
+//   data_out[15:0][7:0]  — 16 output lanes to the gearbox / PHY pins.
+//
+// Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
+// Spec ref: UCIe 1.0, Section 4.3.7 - Width Degrade in Standard Package
+//           Interfaces.
+// -------------------------------------------------------------------------
   byte_lane_mapper #(.NLANES(NLANES_MAX)) u_dut (
     .lclk(lclk), .lreset_n(lreset_n), .enable(enable),
     .lnk_is_x8(lnk_is_x8), .degrade_lanes(degrade_lanes),
@@ -23,6 +215,17 @@ module ut_mapper;
   );
 
   initial lclk = 1'b0;
+// -------------------------------------------------------------------------
+// always: lclk Generator
+//
+// Plain clock driver for the 500 MHz local clock (lclk). The half-period
+// is 1.0 ns, yielding a full period of 2.0 ns (500 MHz). The DUT is
+// combinational so the clock is not functionally required; it serves as a
+// synchronisation reference for the `repeat (2) @(posedge lclk)` settling
+// delays used throughout the stimulus sequence.
+//
+// Spec ref: UCIe 1.0, Section 5.2 - Overview (lclk definition).
+// -------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
 
   task chk_lane;

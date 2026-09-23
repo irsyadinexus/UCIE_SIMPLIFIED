@@ -208,11 +208,23 @@ module phy_csr (
   end
 
   // =========================================================================
-  // Unused signal suppression
+  // always_comb: Unused Signal Suppression
   // =========================================================================
   // lclk and lreset_n are consumed by the always_ff blocks above, but some
   // lint tools may flag them as combinationally unused. This explicit
   // always_comb reference silences those warnings.
+  //
+  // The CSR block is otherwise pure sequential logic: a register file clocked
+  // on lclk with an asynchronous active-low reset, addressed by csr_addr and
+  // read back on csr_rdata. Both clock and reset therefore have a real role in
+  // the design; this block exists only to satisfy tools that judge usage
+  // combinationally rather than sequentially.
+  //
+  // The assigned value is never read, so synthesis discards the whole block
+  // and it adds no logic to the CSR.
+  //
+  // Spec ref: UCIe 1.0, Section 8.3 - Register Interface (CSR access to the
+  // PHY configuration and status registers).
   // =========================================================================
   logic unused;
   always_comb begin

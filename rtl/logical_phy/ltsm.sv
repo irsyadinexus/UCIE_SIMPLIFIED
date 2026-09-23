@@ -197,6 +197,8 @@
 //   v0.0.2  2026-09-22  Fix tmr_start to pulse for 1 cycle on sub-state entry.
 //   v0.0.3  2026-09-22  Enforce 4 ms physical layer RESET minimum (Req.1).
 //   v0.0.4  2026-09-23  Pulse pat_lfsr_reset on LINKINIT entry so LFSR advances.
+//   v0.0.5  2026-09-23  Documentation: add per-construct comment blocks for
+//                        all always_ff and assign statements per doc contract.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -285,6 +287,23 @@ module ltsm #(
   logic        reset_min_done_q; // 4 ms RESET minimum met
   logic        retrain_req_q;
   logic        req_sent_d, resp_rcvd_d, timer_start_d, retrain_req_d, reset_min_done_d;
+  // -------------------------------------------------------------------------
+  // always_ff: State and Handshake Register Bank
+  //
+  // Registers the LTSM state (state_q) and five handshake/control flags on
+  // the rising edge of lclk, with asynchronous active-low reset. On reset
+  // the state machine enters LT_RESET and all handshake flags are cleared.
+  // On each active clock edge, the next-state values computed by the
+  // always_comb block are captured:
+  //   state_q          – current LTSM state encoding (8-bit ltsm_state_t).
+  //   req_sent_q       – local sideband request has been accepted by codec.
+  //   resp_rcvd_q      – partner's matching response/request has arrived.
+  //   timer_start_q    – 8 ms residency timer armed for this sub-state.
+  //   reset_min_done_q – 4 ms RESET minimum timer has elapsed.
+  //   retrain_req_q    – a PHYRETRAIN request is pending.
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       state_q          <= LT_RESET;
@@ -312,6 +331,17 @@ module ltsm #(
   // =========================================================================
   ltsm_state_t state_q_prev;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Previous-State Pipeline Register
+  //
+  // Captures the one-cycle-delayed copy of state_q into state_q_prev.
+  // The comparison (state_q != state_q_prev) generates the sub-state entry
+  // edge used to clear handshake flags, re-arm the residency timer, and
+  // pulse pat_lfsr_reset. Resets to LT_RESET so no false entry edge is
+  // produced on power-up.
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) state_q_prev <= LT_RESET;
     else           state_q_prev <= state_q;
@@ -500,6 +530,16 @@ module ltsm #(
   // block transitions to TRAINERROR (spec 4.5.3.8).
   // =========================================================================
   assign tmr_start = (state_q != state_q_prev);
+  // -------------------------------------------------------------------------
+  // assign: Timer Run Enable
+  //
+  // Holds the 8 ms residency timer running while the current sub-state
+  // handshake is pending (timer armed AND response not yet received).
+  // Once resp_rcvd_q is set the timer stops, preventing a late expiry
+  // from incorrectly escalating to TRAINERROR.
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // -------------------------------------------------------------------------
   assign tmr_run   = timer_start_q && !resp_rcvd_q;
 
   // =========================================================================
@@ -743,6 +783,28 @@ module ltsm #(
   // recovery and stall insertion are not implemented in this build.
   // =========================================================================
   assign sb_tx_load      = can_send && (msg_req_code(state_q) != MC_NOP_CRD);
+  // -------------------------------------------------------------------------
+  // assign (group): Sideband TX Packet Field Tie-Offs
+  //
+  // These 14 continuous assignments drive the fixed fields of every
+  // sideband message transmitted by the LTSM:
+  //   sb_tx_opcode     – SB_OP_MSG_NODATA; all LTSM messages are headerless.
+  //   sb_tx_srcid      – SRCID_STACK0; this endpoint's stack identifier.
+  //   sb_tx_dstid      – SRCID_STACK0; partner shares the same stack.
+  //   sb_tx_msginfo    – msg_info(state_q); non-zero only in REPAIR.
+  //   sb_tx_msgcode    – msg_req_code(state_q); request code per Tables 53/54.
+  //   sb_tx_msgsubcode – msg_subcode(state_q); sub-state disambiguator.
+  //   sb_tx_be         – 8'h00; no byte-enable (no data payload).
+  //   sb_tx_tag        – 5'h00; tag unused for training messages.
+  //   sb_tx_ep         – 1'b0;  no error/poison bit.
+  //   sb_tx_addr       – 12'h000; no register address targeted.
+  //   sb_tx_data_in    – 64'h0; no data payload.
+  //   sb_tx_has_data   – 1'b0;  marks packet as header-only.
+  //   sb_msg_timeout   – 1'b0;  timeout recovery not implemented.
+  //   sb_stall_sent    – 1'b0;  stall insertion not implemented.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.2 - Packet Formats.
+  // -------------------------------------------------------------------------
   assign sb_tx_opcode    = SB_OP_MSG_NODATA;
   assign sb_tx_srcid     = SRCID_STACK0;
   assign sb_tx_dstid     = SRCID_STACK0;
@@ -776,6 +838,22 @@ module ltsm #(
   assign pat_enable     = ((state_q >= LT_MB_VALVREF) &&
                           (state_q <= LT_MB_REPAIR)) ||
                           (state_q == LT_LINKINIT);
+  // -------------------------------------------------------------------------
+  // assign: Training Pattern Selection Mux
+  //
+  // Selects the training pattern driven onto the main-band lanes based on
+  // the current LTSM sub-state:
+  //   VALVREF / DATAVREF  -> PAT_VALTRAIN   (alternating 1010 checkerboard)
+  //   LINKINIT            -> PAT_LFSR       (per-lane scrambled LFSR)
+  //   RXDESKEW            -> PAT_CLKREPAIR  (clock-repair single-UI toggle)
+  //   All other MBTRAIN   -> PAT_PERLANEID  (lane numbering identification)
+  //
+  // The priority-encoded ternary chain matches the spec ordering; the
+  // default (PAT_PERLANEID) covers remaining MBTRAIN sub-states.
+  //
+  // Spec ref: UCIe 1.0, Section 4.4.1 - Scrambling and training pattern
+  //           generation.
+  // -------------------------------------------------------------------------
   assign pat_select     = (state_q == LT_MB_VALVREF)  ? PAT_VALTRAIN  :
                           (state_q == LT_MB_DATAVREF) ? PAT_VALTRAIN  :
                           (state_q == LT_LINKINIT)    ? PAT_LFSR      :
@@ -789,6 +867,17 @@ module ltsm #(
   // so the LFSR advances freely for the full 4096-UI duration.
   // ref: spec 4.5.3.6 (LINKINIT), 4.4.1 (scrambling).
   assign pat_lfsr_reset = (state_q == LT_LINKINIT) && (state_q != state_q_prev);
+  // -------------------------------------------------------------------------
+  // assign: LFSR Enable Gate
+  //
+  // Enables the per-lane LFSR only during the LINKINIT sub-state. During
+  // all other states the LFSR holds its current value so it can be cleanly
+  // reseeded on the next LINKINIT entry via pat_lfsr_reset. The LFSR runs
+  // for the full 4096-UI LINKINIT duration, after which pat_done fires.
+  //
+  // Spec ref: UCIe 1.0, Section 4.4.1 - Scrambling and training pattern
+  //           generation.
+  // -------------------------------------------------------------------------
   assign pat_lfsr_enable= (state_q == LT_LINKINIT);
   // =========================================================================
   // LTSM status outputs  (spec 4.5.3 – reported to RDI state machine)
@@ -803,6 +892,21 @@ module ltsm #(
   // degrade_lanes    : Tied to 00 (no degradation in this build).
   // =========================================================================
   assign link_trained    = (state_q == LT_ACTIVE);
+  // -------------------------------------------------------------------------
+  // assign (group): Status and Observability Outputs
+  //
+  // Six continuous assignments that reflect the LTSM state to the RDI
+  // state machine and to top-level observability ports:
+  //   train_error      – asserted in LT_TRAINERROR (4.5.3.8).
+  //   link_reset_out   – asserted in LT_RESET (4.5.3.1); drives RDI LINKRESET.
+  //   phy_retrain_done – asserted when ACTIVE is re-entered after PHYRETRAIN
+  //                      with retrain_req_q still set (4.5.3.5).
+  //   ltsm_state       – raw 8-bit state encoding for Error Log 0.
+  //   lnk_is_x8        – tied to 0; x16-only in this reduced build.
+  //   degrade_lanes    – tied to 00; no lane degradation supported.
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // -------------------------------------------------------------------------
   assign train_error     = (state_q == LT_TRAINERROR);
   assign link_reset_out  = (state_q == LT_RESET);
   assign phy_retrain_done= (state_q == LT_ACTIVE) && retrain_req_q;
@@ -822,6 +926,17 @@ module ltsm #(
   // matching.
   // =========================================================================
   logic unused_match;
+  // -------------------------------------------------------------------------
+  // assign: Lint-Suppression Tie-Off
+  //
+  // Combines every sideband RX field, timer, and pattern-done signal that
+  // is read only inside functions or conditional expressions. Without this
+  // tie-off, Icarus Verilog reports spurious "unused" warnings because the
+  // function-call-based message matching hides the references from its
+  // single-pass analysis.
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // -------------------------------------------------------------------------
   assign unused_match = msg_is_req | msg_is_rsp | tmr_expired | pat_done |
                         sb_rx_pkt_vld | sb_rx_opcode[0] | sb_rx_srcid[0] |
                         sb_rx_dstid[0] | sb_rx_msginfo[0] | sb_rx_cp_err |

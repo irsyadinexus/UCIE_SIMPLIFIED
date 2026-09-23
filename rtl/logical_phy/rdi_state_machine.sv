@@ -101,6 +101,10 @@
 // --------------------------------------------------------------------------
 //   v0.0.1  2025-XX-XX  First commit to git. Full RDI LSM per spec 8.1.5
 //                        with Active-entry handshake and stall pass-through.
+//   v0.0.2  2026-09-23  Documentation pass: added per-construct comment
+//                        blocks for RDI output assigns (inband_pres through
+//                        trainerror) and unused-signal always_comb, citing
+//                        UCIe 1.0 Sections 8.1, 8.1.5, 8.3.2, Table 114.
 // ============================================================================
 `ifndef RdiStateMachine_SV
 `define RdiStateMachine_SV
@@ -261,6 +265,26 @@ module rdi_state_machine (
   // rdi_pl_trainerror   : Training error from LTSM.             Table 114.
   // =========================================================================
   assign rdi_pl_state_sts     = state_q;
+  // -------------------------------------------------------------------------
+  // assign (group): RDI status / error output signals
+  //
+  // These six signals are driven to the D2D Adapter through the RDI and
+  // reflect either registered state or pass-through PHY events:
+  //   rdi_pl_inband_pres   - forwarded from phy_inband_pres; indicates the
+  //                          partner die is present on sideband (Table 114).
+  //   rdi_pl_linkerror     - asserted when state_q == LINKERROR, telling
+  //                          the adapter that recovery is required (8.1.5).
+  //   rdi_pl_phyinrecenter - asserted when state_q == RETRAIN, indicating
+  //                          the PHY is recentering its receiver (8.1.5).
+  //   rdi_pl_cerror        - correctable-error pass-through (Table 114).
+  //   rdi_pl_nferror       - non-fatal-error pass-through (Table 114).
+  //   rdi_pl_trainerror    - forwarded from phy_train_error; the LTSM has
+  //                          declared an unrecoverable training failure.
+  //
+  // Spec ref: UCIe 1.0, Section 8.1 - Raw Die-to-Die Interface;
+  //           Section 8.3.2 - State Request and Status;
+  //           Table 114 - RDI Signal List.
+  // -------------------------------------------------------------------------
   assign rdi_pl_inband_pres   = phy_inband_pres;
   assign rdi_pl_linkerror     = (state_q == RDI_STS_LINKERROR);
   assign rdi_pl_phyinrecenter = (state_q == RDI_STS_RETRAIN);
@@ -298,6 +322,18 @@ module rdi_state_machine (
   // in this build. An explicit always_comb reference prevents lint warnings.
   // =========================================================================
   logic unused_rdi;
+  // -------------------------------------------------------------------------
+  // always_comb: Unused-signal lint suppression
+  //
+  // rdi_lp_stallack is declared in the port list (Table 114) for interface
+  // completeness but is not consumed by any transition or output logic in
+  // this simplified build. Assigning it to a local variable inside an
+  // always_comb block prevents synthesis and lint tools from emitting
+  // "unused port" warnings without altering any functional behaviour.
+  //
+  // Spec ref: UCIe 1.0, Section 8.1 - Raw Die-to-Die Interface;
+  //           Table 114 - RDI Signal List.
+  // -------------------------------------------------------------------------
   always_comb begin
     unused_rdi = rdi_lp_stallack;
   end

@@ -100,13 +100,13 @@
 //             | LKS_DONE
 //             v
 //  +-----------+
-//  | LINKINIT  |  4.5.3.6  Reseed per-lane LFSRs; LFSR pattern 4096 UI.
+//  | LINKINIT  |  4.5.3.5  Reseed per-lane LFSRs; LFSR pattern 4096 UI.
 //  |  (14h)    |           Exit -> ACTIVE on pat_done.
 //  +-----+-----+
 //        |
 //        v
 //  +-----------+                 +--------------+
-//  |  ACTIVE   |  4.5.3.7       | PHYRETRAIN   | 4.5.3.5
+//  |  ACTIVE   |  4.5.3.6       | PHYRETRAIN   | 4.5.3.7
 //  |  (15h)    |<--------------->|  (13h)       | Re-run training subset.
 //  +-----+-----+                 +--------------+
 //        |
@@ -138,7 +138,7 @@
 //   reads MsgInfo (LKS_DONE / LKS_EXIT_REP / LKS_EXIT_DEG).
 //
 // --------------------------------------------------------------------------
-// Pattern generator control  (spec 4.5.3.4, 4.5.3.6)
+// Pattern generator control  (spec 4.5.3.4, 4.5.3.5)
 // --------------------------------------------------------------------------
 //   The LTSM enables the pattern generator during MBTRAIN sub-states and
 //   LINKINIT. Pattern selection:
@@ -199,6 +199,11 @@
 //   v0.0.4  2026-09-23  Pulse pat_lfsr_reset on LINKINIT entry so LFSR advances.
 //   v0.0.5  2026-09-23  Documentation: add per-construct comment blocks for
 //                        all always_ff and assign statements per doc contract.
+//   v0.0.6  2026-09-23  Documentation: correct shifted LTSM state citations.
+//                        LINKINIT, ACTIVE, and PHYRETRAIN are Sections
+//                        4.5.3.5, 4.5.3.6, and 4.5.3.7, respectively.
+//   v0.0.7  2026-09-23  Req.3: remove unused sbclk/sbreset_n ports. The LTSM
+//                        now uses only lclk-facing asynchronous mailboxes.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -211,8 +216,6 @@ module ltsm #(
 ) (
   input  logic        lclk,
   input  logic        lreset_n,
-  input  logic        sbclk,
-  input  logic        sbreset_n,
 
   // ---- adapter / RDI
   input  logic        start_link_train,   // adapter requests RESET exit
@@ -225,7 +228,7 @@ module ltsm #(
   output logic        lnk_is_x8,          // negotiated x8 degrade
   output logic [1:0]  degrade_lanes,      // which half survives
 
-  // ---- sideband codec (the LTSM is the only sideband master here)
+  // ---- lclk-facing sideband CDC endpoint (the LTSM is the only master)
   output logic        sb_tx_load,
   output logic [4:0]  sb_tx_opcode,
   output logic [2:0]  sb_tx_srcid,
@@ -296,8 +299,8 @@ module ltsm #(
   // On each active clock edge, the next-state values computed by the
   // always_comb block are captured:
   //   state_q          – current LTSM state encoding (8-bit ltsm_state_t).
-  //   req_sent_q       – local sideband request has been accepted by codec.
-  //   resp_rcvd_q      – partner's matching response/request has arrived.
+  //   req_sent_q       – local sideband request accepted by the CDC mailbox.
+  //   resp_rcvd_q      – partner response delivered by the CDC mailbox.
   //   timer_start_q    – 8 ms residency timer armed for this sub-state.
   //   reset_min_done_q – 4 ms RESET minimum timer has elapsed.
   //   retrain_req_q    – a PHYRETRAIN request is pending.
@@ -455,7 +458,7 @@ module ltsm #(
   //   MB.DTCENTER2     -> MS_DTC2_START     (0x13)   spec 4.5.3.4
   //   MB.LINKSPEED     -> MS_LKS_START      (0x15)   spec 4.5.3.4
   //   MB.REPAIR        -> MS_REPAIR_INIT    (0x1B)   spec 4.5.3.4
-  //   PHYRETRAIN       -> MS_PHYR_INIT      (0x00)   spec 4.5.3.5
+  //   PHYRETRAIN       -> MS_PHYR_INIT      (0x00)   spec 4.5.3.7
   //   TRAINERROR       -> MS_TE_ENTRY       (0x00)   spec 4.5.3.8
   // =========================================================================
   function automatic logic [7:0] msg_subcode(input ltsm_state_t s);
@@ -695,7 +698,7 @@ module ltsm #(
       end
 
       // -----------------------------------------------------------------
-      // 4.5.3.6 LINKINIT
+      // 4.5.3.5 LINKINIT
       // -----------------------------------------------------------------
       // Reseed the per-lane LFSRs (pat_lfsr_reset asserted) and run the
       // LFSR pattern for 4096 UI (pat_select = PAT_LFSR). The sub-state
@@ -707,7 +710,7 @@ module ltsm #(
       end
 
       // -----------------------------------------------------------------
-      // 4.5.3.7 ACTIVE
+      // 4.5.3.6 ACTIVE
       // -----------------------------------------------------------------
       // Data may flow on the main band. The link holds ACTIVE until a
       // retrain request (retrain_req_q) transitions to PHYRETRAIN, or
@@ -719,7 +722,7 @@ module ltsm #(
       end
 
       // -----------------------------------------------------------------
-      // 4.5.3.5 PHYRETRAIN
+      // 4.5.3.7 PHYRETRAIN
       // -----------------------------------------------------------------
       // Re-run the requested subset of training. The sideband exchanges
       // PHYR_REQ (0xC5) / PHYR_RSP (0xCA). On completion the LTSM
@@ -753,7 +756,7 @@ module ltsm #(
     endcase
 
     // -------------------------------------------------------------------
-    // 4.5.3.8 Residency timeout escalation
+    // Residency timeout escalation to TRAINERROR (Section 4.5.3.8)
     // -------------------------------------------------------------------
     // If the 8 ms residency timer expires while a training sub-state
     // handshake is pending, the LTSM escalates to TRAINERROR. States
@@ -821,7 +824,7 @@ module ltsm #(
   assign sb_stall_sent   = 1'b0;
 
   // =========================================================================
-  // Pattern generator control  (spec 4.5.3.4, 4.5.3.6)
+  // Pattern generator control  (spec 4.5.3.4, 4.5.3.5)
   // =========================================================================
   // The pattern generator runs during the MBTRAIN sub-states (VALVREF
   // through REPAIR, 08h-12h) and during LINKINIT (14h). The pattern
@@ -865,7 +868,7 @@ module ltsm #(
   // patterns, so the LFSR only runs during LINKINIT, where the LFSR
   // pattern itself is the payload. Reseed is a clean 1-cycle entry pulse
   // so the LFSR advances freely for the full 4096-UI duration.
-  // ref: spec 4.5.3.6 (LINKINIT), 4.4.1 (scrambling).
+  // ref: spec 4.5.3.5 (LINKINIT), 4.4.1 (scrambling).
   assign pat_lfsr_reset = (state_q == LT_LINKINIT) && (state_q != state_q_prev);
   // -------------------------------------------------------------------------
   // assign: LFSR Enable Gate
@@ -882,7 +885,7 @@ module ltsm #(
   // =========================================================================
   // LTSM status outputs  (spec 4.5.3 – reported to RDI state machine)
   // =========================================================================
-  // link_trained     : Asserted when the LTSM is in ACTIVE (4.5.3.7).
+  // link_trained     : Asserted when the LTSM is in ACTIVE (4.5.3.6).
   // train_error      : Asserted when the LTSM is in TRAINERROR (4.5.3.8).
   // link_reset_out   : Asserted when the LTSM is in RESET (4.5.3.1).
   // phy_retrain_done : Asserted when the LTSM returns to ACTIVE after
@@ -900,7 +903,7 @@ module ltsm #(
   //   train_error      – asserted in LT_TRAINERROR (4.5.3.8).
   //   link_reset_out   – asserted in LT_RESET (4.5.3.1); drives RDI LINKRESET.
   //   phy_retrain_done – asserted when ACTIVE is re-entered after PHYRETRAIN
-  //                      with retrain_req_q still set (4.5.3.5).
+  //                      with retrain_req_q still set (4.5.3.7).
   //   ltsm_state       – raw 8-bit state encoding for Error Log 0.
   //   lnk_is_x8        – tied to 0; x16-only in this reduced build.
   //   degrade_lanes    – tied to 00; no lane degradation supported.

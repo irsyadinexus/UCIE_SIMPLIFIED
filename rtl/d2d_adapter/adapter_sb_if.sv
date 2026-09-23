@@ -5,10 +5,11 @@
 // ----------------------------------------------------------------------------
 //
 // SPECIFICATION REFERENCES
-//   UCIe 1.0 Specification, Section 4.5.x - Sideband Packet Format
-//   UCIe 1.0 Specification, Section 6.1 - Sideband Protocol & Timing
+//   UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission
+//   UCIe 1.0 Specification, Section 6.1 - Protocol specification
+//   UCIe 1.0 Specification, Section 6.1.2 - Packet Formats
 //   UCIe 1.0 Specification, Table 47 - Sideband Opcodes
-//   UCIe 1.0 Specification, Table 49 - SrcID / DstID Encodings
+//   UCIe 1.0 Specification, Table 48 - FDI SrcID / DstID Encodings
 //   UCIe 1.0 Specification, Tables 53-56 - Sideband Message Codes
 //   UCIe 1.0 Specification, Table 115 - FDI Signal List (lp_cfg / pl_cfg)
 //
@@ -51,15 +52,15 @@
 //        csr_wr/csr_rd/csr_addr/csr_wdata bus. CfgRd completions are
 //        transmitted back when csr_rdata_vld is asserted.
 //
-//   PACKET HEADER FORMAT (spec 4.5.x, 64-bit header):
+//   SIMPLIFIED ENDPOINT HEADER (local 64-bit encoding):
 //     [7:0]   MsgCode    - message type identifier.
 //     [15:8]  SubCode    - message sub-type.
 //     [31:16] MsgInfo    - message-specific information.
 //     [36]    CP         - command parity (even parity over header, excl DP).
 //     [37]    DP         - data parity.
 //     [38]    Cr         - credit return bit.
-//     [50:48] SrcID      - source identifier (Table 49).
-//     [53:51] DstID      - destination identifier (Table 49).
+//     [50:48] SrcID      - source identifier (Table 48).
+//     [53:51] DstID      - destination identifier (Table 48).
 //     [58:54] Opcode     - operation code (Table 47).
 //
 //   The LTSM inside logical_phy owns its own RDI-side sideband credit loop
@@ -88,6 +89,14 @@
 //   v0.0.3  2026-09-23  Documentation: add per-construct comment blocks with
 //                        spec references for sideband flow control, credit/
 //                        timeout logic, and CSR access path.
+//   v0.0.4  2026-09-23  Documentation: replace false Section 4.5.x packet
+//                        citations with Section 4.1.5 and Chapter 6 references.
+//                        Mark all non-spec field positions as local endpoint
+//                        encoding. Correct FDI IDs from Table 49 to Table 48.
+//                        Normalize the remaining sideband citation titles.
+//   v0.0.5  2026-09-23  Documentation: distinguish the local CP mask from
+//                        the Table 52 completion rule and remove the unrelated
+//                        FDI bring-up citation from message decoding.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -183,7 +192,7 @@ module adapter_sb_if (
   // (crd_remote_q != 0) and no credit-return packet has just arrived.
   // It runs as long as there are outstanding credits.
   //
-  // Spec ref: UCIe 1.0, Section 6.1 - 8 ms sideband message timeout.
+  // Spec ref: UCIe 1.0, Section 6.1 - Protocol specification (8 ms timeout).
   // -------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_SB_MSG)) u_msg_timer (
     .clk(lclk), .reset_n(lreset_n),
@@ -203,7 +212,8 @@ module adapter_sb_if (
   // long silence as a link error while the adapter is waiting for a
   // delayed response.
   //
-  // Spec ref: UCIe 1.0, Section 6.1 - 4 ms stall response interval.
+  // Spec ref: UCIe 1.0, Section 6.1 - Protocol specification (4 ms Stall
+  //           response interval).
   // -------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_STALL)) u_stall_timer (
     .clk(lclk), .reset_n(lreset_n),
@@ -236,7 +246,8 @@ module adapter_sb_if (
   // rx_complete is high when rx_ui_q == 7 (the 8th and final UI of the
   // packet), indicating the header assembly is done.
   //
-  // Spec ref: UCIe 1.0, Section 4.5.x - sideband packet framing.
+  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission (Figures 46-47);
+  //           Section 6.1.2 - Packet Formats.
   // -------------------------------------------------------------------------
   wire [63:0] rx_hdr_d = {rx_hdr_q[55:0], lp_cfg};
   wire        rx_complete = (rx_ui_q == 4'd7);
@@ -259,7 +270,8 @@ module adapter_sb_if (
   //   When lp_cfg_vld is deasserted:
   //     - rx_pkt_vld is cleared. rx_hdr_q and rx_ui_q hold their values,
   //       preserving partial packet state across idle gaps.
-  // Spec ref: UCIe 1.0, Section 4.5.x - sideband UI framing.
+  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission;
+  //           Section 6.1.2 - Packet Formats.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -279,7 +291,8 @@ module adapter_sb_if (
   // assign: Parsed Header Fields
   //
   // Extracts individual fields from the fully-assembled 64-bit header
-  // (rx_hdr_q) for use by the decode logic. Field positions per spec 4.5.x:
+  // (rx_hdr_q) for use by the decode logic. This endpoint uses the local
+  // simplified field placement below:
   //
   //   rx_msgcode [7:0]   - Message code identifying the message type
   //                         (e.g. MC_NOP_CRD, MC_LM_RDI_REQ). Tables 53-56.
@@ -290,14 +303,14 @@ module adapter_sb_if (
   //   rx_dp      [37]    - Data parity.
   //   rx_cr      [38]    - Credit return bit. When set, this packet returns
   //                         one credit to the sender (spec 6.1.3).
-  //   rx_srcid   [50:48] - Source ID (Table 49).
-  //   rx_dstid   [53:51] - Destination ID (Table 49). SRCID_ADAPT = 3'b001
+  //   rx_srcid   [50:48] - Source ID (Table 48).
+  //   rx_dstid   [53:51] - Destination ID (Table 48). SRCID_ADAPT = 3'b001
   //                         addresses the Adapter's CSR space.
   //   rx_opcode  [58:54] - Operation code (Table 47). Used to distinguish
   //                         message-no-data, message-with-data, CfgRd, CfgWr.
   //
-  // Spec ref: UCIe 1.0, Section 4.5.x - sideband packet header format,
-  //           Table 47 (opcodes), Table 49 (srcid/dstid).
+  // Spec context: UCIe 1.0, Section 6.1.1 - Packet Types; Section 6.1.2 -
+  //               Packet Formats; Table 47 (opcodes); Table 48 (FDI IDs).
   // -------------------------------------------------------------------------
   wire [7:0]  rx_msgcode = rx_hdr_q[7:0];
   wire [7:0]  rx_subcode = rx_hdr_q[15:8];
@@ -312,16 +325,17 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   // assign: Command Parity Calculation
   //
-  // Computes the expected CP (command parity) as even parity over all 64
-  // header bits with the DP bit (bit 37) masked to zero. This matches the
-  // spec 4.5.x definition: CP covers all header bits except DP itself.
+  // Computes a local CP-check value over the 64-bit endpoint header. The local
+  // mask clears only the local DP bit (bit 37) and retains the local CP bit
+  // (bit 36). This local encoding does not model the completion CP exclusion.
   //
   // In this simplified endpoint, CP is computed for potential future use
   // (error detection) but is not currently checked against rx_cp. The
   // parity infrastructure is retained so that a full implementation can
   // add CP checking without restructuring.
   //
-  // Spec ref: UCIe 1.0, Section 4.5.x - sideband packet parity.
+  // Spec context: UCIe 1.0, Section 6.1.2.1 - Register Access Packets,
+  // Table 50 (CP excludes DP); Table 52 (completion CP excludes DP and CP).
   // -------------------------------------------------------------------------
   wire [63:0] hdr_for_cp = {rx_hdr_q[63:38], 1'b0, rx_hdr_q[36:0]};
   wire        cp_calc    = ^hdr_for_cp;
@@ -348,7 +362,7 @@ module adapter_sb_if (
   //
   // On reset, the counter is cleared to zero.
   //
-  // Spec ref: UCIe 1.0, Section 4.5.x - sideband packet serialisation.
+  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission (Figures 46-47).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -361,15 +375,15 @@ module adapter_sb_if (
   // -------------------------------------------------------------------------
   // always_ff: Inter-Packet Gap Counter
   //
-  // Enforces the SB_GAP_UI (32) UI inter-packet gap required by spec 4.5.x
-  // between consecutive sideband packets. The gap counter is loaded with
+  // Enforces this endpoint's SB_GAP_UI (32) UI inter-packet gap between
+  // consecutive sideband packets. The gap counter is loaded with
   // SB_GAP_UI[5:0] when the last UI of a packet (tx_ui_q == 7) is
   // transmitted, then decrements each cycle until it reaches zero.
   //
   // The in_gap wire is true whenever gap_q != 0, preventing the transmit
   // control logic from starting a new packet during the gap.
   //
-  // Spec ref: UCIe 1.0, Section 4.5.x - sideband inter-packet gap.
+  // Spec context: UCIe 1.0, Section 4.1.5 - Sideband transmission (Figure 47).
   // -------------------------------------------------------------------------
   logic [5:0] gap_q;
   wire       in_gap = (gap_q != 6'h00);
@@ -424,8 +438,8 @@ module adapter_sb_if (
   //     returning it. The decrement is guarded (crd_remote_q > 0) to
   //     prevent underflow.
   // On reset, both counters are cleared to zero (no credits available).
-  // Spec ref: UCIe 1.0, Section 6.1.3 - sideband credit model,
-  //           max SB_CRD_MAX (4) outstanding remote credits.
+  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity
+  //           (sideband credit model, max SB_CRD_MAX = 4).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -449,7 +463,8 @@ module adapter_sb_if (
   // output is a coverage/monitor hook used by the testbench to track
   // sideband credit flow without adding probe logic.
   //
-  // Spec ref: UCIe 1.0, Section 6.1.3 - credit return mechanism.
+  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity
+  //           (credit return mechanism).
   // -------------------------------------------------------------------------
   assign sb_credit_returned = rx_pkt_vld && (rx_cr ||
                             (rx_opcode == SB_OP_MSG_NODATA && rx_msgcode == MC_NOP_CRD));
@@ -466,7 +481,7 @@ module adapter_sb_if (
   //   - LinkMgmt.RDI.Req.Active (msgcode MC_LM_RDI_REQ, subcode MS_LM_ACTIVE):
   //     Sets adapter_active_req = 1, indicating the partner die wants the
   //     link to enter Active. This flag is consumed by fdi_state_machine
-  //     as one arm of the four-way Active handshake (spec 8.1.6 step 6).
+  //     as one arm of this reduced endpoint's Active-entry logic.
   //
   //   - LinkMgmt.RDI.Req.LinkReset or .Disable (subcodes MS_LM_LINKRESET,
   //     MS_LM_DISABLE): Clears adapter_active_req = 0, cancelling any
@@ -476,7 +491,7 @@ module adapter_sb_if (
   // All decoded messages must have opcode SB_OP_MSG_NODATA (message without
   // data payload) per Table 47.
   // On reset, adapter_active_req is cleared (no partner request pending).
-  // Spec ref: UCIe 1.0, Tables 53-56 (message codes), Section 8.1.6 step 6.
+  // Spec ref: UCIe 1.0, Tables 53-56 - Message Encodings.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -503,7 +518,7 @@ module adapter_sb_if (
   // The port exists so that the d2d_adapter interconnect is structurally
   // complete for future expansion.
   //
-  // Spec ref: UCIe 1.0, Section 8.2 - Adapter state requests.
+  // Spec ref: UCIe 1.0, Section 8.3.2 - State Request and Status.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -560,7 +575,8 @@ module adapter_sb_if (
   // These are implemented as continuous assigns rather than inside an
   // always_* process because Icarus Verilog 12 does not evaluate constant
   // part-selects correctly inside always_* blocks.
-  // Spec ref: UCIe 1.0, Section 4.5.x - sideband CfgRd/CfgWr encoding.
+  // Spec context: UCIe 1.0, Section 6.1.2.1 - Register Access Packets,
+  // Tables 50-51. The bit placement is this endpoint's local encoding.
   // -------------------------------------------------------------------------
   assign csr_addr  = rx_hdr_q[26:0];
   assign csr_wdata = rx_hdr_q[63:0];
@@ -580,7 +596,9 @@ module adapter_sb_if (
   //             a fixed completion opcode and routing (dstid SRCID_ADAPT).
   //             Simplified encoding: one 64-bit header, read data embedded.
   //
-  // Spec ref: Table 47 (opcodes), Table 49 (srcid/dstid), 4.5.x (completion).
+  // Spec context: UCIe 1.0, Section 6.1.2 - Packet Formats, Table 47
+  // (opcodes), and Table 48 (FDI srcid/dstid). This endpoint uses a local
+  // simplified completion encoding.
   // -------------------------------------------------------------------------
   always_comb begin
     csr_wr    = rx_pkt_vld && (rx_dstid == SRCID_ADAPT) &&

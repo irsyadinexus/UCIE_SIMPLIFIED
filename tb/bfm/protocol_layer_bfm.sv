@@ -88,12 +88,14 @@
 //   +-------------------+                        +-------------------+
 //
 // Spec ref: Section 8.2 - Flit-Aware Die-to-Die Interface (FDI)
-//           Section 8.3.1 - Stall Handshake
+//           Section 8.3.1 - Stallreq/Ack Mechanism
 //
 // REVISION HISTORY
 // ----------------
 //   v0.0.1  2025-XX-XX  Initial creation.
 //   v0.0.2  2026-09-23  Documentation: expand header, add per-block comments.
+//   v0.0.3  2026-09-23  Documentation: use the canonical Section 8.3.1 title,
+//                        Stallreq/Ack Mechanism, in both citations.
 //
 // ============================================================================
 `ifndef ProtLayerBfm_SV
@@ -146,7 +148,7 @@ module protocol_layer_bfm #(
   // On reset (lreset_n low), lp_stallack is cleared so that the
   // handshake starts in the idle (de-asserted) state.
   //
-  // Spec ref: Section 8.3.1 - Four-Phase Stall Handshake
+  // Spec ref: Section 8.3.1 - Stallreq/Ack Mechanism
   // -----------------------------------------------------------------
   always @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n)  lp_stallack <= 1'b0;

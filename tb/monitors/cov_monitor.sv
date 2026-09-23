@@ -43,7 +43,7 @@
 //   3. RDI state histogram – The 4-bit rdi_state_sts from each die is
 //      used to index a 16-entry counter array, recording which RDI states
 //      have been entered.
-//      Spec ref: Section 8.1 - Raw D2D Interface, Table 114.
+//      Spec ref: Section 8.1 - Raw Die-to-Die Interface (RDI), Table 114.
 //
 //   4. Functional event counters – Miscellaneous signals of interest
 //      (transfer completion, 4-phase stalls, width degradation, lane
@@ -72,13 +72,15 @@
 // -------------------------------------------------------------------------
 // Ports
 // -------------------------------------------------------------------------
-//   lclk          – Main link clock (500 MHz for 4 GT/s).  LTSM, RDI,
-//                   and event counters are sampled on posedge lclk.
-//   sbclk         – Sideband clock (800 MHz).  Sideband opcode/msgcode
-//                   counters are sampled on posedge sbclk.
-//   lreset_n      – Active-low reset.  State-coverage sampling is gated
-//                   by lreset_n to avoid recording the reset-state
-//                   artefact at time zero.
+//   lclk          – Main link clock (500 MHz for 4 GT/s). LTSM, RDI, event,
+//                   and mailbox-delivered sideband packet counters sample on
+//                   posedge lclk.
+//   sbclk         – Sideband clock (800 MHz). The monitor retains it for the
+//                   testbench interface, but packet coverage uses the
+//                   coherent lclk-domain mailbox outputs.
+//   lreset_n      – Active-low reset. State coverage sampling is gated by
+//                   lreset_n to avoid recording the reset-state artefact at
+//                   time zero.
 //
 //   Per-die observables (suffix _0 for Die 0, _1 for Die 1):
 //     ltsm_state_N      [7:0]  – Current LTSM state encoding.
@@ -153,6 +155,12 @@
 //                                 handshake, not the RDI Active state, so the
 //                                 link_active events now cite 8.1.5 (RDI
 //                                 State Status Machine) and 4.5.
+//   0.0.4 2026-09-23  -           Documentation: correct the Section 8.1
+//                                 title to Raw Die-to-Die Interface (RDI).
+//   0.0.5 2026-09-23  -           Req.3: sample mailbox-delivered sideband
+//                                 packet fields and valid strobes on lclk.
+//   0.0.6 2026-09-23  -           Req.3: remove stale sbclk-domain coverage
+//                                 sampling text from the port documentation.
 //
 // ============================================================================
 `ifndef CovMonitor_SV
@@ -229,7 +237,7 @@ module cov_monitor #(
 // -----------------------------------------------------------------------
 // This always block runs on the positive edge of lclk (500 MHz) and is
 // responsible for recording which Link Training State Machine (LTSM)
-// states and which RDI (Raw D2D Interface) states have been visited
+// states and which RDI (Raw Die-to-Die Interface) states have been visited
 // during the simulation.
 //
 // LTSM state coverage:
@@ -244,7 +252,7 @@ module cov_monitor #(
 // RDI state coverage:
 //   The 4-bit rdi_state_sts from each die (Table 114 encoding) directly
 //   indexes a 16-entry array.  Again, a hit flag of 1'b1 is written.
-//   Spec ref: Section 8.1 - Raw D2D Interface, Table 114.
+//   Spec ref: Section 8.1 - Raw Die-to-Die Interface (RDI), Table 114.
 //
 // Reset gating:
 //   Sampling is gated by lreset_n so that the all-zero reset state
@@ -265,11 +273,9 @@ module cov_monitor #(
 // -----------------------------------------------------------------------
 // Sideband Opcode & Message-Code Coverage Sampling
 // -----------------------------------------------------------------------
-// This always block runs on the positive edge of sbclk (800 MHz) and
-// captures every valid sideband packet received by either die.
-//
-// When sb_rx_pkt_vld_N is asserted the corresponding die has latched a
-// complete 64-bit sideband packet.  The monitor extracts:
+// This always block runs on the positive edge of lclk (500 MHz). The logical
+// PHY delivers each complete sideband packet through an sbclk-to-lclk mailbox,
+// so sb_rx_pkt_vld_N and its fields are coherent in this domain.
 //   - sb_rx_opcode_N  [4:0] : 5-bit opcode  → indexes sb_opcode_hits[0:31]
 //   - sb_rx_msgcode_N [7:0] : 8-bit msgcode → indexes sb_msgcode_hits[0:255]
 //
@@ -281,7 +287,7 @@ module cov_monitor #(
 //
 // Spec ref: Section 6.1.1 - Packet Types (5-bit opcode field and 8-bit
 //           msgcode field).
-  always @(posedge sbclk) begin
+  always @(posedge lclk) begin
     if (sb_rx_pkt_vld_0) begin
       sb_opcode_hits[sb_rx_opcode_0]   <= sb_opcode_hits[sb_rx_opcode_0]   + 1'b1;
       sb_msgcode_hits[sb_rx_msgcode_0] <= sb_msgcode_hits[sb_rx_msgcode_0] + 1'b1;

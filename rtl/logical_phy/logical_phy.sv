@@ -5,7 +5,7 @@
 // Description : Hierarchical integration wrapper for the UCIe Logical PHY
 //               layer. This module is the single counterpart to the D2D
 //               Adapter at the top level and owns every block between the
-//               RDI (Raw D2D Interface, spec 8.1) and the physical pins.
+//               RDI (Raw Die-to-Die Interface, spec 8.1) and the physical pins.
 //
 // Spec refs   : UCIe 1.0 spec section 4.0 (Logical Physical Layer),
 //               section 8.1 - Raw Die-to-Die Interface (RDI), Table 114
@@ -71,8 +71,9 @@
 //   TX path : adapter -> rdi_lp_data -> rdi_pl_data pass-through (loopback).
 //             During training: ltsm -> pattern_gen -> mb_tx_data pins.
 //   RX path : mb_rx_data pins -> (future CRC / scrambler) -> rdi_pl_data.
-//   Sideband: ltsm -> sb_codec -> sb_tx_data pins; sb_rx_data -> sb_codec ->
-//             ltsm.
+//   Sideband: ltsm (lclk) -> async mailbox -> sb_codec (sbclk) -> sideband
+//             pins. Received packets cross through the reverse mailbox to
+//             the ltsm lclk domain.
 //
 // --------------------------------------------------------------------------
 // Parameters
@@ -95,9 +96,9 @@
 // --------------------------------------------------------------------------
 // Clock domains
 // --------------------------------------------------------------------------
-//   lclk     : 500 MHz link clock for the main-band data path and LTSM.
-//   sbclk    : 800 MHz sideband clock for sb_codec and sideband side of the
-//              LTSM.
+//   lclk     : 500 MHz link clock for the main-band path and LTSM.
+//   sbclk    : 800 MHz sideband clock for sb_codec. Toggle mailboxes carry
+//              complete sideband packets safely between lclk and sbclk.
 //
 // --------------------------------------------------------------------------
 // Implementation notes
@@ -136,6 +137,11 @@
 //                        4.5.3.5), Figure 48 is lane remapping (byte-to-lane
 //                        is Figures 42-43), and the stall handshake is 8.3.1
 //                        rather than Table 115.
+//   v0.0.8  2026-09-23  Documentation: correct the Stallreq/Ack signal pair
+//                        and clarify that lp_state_req is Section 8.3.2.
+//   v0.0.9  2026-09-23  Req.3: add paired asynchronous mailboxes between the
+//                        lclk LTSM and the 800 MHz sbclk codec. Synchronize
+//                        codec busy and sideband presence back to lclk.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -196,7 +202,13 @@ module logical_phy #(
   logic [NBYTES-1:0][7:0] tx_bytes;
   logic [NLANES-1:0][7:0] lane_bytes;
 
-  // ------------------------------------------------- LTSM <-> codec
+  // ------------------------------------------------- LTSM <-> sideband CDC
+  // The LTSM side uses lclk. The sb_codec side uses sbclk. Each direction
+  // carries complete packet fields through a one-entry asynchronous mailbox.
+  localparam int unsigned SB_TX_W = 126;
+  localparam int unsigned SB_RX_W = 37;
+
+  // LTSM-facing TX request and codec-facing busy indication.
   logic        sb_tx_load;
   logic [4:0]  sb_tx_opcode;
   logic [2:0]  sb_tx_srcid;
@@ -211,17 +223,52 @@ module logical_phy #(
   logic [63:0] sb_tx_data_in;
   logic        sb_tx_has_data;
   logic        sb_tx_busy;
-  logic        sb_rx_pkt_vld;
-  logic [4:0]  sb_rx_opcode;
-  logic [2:0]  sb_rx_srcid;
-  logic [2:0]  sb_rx_dstid;
-  logic [7:0]  sb_rx_msginfo;
-  logic [7:0]  sb_rx_msgcode;
-  logic [7:0]  sb_rx_msgsubcode;
-  logic        sb_rx_cp_err;
-  logic        sb_rx_dp_err;
-  logic        sb_msg_timeout;
-  logic        sb_stall_sent;
+
+  // Codec-facing TX request produced by the lclk-to-sbclk mailbox.
+  logic [SB_TX_W-1:0] sb_tx_cdc_data;
+  logic               sb_tx_cdc_busy;
+  logic               codec_tx_load;
+  logic [4:0]         codec_tx_opcode;
+  logic [2:0]         codec_tx_srcid;
+  logic [2:0]         codec_tx_dstid;
+  logic [7:0]         codec_tx_msginfo;
+  logic [7:0]         codec_tx_msgcode;
+  logic [7:0]         codec_tx_msgsubcode;
+  logic [7:0]         codec_tx_be;
+  logic [4:0]         codec_tx_tag;
+  logic               codec_tx_ep;
+  logic [11:0]        codec_tx_addr;
+  logic [63:0]        codec_tx_data_in;
+  logic               codec_tx_has_data;
+  logic               codec_tx_busy;
+  logic               codec_tx_busy_meta_q;
+  logic               codec_tx_busy_sync_q;
+
+  // Codec-facing RX packet and LTSM-facing packet delivered by sbclk-to-lclk.
+  logic               codec_rx_pkt_vld;
+  logic [4:0]         codec_rx_opcode;
+  logic [2:0]         codec_rx_srcid;
+  logic [2:0]         codec_rx_dstid;
+  logic [7:0]         codec_rx_msginfo;
+  logic [7:0]         codec_rx_msgcode;
+  logic [7:0]         codec_rx_msgsubcode;
+  logic               codec_rx_cp_err;
+  logic               codec_rx_dp_err;
+  logic [SB_RX_W-1:0] sb_rx_cdc_data;
+  logic               sb_rx_cdc_busy;
+  logic               sb_rx_pkt_vld;
+  logic [4:0]         sb_rx_opcode;
+  logic [2:0]         sb_rx_srcid;
+  logic [2:0]         sb_rx_dstid;
+  logic [7:0]         sb_rx_msginfo;
+  logic [7:0]         sb_rx_msgcode;
+  logic [7:0]         sb_rx_msgsubcode;
+  logic               sb_rx_cp_err;
+  logic               sb_rx_dp_err;
+  logic               sb_rx_valid_meta_q;
+  logic               sb_rx_valid_sync_q;
+  logic               sb_msg_timeout;
+  logic               sb_stall_sent;
 
   // ------------------------------------------------- LTSM <-> pattern gen
   logic        pat_enable;
@@ -258,59 +305,109 @@ module logical_phy #(
   logic        csr_rdata_vld;
 
   // ---------------------------------------------------------------------------
-  // Sideband Codec Instantiation  (u_sb_codec)
+  // Sideband CDC and Codec Instantiations  (u_sb_tx_cdc/u_sb_codec/u_sb_rx_cdc)
   // ---------------------------------------------------------------------------
-  // Spec reference : Chapter 6 (sideband framing), Table 47 (opcodes),
-  //                  Tables 53/54/56 (message codes).
+  // The LTSM generates and consumes one-lclk-cycle packet events. The sb_codec
+  // samples and produces one-sbclk-cycle packet events at 800 MHz. The paired
+  // toggle mailboxes preserve packet data and event delivery across the two
+  // asynchronous domains. The codec remains the sole sbclk-domain serializer
+  // and deserializer.
   //
-  // The sb_codec serialises and deserialises 64-bit sideband packets at the
-  // sbclk rate. It is the only module that knows the bit-field layout of the
-  // sideband header; all other blocks see named, typed fields.
-  //
-  // The LTSM drives the TX side (sb_tx_load, sb_tx_opcode, etc.) and
-  // consumes the RX side (sb_rx_pkt_vld, sb_rx_opcode, etc.).
-  // The codec also computes and checks CP (command parity) and DP (data
-  // parity) per spec Chapter 6 parity rules.
-  //
-  // tx_cr is tied to 1'b0: credit return messages are not generated in this
-  // reduced-capability build. The rx_cr, rx_addr, and rx_data outputs are
-  // left unconnected for the same reason.
+  // The TX mailbox carries the full 126-bit LTSM request bundle to sbclk. The
+  // RX mailbox returns the parsed 37-bit packet bundle to lclk. The busy path
+  // synchronizes codec backpressure into lclk and combines it with mailbox
+  // occupancy before the LTSM can issue another request.
   // ---------------------------------------------------------------------------
+  sb_cdc_mailbox #(.WIDTH(SB_TX_W)) u_sb_tx_cdc (
+    .src_clk    (lclk),
+    .src_reset_n(lreset_n),
+    .src_data   ({sb_tx_opcode, sb_tx_srcid, sb_tx_dstid, sb_tx_msginfo,
+                  sb_tx_msgcode, sb_tx_msgsubcode, sb_tx_be, sb_tx_tag,
+                  sb_tx_ep, sb_tx_addr, sb_tx_data_in, sb_tx_has_data}),
+    .src_send   (sb_tx_load),
+    .src_busy   (sb_tx_cdc_busy),
+    .dst_clk    (sbclk),
+    .dst_reset_n(sbreset_n),
+    .dst_data   (sb_tx_cdc_data),
+    .dst_valid  (codec_tx_load)
+  );
+
+  assign {codec_tx_opcode, codec_tx_srcid, codec_tx_dstid, codec_tx_msginfo,
+          codec_tx_msgcode, codec_tx_msgsubcode, codec_tx_be, codec_tx_tag,
+          codec_tx_ep, codec_tx_addr, codec_tx_data_in, codec_tx_has_data} =
+         sb_tx_cdc_data;
+
+  // Synchronize sbclk-domain levels that the lclk-side PHY consumes. The busy
+  // level gates new LTSM requests. sb_rx_valid only feeds RDI in-band presence.
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      codec_tx_busy_meta_q <= 1'b0;
+      codec_tx_busy_sync_q <= 1'b0;
+      sb_rx_valid_meta_q   <= 1'b0;
+      sb_rx_valid_sync_q   <= 1'b0;
+    end else begin
+      codec_tx_busy_meta_q <= codec_tx_busy;
+      codec_tx_busy_sync_q <= codec_tx_busy_meta_q;
+      sb_rx_valid_meta_q   <= sb_rx_valid;
+      sb_rx_valid_sync_q   <= sb_rx_valid_meta_q;
+    end
+  end
+
+  assign sb_tx_busy = sb_tx_cdc_busy | codec_tx_busy_sync_q;
+
   sb_codec u_sb_codec (
     .sbclk        (sbclk),
     .sbreset_n    (sbreset_n),
-    .tx_load      (sb_tx_load),
-    .tx_opcode    (sb_tx_opcode),
-    .tx_srcid     (sb_tx_srcid),
-    .tx_dstid     (sb_tx_dstid),
-    .tx_msginfo   (sb_tx_msginfo),
-    .tx_msgcode   (sb_tx_msgcode),
-    .tx_msgsubcode(sb_tx_msgsubcode),
+    .tx_load      (codec_tx_load),
+    .tx_opcode    (codec_tx_opcode),
+    .tx_srcid     (codec_tx_srcid),
+    .tx_dstid     (codec_tx_dstid),
+    .tx_msginfo   (codec_tx_msginfo),
+    .tx_msgcode   (codec_tx_msgcode),
+    .tx_msgsubcode(codec_tx_msgsubcode),
     .tx_cr        (1'b0),
-    .tx_addr      (sb_tx_addr),
-    .tx_be        (sb_tx_be),
-    .tx_tag       (sb_tx_tag),
-    .tx_ep        (sb_tx_ep),
-    .tx_data_in   (sb_tx_data_in),
-    .tx_has_data  (sb_tx_has_data),
-    .tx_busy      (sb_tx_busy),
+    .tx_addr      (codec_tx_addr),
+    .tx_be        (codec_tx_be),
+    .tx_tag       (codec_tx_tag),
+    .tx_ep        (codec_tx_ep),
+    .tx_data_in   (codec_tx_data_in),
+    .tx_has_data  (codec_tx_has_data),
+    .tx_busy      (codec_tx_busy),
     .sb_tx_data   (sb_tx_data),
     .sb_tx_valid  (sb_tx_valid),
     .sb_rx_data   (sb_rx_data),
     .sb_rx_valid  (sb_rx_valid),
-    .rx_pkt_vld   (sb_rx_pkt_vld),
-    .rx_opcode    (sb_rx_opcode),
-    .rx_srcid     (sb_rx_srcid),
-    .rx_dstid     (sb_rx_dstid),
-    .rx_msginfo   (sb_rx_msginfo),
-    .rx_msgcode   (sb_rx_msgcode),
-    .rx_msgsubcode(sb_rx_msgsubcode),
+    .rx_pkt_vld   (codec_rx_pkt_vld),
+    .rx_opcode    (codec_rx_opcode),
+    .rx_srcid     (codec_rx_srcid),
+    .rx_dstid     (codec_rx_dstid),
+    .rx_msginfo   (codec_rx_msginfo),
+    .rx_msgcode   (codec_rx_msgcode),
+    .rx_msgsubcode(codec_rx_msgsubcode),
     .rx_cr        (),
     .rx_addr      (),
     .rx_data      (),
-    .rx_cp_err    (sb_rx_cp_err),
-    .rx_dp_err    (sb_rx_dp_err)
+    .rx_cp_err    (codec_rx_cp_err),
+    .rx_dp_err    (codec_rx_dp_err)
   );
+
+  sb_cdc_mailbox #(.WIDTH(SB_RX_W)) u_sb_rx_cdc (
+    .src_clk    (sbclk),
+    .src_reset_n(sbreset_n),
+    .src_data   ({codec_rx_opcode, codec_rx_srcid, codec_rx_dstid,
+                  codec_rx_msginfo, codec_rx_msgcode, codec_rx_msgsubcode,
+                  codec_rx_cp_err, codec_rx_dp_err}),
+    .src_send   (codec_rx_pkt_vld),
+    .src_busy   (sb_rx_cdc_busy),
+    .dst_clk    (lclk),
+    .dst_reset_n(lreset_n),
+    .dst_data   (sb_rx_cdc_data),
+    .dst_valid  (sb_rx_pkt_vld)
+  );
+
+  assign {sb_rx_opcode, sb_rx_srcid, sb_rx_dstid, sb_rx_msginfo,
+          sb_rx_msgcode, sb_rx_msgsubcode, sb_rx_cp_err, sb_rx_dp_err} =
+         sb_rx_cdc_data;
 
   // ---------------------------------------------------------------------------
   // Link Training and Status Machine Instantiation  (u_ltsm)
@@ -335,8 +432,6 @@ module logical_phy #(
   ltsm #(.NLANES(NLANES)) u_ltsm (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
-    .sbclk           (sbclk),
-    .sbreset_n       (sbreset_n),
     .start_link_train(ltsm_start_link_train),
     .adapter_active_req(adapter_active_req),
     .link_trained    (link_trained),
@@ -450,7 +545,7 @@ module logical_phy #(
     .phy_link_reset  (link_reset_out),
     .phy_retrain_req (rdi_lp_state_req == ucie_pkg::RDI_REQ_RETRAIN),
     .phy_train_error (train_error),
-    .phy_inband_pres (sb_rx_valid),
+    .phy_inband_pres (sb_rx_valid_sync_q),
     .cerror          (1'b0),
     .nferror         (1'b0),
     .stall_req       (1'b0),
@@ -726,8 +821,8 @@ module logical_phy #(
   // rather than a hidden one.
   //
   // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism (the
-  //           lp_state_req / pl_stallreq handshake, not modelled in this
-  //           simplified endpoint).
+  //           pl_stallreq / lp_stallack handshake). lp_state_req is a
+  //           separate state request specified in Section 8.3.2.
   // ---------------------------------------------------------------------------
   logic unused;
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |

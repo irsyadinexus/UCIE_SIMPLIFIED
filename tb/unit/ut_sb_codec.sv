@@ -69,19 +69,14 @@
 //                                                      └──────────────────────┘
 //
 //
-// CLOCK RATE – SIMULATION CONCESSION
-// -----------------------------------
-// The sideband clock (sbclk) in this testbench runs at 250 MHz (2 ns
-// half-period, 4 ns period).  This is a simulation-only reduced rate chosen
-// for convenience and faster simulation turn-around.  The production
-// sideband signalling rate is 800 MHz as specified in Section 5.13 –
-// Sideband signaling.  Because the codec logic is fully synchronous to
-// sbclk with no cycle-count-dependent timing, functional correctness at
-// 250 MHz implies correctness at 800 MHz; only gate-level timing closure
-// is affected.
+// CLOCK RATE
+// ----------
+// The sideband clock (sbclk) in this testbench runs at the 800 MHz production
+// rate (0.625 ns half-period, 1.25 ns period). The codec is entirely in this
+// clock domain, so this test validates serialization, packet gaps, and parity
+// at the specified sideband clock rate.
 //
-//   Spec ref: Section 5.13 – Sideband signaling
-//             (defines the 800 MHz production sideband rate)
+//   Spec ref: Section 5.13 – Sideband signaling.
 //
 //
 // STIMULUS (DIRECTED TESTS)
@@ -135,6 +130,8 @@
 //   v0.0.1  2025-XX-XX  Initial creation.
 //   v0.0.2  2026-09-23  Documentation: expand header, add per-block
 //                        comments throughout the testbench.
+//   v0.0.3  2026-09-23  Req.3: run the codec test at the 800 MHz production
+//                        sideband rate.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -262,23 +259,15 @@ module ut_sb_codec;
   );
 
   // --------------------------------------------------------------------------
-  // Clock generator – sbclk at 250 MHz (simulation concession)
+  // Clock generator – sbclk at 800 MHz
   // --------------------------------------------------------------------------
-  // The `always #2` toggle produces a clock with a 4 ns period (2 ns
-  // half-period), corresponding to 250 MHz.
+  // The `always #0.625` toggle produces a 1.25 ns period, corresponding to
+  // the 800 MHz sideband production rate.
   //
-  // IMPORTANT: 250 MHz is a simulation-only reduced rate.  The production
-  // sideband signalling rate is 800 MHz per Section 5.13 – Sideband
-  // signaling.  The sb_codec is fully synchronous to sbclk and contains
-  // no hard-coded cycle-count timing assumptions, so functional behaviour
-  // is identical at any frequency.  The lower simulation rate simply
-  // reduces event counts and accelerates regression runs.
-  //
-  //   Spec ref: Section 5.13 – Sideband signaling
-  //             (defines 800 MHz as the production sideband clock rate)
+  // Spec ref: Section 5.13 – Sideband signaling.
   // --------------------------------------------------------------------------
   initial sbclk = 1'b0;
-  always #2 sbclk = ~sbclk;     // 250 MHz sideband
+  always #0.625 sbclk = ~sbclk; // 800 MHz sideband
 
   // --------------------------------------------------------------------------
   // Receiver output latch – snapshot on rx_pkt_vld pulse

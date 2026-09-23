@@ -8,8 +8,8 @@
 //   UCIe 1.0 Specification, Section 8.2 - Flit-Aware Die-to-Die Interface
 //     (FDI)
 //   UCIe 1.0 Specification, Section 8.2.5 - FDI State Status Machine
-//   UCIe 1.0 Specification, Section 8.2.6 - Rx Active Handshake
-//   UCIe 1.0 Specification, Section 8.1.6 Step 6 - Active Entry Gating
+//   UCIe 1.0 Specification, Section 8.2.6 - Rx_active_req/Sts Handshake
+//   UCIe 1.0 Specification, Section 8.2.7 - FDI Bring up flow
 //   UCIe 1.0 Specification, Table 115 - FDI Signal List
 //   UCIe 1.0 Specification, Table 114 - RDI Signal List (state encodings)
 //
@@ -130,6 +130,8 @@
 //   v0.0.1  2025-08-15  Initial creation.
 //   v0.0.2  2026-09-23  Documentation: expand header, add per-block
 //                        comments.
+//   v0.0.3  2026-09-23  Documentation: correct the Rx_active_req/Sts and FDI
+//                        Bring up flow citations in the header.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0

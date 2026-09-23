@@ -53,16 +53,15 @@
 //   rx_dp_err.
 //
 // --------------------------------------------------------------------------
-// TX sequencing
-// --------------------------------------------------------------------------
-//   1. The LTSM asserts tx_load with all field inputs valid.
+//   1. The logical_phy lclk-to-sbclk mailbox asserts tx_load with all field
+//      inputs stable in the sbclk domain.
 //   2. The codec calls assemble_hdr() to pack the header, computes CP and
 //      DP, and latches the result.
 //   3. The header is shifted out one bit per sbclk cycle (64 UIs, LSB
 //      first), then the data payload (if tx_has_data), then a 32-UI idle
 //      gap (SB_GAP_UI).
-//   4. tx_busy is high throughout; the LTSM must not assert tx_load while
-//      tx_busy.
+//   4. tx_busy is high throughout. logical_phy synchronizes this back to lclk
+//      and does not issue a new mailbox request until it is low.
 //
 // --------------------------------------------------------------------------
 // RX sequencing
@@ -81,13 +80,12 @@
 //   None (NC and SB_GAP_UI from ucie_pkg).
 //
 // --------------------------------------------------------------------------
-// Interfaces
-// --------------------------------------------------------------------------
-//   TX: Field inputs from LTSM, serial output sb_tx_data/sb_tx_valid to
-//       partner die. tx_busy backpressure.
-//   RX: Serial input sb_rx_data/sb_rx_valid from partner die, parsed field
-//       outputs to LTSM. rx_pkt_vld indicates a complete packet.
-//       rx_cp_err, rx_dp_err indicate parity mismatches.
+//   TX: Packet fields arrive from the logical_phy lclk-to-sbclk mailbox.
+//       The codec serializes them at sbclk and returns tx_busy to logical_phy.
+//   RX: Serial input sb_rx_data/sb_rx_valid is parsed at sbclk. Parsed packet
+//       fields leave through the logical_phy sbclk-to-lclk mailbox. The codec
+//       owns no lclk logic and has no direct LTSM clock-domain crossing.
+//       rx_cp_err and rx_dp_err report parity errors with the parsed packet.
 //
 // --------------------------------------------------------------------------
 // Implementation notes
@@ -112,6 +110,8 @@
 //                        blocks for tx_busy output, remaining RX field
 //                        extractions, and CP parity check assign, citing
 //                        UCIe 1.0 Section 6.1.2, 6.1.3, and Table 47.
+//   v0.0.3  2026-09-23  Req.3: document sbclk-only operation. logical_phy
+//                        now owns the asynchronous LTSM/codec boundaries.
 // ============================================================================
 `ifndef SbCodec_SV
 `define SbCodec_SV

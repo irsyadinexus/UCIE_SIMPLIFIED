@@ -138,6 +138,10 @@
 //                        (Flit-Aware Die-to-Die Interface). Width degrade is
 //                        Section 4.3.7, not 4.3.4. The CSR and link control
 //                        references now cite Section 7.5 with Table 65.
+//   v0.0.5  2026-09-23  Documentation: correct the Section 8.3.1 title and
+//                        replace the false Section 4.5.x packet reference with
+//                        the applicable sideband references. Normalize the
+//                        Table 115 citation for lp_linkerror.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -265,7 +269,7 @@ module d2d_adapter #(
   //   - stall_active = stallreq_q && lp_stallack gates both lp_valid and
   //     lp_irdy inside u_datapath, preventing data movement during stall.
   //
-  // Spec ref: UCIe 1.0, Section 8.3.1 - Stall Protocol.
+  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism.
   // --------------------------------------------------------------------------
   logic stallreq_q;
 
@@ -277,7 +281,7 @@ module d2d_adapter #(
   // cannot re-assert while the Protocol Layer's acknowledge is still high,
   // satisfying the four-phase handshake requirement of spec 8.3.1.
   //
-  // Spec ref: UCIe 1.0, Section 8.3.1 - Stall four-phase protocol.
+  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) stallreq_q <= 1'b0;
@@ -427,8 +431,8 @@ module d2d_adapter #(
   //
   // partner_active_req is tied to 1'b0 (u_sb_if latches Active from stream).
   //
-  // Spec ref: UCIe 1.0, Section 4.5.x (packet format), Section 6.1
-  //           (sideband protocol/timers), Table 47 (opcodes).
+  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission; Section 6.1
+  //           - Protocol specification; Sections 6.1.1-6.1.3; Table 47.
   // -------------------------------------------------------------------------
   adapter_sb_if u_sb_if (
     .lclk(lclk),
@@ -504,7 +508,7 @@ module d2d_adapter #(
   // file so that testbenches and debug monitors can observe whether the
   // RDI has reached Active without reading the CSR.
   //
-  // Spec ref: UCIe 1.0, Table 115 - lp_linkerror definition.
+  // Spec ref: UCIe 1.0, Table 115 - FDI Signal List (lp_linkerror definition).
   // -------------------------------------------------------------------------
   always_comb begin
     lp_linkerror    = 1'b0;

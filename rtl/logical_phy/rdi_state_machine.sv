@@ -2,7 +2,7 @@
 // File        : rdi_state_machine.sv
 // Module      : rdi_state_machine
 // Project     : UCIe 1.0 Simplified Endpoint
-// Description : Raw D2D Interface (RDI) Link State Machine. Mediates between
+// Description : Raw Die-to-Die Interface (RDI) Link State Machine. Mediates between
 //               the D2D Adapter (which requests state transitions via
 //               rdi_lp_state_req) and the Logical PHY (which reports physical
 //               link events: trained, reset, retrain, error).
@@ -105,6 +105,8 @@
 //                        blocks for RDI output assigns (inband_pres through
 //                        trainerror) and unused-signal always_comb, citing
 //                        UCIe 1.0 Sections 8.1, 8.1.5, 8.3.2, Table 114.
+//   v0.0.3  2026-09-23  Documentation: correct the RDI expansion in the
+//                        module description to Raw Die-to-Die Interface.
 // ============================================================================
 `ifndef RdiStateMachine_SV
 `define RdiStateMachine_SV

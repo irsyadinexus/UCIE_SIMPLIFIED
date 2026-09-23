@@ -7,8 +7,8 @@
 // SPECIFICATION REFERENCES
 //   UCIe 1.0 Specification, Section 8.2 - Flit-Aware Die-to-Die Interface
 //                                         (FDI)
-//   UCIe 1.0 Specification, Section 8.2.6 - Rx Active Handshake
-//   UCIe 1.0 Specification, Section 8.1.6 Step 6 - Active Entry Gating
+//   UCIe 1.0 Specification, Section 8.2.6 - Rx_active_req/Sts Handshake
+//   UCIe 1.0 Specification, Section 8.2.7 - FDI Bring up flow
 //   UCIe 1.0 Specification, Table 115 - FDI Signal List
 //   UCIe 1.0 Specification, Table 114 - RDI Signal List (state encodings)
 //
@@ -90,6 +90,9 @@
 //   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
 //   v0.0.3  2026-09-23  Documentation: fix the Section 8.2 title in the header
 //                        ("Fdie-to-Die" -> "Flit-Aware Die-to-Die Interface").
+//   v0.0.4  2026-09-23  Documentation: correct the Rx_active_req/Sts and FDI
+//                        Bring up flow citations in the header. Normalize the
+//                        Section 8.2 citation for pl_inband_pres.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -226,7 +229,8 @@ module fdi_state_machine (
   // The computed pl_inband_pres_d is registered into inband_pres_q in the
   // state register always_ff above.
   //
-  // Spec ref: UCIe 1.0, Section 8.2 - pl_inband_pres behaviour.
+  // Spec ref: UCIe 1.0, Section 8.2 - Flit-Aware Die-to-Die Interface (FDI)
+  //           (pl_inband_pres behavior).
   // -------------------------------------------------------------------------
   always_comb begin
     if (rdi_inband_pres)               pl_inband_pres_d = 1'b1;

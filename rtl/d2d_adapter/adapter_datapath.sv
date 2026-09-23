@@ -84,6 +84,8 @@
 //                        reference now points to Section 2.0 Protocol Layer.
 //                        Width degrade is Section 4.3.7, not 4.3.4 (which is
 //                        Clock and Track Lane remapping).
+//   v0.0.5  2026-09-23  Documentation: use the canonical Table 115 title
+//                        before the lp_stallack signal description.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -224,7 +226,7 @@ module adapter_datapath #(
   // wiring matches FDI Table 115. This assign keeps the signal visible to
   // lint tools without generating an unused-port warning.
   //
-  // Spec ref: UCIe 1.0, Table 115 - lp_stallack definition.
+  // Spec ref: UCIe 1.0, Table 115 - FDI Signal List (lp_stallack definition).
   // -------------------------------------------------------------------------
   logic unused_stallack;
   assign unused_stallack = lp_stallack;

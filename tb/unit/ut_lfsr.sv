@@ -43,7 +43,7 @@
 //   1. scrambler
 //      - Instance  : u_dut
 //      - Parameter : LANE_ID = 3
-//      - Seed      : lfsr_seed(3) = 23'h18C0DB (per UCIe 1.0 Table 47)
+//      - Seed      : lfsr_seed(3) = 23'h18C0DB (per UCIe 1.0 Table 20)
 //      - Clock     : lclk (500 MHz, 1 ns half-period)
 //      - data_in   : tied to 8'h00 (raw LFSR output on data_out)
 //
@@ -159,6 +159,9 @@
 //   0.0.1  2025-XX-XX  -           Initial creation.
 //   0.0.2  2026-09-23  -           Documentation: expand header, add
 //                                  per-block comments.
+//   0.0.3  2026-09-23  -           Documentation: correct lane-3 LFSR seed
+//                                  citations from Table 47 to Table 20 and
+//                                  use the real Section 4.5 title.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -185,7 +188,7 @@ module ut_lfsr;
   //
   // Instantiates the scrambler module with LANE_ID = 3, selecting the
   // per-lane seed lfsr_seed(3) = 23'h18C0DB from ucie_pkg (per UCIe 1.0
-  // Table 47).  The scrambler implements the 23-bit Fibonacci LFSR with
+  // Table 20).  The scrambler implements the 23-bit Fibonacci LFSR with
   // polynomial G(x) = x^23 + x^21 + x^16 + x^8 + x^5 + x^2 + 1.
   //
   // Connections:
@@ -250,7 +253,7 @@ module ut_lfsr;
   // True to spec: C_RESET_MIN = 2,000,000 cycles (no prescaling).
   //
   // Spec ref: UCIe 1.0, Section 4.5.3.1 — RESET state; Section 4.5 —
-  //           Sub-state residency timeout.
+  //           Link Initialization and Training (sub-state residency timeout).
   // -------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN)) u_timer (
     .clk     (tclk),

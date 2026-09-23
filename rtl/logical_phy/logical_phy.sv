@@ -7,10 +7,11 @@
 //               Adapter at the top level and owns every block between the
 //               RDI (Raw D2D Interface, spec 8.1) and the physical pins.
 //
-// Spec refs   : UCIe 1.0 spec section 3.1 (Logical PHY layer definition),
-//               section 8.1 (RDI signal table, Table 114), section 4.5.3
-//               (LTSM), section 6 (sideband framing), section 5.2 (byte-to-
-//               lane mapping), section 7.1 (PHY CSR).
+// Spec refs   : UCIe 1.0 spec section 4.0 (Logical Physical Layer),
+//               section 8.1 - Raw Die-to-Die Interface (RDI), Table 114
+//               (RDI signal list), section 4.5.3 (Link Training State
+//               Machine), section 6.0 (Sideband), section 7.5 (UCIe
+//               Registers).
 //
 // Capability  : Standard Package, x16, 4 GT/s, Streaming / Raw Mode
 //               (Format 1). Single stack (Stack-0). No retimer. Reduced-
@@ -127,6 +128,14 @@
 //   v0.0.6  2026-09-23  Documentation pass: add per-construct comment blocks
 //                        for every always, assign, and instantiation per the
 //                        project documentation contract.
+//   v0.0.7  2026-09-23  Documentation: correct fabricated citations in the
+//                        header and per-construct blocks. Title 3.1 is Link
+//                        Initialization (not Logical PHY), 7.1 is the high
+//                        level software view (registers are 7.5), Table 71 is
+//                        the sideband mailbox (training patterns are 4.4.1 /
+//                        4.5.3.5), Figure 48 is lane remapping (byte-to-lane
+//                        is Figures 42-43), and the stall handshake is 8.3.1
+//                        rather than Table 115.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -453,8 +462,8 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   // Training Pattern Generator Instantiation  (u_pat_gen)
   // ---------------------------------------------------------------------------
-  // Spec reference : 4.5.3.4 (MBTRAIN sub-states), 4.5.3.6 (LINKINIT),
-  //                  Table 71 (training pattern sequence).
+  // Spec reference : 4.5.3.4 (MBTRAIN sub-states), 4.5.3.5 (LINKINIT),
+  //                  4.4.1 (Scrambling and training pattern generation).
   //
   // The pattern generator produces per-lane training patterns on mb_tx_data
   // during the MBTRAIN and LINKINIT sub-states. The LTSM selects the active
@@ -487,8 +496,10 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   // Byte-to-Lane Mapper Instantiation  (u_mapper)
   // ---------------------------------------------------------------------------
-  // Spec reference : 5.2 / Figure 48 (byte-to-lane mapping), 4.1.1
-  //                  (lane and width definitions), width-degrade mechanism.
+  // Spec reference : 4.1.1 (Byte to Lane Mapping), Figure 42 (Byte map for
+  //                  x16 interface), Figure 43 (Byte to Lane mapping for
+  //                  Standard package x8 degraded), 4.3.7 (Width Degrade in
+  //                  Standard Package Interfaces).
   //
   // The mapper translates NBYTES parallel bytes into NLANES lane-aligned
   // bytes, handling x16 full-width and x8-degraded half-width modes. In
@@ -714,8 +725,9 @@ module logical_phy #(
   // synthesis discards it entirely. It is a deliberate, documented suppression
   // rather than a hidden one.
   //
-  // Spec ref: UCIe 1.0, Table 115 - lp_state_req / pl_stallreq handshake
-  //              (not modelled in this simplified endpoint).
+  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism (the
+  //           lp_state_req / pl_stallreq handshake, not modelled in this
+  //           simplified endpoint).
   // ---------------------------------------------------------------------------
   logic unused;
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |

@@ -5,7 +5,8 @@
 // ----------------------------------------------------------------------------
 //
 // SPECIFICATION REFERENCES
-//   UCIe 1.0 Specification, Section 8.2 - Fdie-to-Die Interface (FDI)
+//   UCIe 1.0 Specification, Section 8.2 - Flit-Aware Die-to-Die Interface
+//                                         (FDI)
 //   UCIe 1.0 Specification, Section 8.2.6 - Rx Active Handshake
 //   UCIe 1.0 Specification, Section 8.1.6 Step 6 - Active Entry Gating
 //   UCIe 1.0 Specification, Table 115 - FDI Signal List
@@ -87,6 +88,8 @@
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
 //   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
+//   v0.0.3  2026-09-23  Documentation: fix the Section 8.2 title in the header
+//                        ("Fdie-to-Die" -> "Flit-Aware Die-to-Die Interface").
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0

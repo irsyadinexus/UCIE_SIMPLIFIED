@@ -37,8 +37,8 @@
 //      8-bit message code are used to index 32-bit counter arrays.
 //      Because both dies' RX paths are monitored, traffic in both
 //      directions of the sideband crossing is captured.
-//      Spec ref: Section 6.1.1 - Packet Types (opcode encoding),
-//                Section 6.1.1 - Message Codes (msgcode encoding).
+//      Spec ref: Section 6.1.1 - Packet Types (opcode and msgcode
+//                encoding).
 //
 //   3. RDI state histogram – The 4-bit rdi_state_sts from each die is
 //      used to index a 16-entry counter array, recording which RDI states
@@ -49,8 +49,8 @@
 //      (transfer completion, 4-phase stalls, width degradation, lane
 //      reversal, Raw Mode advertisement, CRC-off advertisement) are each
 //      counted in a dedicated 32-bit register on the lclk edge.
-//      Spec ref: Section 4.5 - Link Training Overview (events),
-//                Section 8.2.3.2 - RDI Active State.
+//      Spec ref: Section 4.5 - Link Initialization and Training (events),
+//                Section 8.1.5 - RDI State Status Machine (link_active).
 //
 // -------------------------------------------------------------------------
 // JSON export
@@ -146,6 +146,13 @@
 //   0.0.1 2025-XX-XX  -           Initial creation.
 //   0.0.2 2026-09-23  -           Documentation: expand header, add
 //                                 per-block comments.
+//   0.0.3 2026-09-23  -           Documentation: correct citations. 6.1.1 is
+//                                 Packet Types, so the msgcode reference no
+//                                 longer claims a "Message Codes" section.
+//                                 8.2.3.2 is the pl_clk_req/lp_clk_ack
+//                                 handshake, not the RDI Active state, so the
+//                                 link_active events now cite 8.1.5 (RDI
+//                                 State Status Machine) and 4.5.
 //
 // ============================================================================
 `ifndef CovMonitor_SV
@@ -272,8 +279,8 @@ module cov_monitor #(
 // crossing — Die 0→Die 1 packets appear on sb_rx_pkt_vld_1 and vice
 // versa — giving full bidirectional opcode/msgcode coverage.
 //
-// Spec ref: Section 6.1.1 - Packet Types (5-bit opcode field),
-//           Section 6.1.1 - Message Codes (8-bit msgcode field).
+// Spec ref: Section 6.1.1 - Packet Types (5-bit opcode field and 8-bit
+//           msgcode field).
   always @(posedge sbclk) begin
     if (sb_rx_pkt_vld_0) begin
       sb_opcode_hits[sb_rx_opcode_0]   <= sb_opcode_hits[sb_rx_opcode_0]   + 1'b1;
@@ -308,8 +315,8 @@ module cov_monitor #(
 // These counters are never reset during a simulation run; they accumulate
 // monotonically and are exported to JSON at the end.
 //
-// Spec ref: Section 8.2.3.2 - RDI Active State (link_active events),
-//           Section 4.5 - Link Training Overview (functional events).
+// Spec ref: Section 8.1.5 - RDI State Status Machine (link_active events),
+//           Section 4.5 - Link Initialization and Training (events).
   always @(posedge lclk) begin
     if (link_active_0 && link_active_1)
       c_rdi_active_entry_done <= c_rdi_active_entry_done + 1'b1;

@@ -5,13 +5,14 @@
 // ----------------------------------------------------------------------------
 //
 // SPECIFICATION REFERENCES
-//   UCIe 1.0 Specification, Section 7.1 - Configuration Register Overview
-//   UCIe 1.0 Specification, Section 7.3 - UCIe Link Control Register
-//   UCIe 1.0 Specification, Section 7.4 - UCIe Link Status Register
-//   UCIe 1.0 Specification, Section 7.5 - Error Log 0 Register
-//   UCIe 1.0 Specification, Section 7.6 - Error Log 1 Register
-//   UCIe 1.0 Specification, Section 7.7 - Electrical Parameter Registers
-//   UCIe 1.0 Specification, Table 114 - RDI state encodings (rdi_state_sts)
+//   UCIe 1.0 Specification, Section 7.5 - UCIe Registers
+//   UCIe 1.0 Specification, Table 64 - UCIe Link DVSEC - UCIe Link Capability
+//   UCIe 1.0 Specification, Table 65 - UCIe Link DVSEC - UCIe Link Control
+//   UCIe 1.0 Specification, Table 66 - UCIe Link DVSEC - UCIe Link Status
+//   UCIe 1.0 Specification, Table 60 - Register Attributes
+//   UCIe 1.0 Specification, Table 114 - RDI signal list
+//   UCIe 1.0 Specification, Section 5.4.1 - Receiver Electrical Parameters
+//   UCIe 1.0 Specification, Table 30 - Transmitter Electrical Parameters
 //
 // DESCRIPTION
 //   Adapter CSR (Configuration / Status Register) file. Contains six 64-bit
@@ -67,6 +68,13 @@
 //                        now cited to Section 7.5 (UCIe Registers, Tables
 //                        64-65) with the unmodelled analog parameters pointed
 //                        at Section 5.4.1 and Table 30.
+//   v0.0.5  2026-09-23  Documentation: correct the header and remaining body
+//                        citations. The header invented per-register sections
+//                        (7.3 Link Control, 7.4 Link Status, 7.5 Error Log 0,
+//                        7.6 Error Log 1) that do not match the real titles.
+//                        All now cite Section 7.5, with Link Capability,
+//                        Control and Status as Tables 64, 65 and 66, and the
+//                        error logs as Sections 7.5.3.30/.31 (Tables 108/109).
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -111,7 +119,7 @@ module adapter_regfile (
   // values to select the target register. Each register is 64 bits wide
   // (8-byte aligned), matching the sideband CfgRd/CfgWr data width.
   //
-  // Spec ref: UCIe 1.0, Section 7.1 - register map layout.
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (register map layout).
   // --------------------------------------------------------------------------
   localparam logic [26:0] A_LINK_CTRL  = 27'h0;
   localparam logic [26:0] A_LINK_STAT  = 27'h8;
@@ -190,7 +198,9 @@ module adapter_regfile (
   //   A sideband CfgWr to offset 0x18 clears the entire register to zero
   //   (RW1C clear-all behaviour).
   //
-  // Spec ref: UCIe 1.0, Section 7.5 (Error Log 0), Section 7.6 (Error Log 1).
+  // Spec ref: UCIe 1.0, Section 7.5.3.30 - Error Log 0 (Table 108 - Error Log
+  //           0 Register); Section 7.5.3.31 - Error Log 1 (Table 109 - Error
+  //           Log 1 Register).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -219,7 +229,8 @@ module adapter_regfile (
   // auto-clear: once set, bit 0 remains high until the register is
   // explicitly rewritten or the module is reset.
   //
-  // Spec ref: UCIe 1.0, Section 7.3 - UCIe Link Control Register.
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (Table 65 - UCIe Link
+  //           DVSEC - UCIe Link Control).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -244,7 +255,8 @@ module adapter_regfile (
   // This register is read-only from the sideband perspective; all fields
   // are continuously updated by hardware every clock cycle.
   //
-  // Spec ref: UCIe 1.0, Section 7.4 - UCIe Link Status Register.
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (Table 66 - UCIe Link
+  //           DVSEC - UCIe Link Status).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -268,7 +280,8 @@ module adapter_regfile (
   //                     active" indication for observability and for the
   //                     d2d_adapter wrapper's link_active_obs output.
   //
-  // Spec ref: UCIe 1.0, Section 7.3 (Link Control), Section 7.4 (Link Status).
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (Table 65 - Link
+  //           Control, Table 66 - Link Status).
   // -------------------------------------------------------------------------
   assign start_link_train    = reg_link_ctrl[0];
   assign link_status_active  = (rdi_state_sts == RDI_STS_ACTIVE);
@@ -291,7 +304,7 @@ module adapter_regfile (
   //   0x20 -> reg_el_param      (Electrical Parameters)
   //   0x28 -> reg_el_param2     (Electrical Parameters 2)
   //   other -> 64'h0            (default / unmapped)
-  // Spec ref: UCIe 1.0, Section 7.1 - CSR read access.
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (CSR read access).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin

@@ -5,13 +5,15 @@
 // ----------------------------------------------------------------------------
 //
 // SPECIFICATION REFERENCES
-//   UCIe 1.0 Specification, Section 2.1 - Architecture Overview
-//   UCIe 1.0 Specification, Section 4.1.x - Byte / Valid Framing
-//   UCIe 1.0 Specification, Section 8.1 - RDI Pipeline Stage Requirement
-//   UCIe 1.0 Specification, Section 4.3.4 - Width Degrade (x8 mode)
-//   UCIe 1.0 Specification, Section 8.3.1 - Stall Protocol
-//   UCIe 1.0 Specification, Table 114 - RDI Signal List
-//   UCIe 1.0 Specification, Table 115 - FDI Signal List
+//   UCIe 1.0 Specification, Section 2.0 - Protocol Layer
+//   UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping
+//   UCIe 1.0 Specification, Section 4.1.2 - Valid Framing
+//   UCIe 1.0 Specification, Section 8.1 - Raw Die-to-Die Interface (RDI)
+//   UCIe 1.0 Specification, Section 4.3.7 - Width Degrade in Standard
+//                                            Package Interfaces
+//   UCIe 1.0 Specification, Section 8.3.1 - Stallreq/Ack Mechanism
+//   UCIe 1.0 Specification, Table 114 - RDI signal list
+//   UCIe 1.0 Specification, Table 115 - FDI signal list
 //
 // DESCRIPTION
 //   Pure Streaming pass-through datapath implementing Raw Mode Format 1 only.
@@ -77,6 +79,11 @@
 //   v0.0.3  2026-09-23  Documentation: add per-construct comment blocks with
 //                        spec references for streaming datapath and stall
 //                        handshake gating.
+//   v0.0.4  2026-09-23  Documentation: correct header citations. Section 2.1
+//                        is "PCIe 6.0", not an architecture overview, so the
+//                        reference now points to Section 2.0 Protocol Layer.
+//                        Width degrade is Section 4.3.7, not 4.3.4 (which is
+//                        Clock and Track Lane remapping).
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -178,14 +185,15 @@ module adapter_datapath #(
   //
   // FDI -> RDI: rdi_lp_irdy = lp_irdy && !stall_active (the PHY must not see
   //   irdy during a stall); rdi_lp_valid = tx_valid_q; rdi_lp_data = tx_data_q.
-  //   Width degrade (spec 4.3.4): when rdi_lnk_is_x8, the upper half
+  //   Width degrade (spec 4.3.7): when rdi_lnk_is_x8, the upper half
   //   [NBYTES*8-1:NBYTES*4] is forced to zero so only lanes 0-7 (bytes 0-7)
   //   carry data; the explicit zeroing gives the scoreboard a clean compare.
   // RDI -> FDI: pl_valid = rx_valid_q; pl_data = rx_data_q;
   //   pl_trdy = rdi_pl_trdy && !stall_active (Protocol Layer must not see
   //   trdy during a stall); pl_stream = lp_stream pass-through.
   //
-  // Spec ref: 4.1.x (byte/valid framing), 4.3.4 (width degrade),
+  // Spec ref: 4.1.1 (Byte to Lane Mapping), 4.1.2 (Valid Framing),
+  //           4.3.7 (Width Degrade in Standard Package Interfaces),
   //           8.3.1 (stall gating).
   // -------------------------------------------------------------------------
   always_comb begin

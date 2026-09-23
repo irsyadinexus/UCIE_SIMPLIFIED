@@ -16,10 +16,11 @@
 //               DAC control — all of that is outside the scope of this
 //               proof-of-concept.
 //
-// Spec refs   : UCIe 1.0 spec section 7.1 (PHY electrical-parameter
-//               registers), section 4.5.3.3 MBINIT.PARAM (parameter
-//               exchange during link training), section 8.1 Table 114
-//               (RDI CSR access).
+// Spec refs   : UCIe 1.0 spec section 7.5 (UCIe Registers - the link
+//               configuration and status registers), section 4.5.3.3
+//               MBINIT.PARAM (parameter exchange during link training),
+//               section 8.1 (Raw Die-to-Die Interface, Table 114 - RDI
+//               signal list).
 //
 // --------------------------------------------------------------------------
 // Register map
@@ -95,7 +96,11 @@
 //   v0.0.2  2026-09-23  Documentation pass: per-construct comment blocks for
 //                        the register write path, read decode and the
 //                        unused-signal suppression, citing UCIe 1.0 Section
-//                        8.3 (Register Interface).
+//                        7.5 (UCIe Registers).
+//   v0.0.3  2026-09-23  Documentation: correct two fabricated citations. The
+//                        header and the unused-signal block cited "Section
+//                        8.3 - Register Interface"; 8.3 is "Common rules for
+//                        FDI and RDI". Both now cite Section 7.5.
 // ============================================================================
 `ifndef PhyCsr_SV
 `define PhyCsr_SV
@@ -227,8 +232,8 @@ module phy_csr (
   // The assigned value is never read, so synthesis discards the whole block
   // and it adds no logic to the CSR.
   //
-  // Spec ref: UCIe 1.0, Section 8.3 - Register Interface (CSR access to the
-  // PHY configuration and status registers).
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (CSR access to the link
+  //           configuration and status registers).
   // =========================================================================
   logic unused;
   always_comb begin

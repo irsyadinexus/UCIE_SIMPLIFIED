@@ -5,11 +5,12 @@
 // ----------------------------------------------------------------------------
 //
 // SPECIFICATION REFERENCES
-//   UCIe 1.0 Specification, Chapter 2 - Architecture Overview
-//   UCIe 1.0 Specification, Section 8.2 - Fdie-to-Die Interface (FDI)
-//   UCIe 1.0 Specification, Section 8.1 - RDI (Raw D2D Interface)
-//   UCIe 1.0 Specification, Table 114 - RDI Signal List
-//   UCIe 1.0 Specification, Table 115 - FDI Signal List
+//   UCIe 1.0 Specification, Chapter 2 - Protocol Layer
+//   UCIe 1.0 Specification, Section 8.2 - Flit-Aware Die-to-Die Interface
+//                                         (FDI)
+//   UCIe 1.0 Specification, Section 8.1 - Raw Die-to-Die Interface (RDI)
+//   UCIe 1.0 Specification, Table 114 - RDI signal list
+//   UCIe 1.0 Specification, Table 115 - FDI signal list
 //
 // DESCRIPTION
 //   Top-level hierarchical wrapper for the Die-to-Die (D2D) Adapter block.
@@ -132,6 +133,11 @@
 //   v0.0.3  2026-09-23  Documentation: add per-construct comment blocks with
 //                        spec references for unused-input lint suppression and
 //                        adapter initialization tie-offs.
+//   v0.0.4  2026-09-23  Documentation: correct header and body citations. Fix
+//                        the "Fdie-to-Die" typo in the Section 8.2 title
+//                        (Flit-Aware Die-to-Die Interface). Width degrade is
+//                        Section 4.3.7, not 4.3.4. The CSR and link control
+//                        references now cite Section 7.5 with Table 65.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -224,7 +230,7 @@ module d2d_adapter #(
   // stall_active       : high while the four-phase stall handshake is in the
   //                      stalled phase (both pl_stallreq and lp_stallack high).
   // lnk_is_x8          : decoded from rdi_pl_lnk_cfg, true when the link has
-  //                      degraded to x8 (spec 4.3.4 width degrade).
+  //                      degraded to x8 (spec 4.3.7 width degrade).
   // csr_*              : CSR access bus between u_sb_if and u_regfile.
   // sb_credit_returned : u_sb_if signals that a credit-return packet arrived.
   // sb_stall_sent      : u_sb_if signals that a stall keep-alive was sent.
@@ -290,7 +296,8 @@ module d2d_adapter #(
   //   lnk_is_x8       - true when rdi_pl_lnk_cfg indicates x8 width, used
   //                     by u_datapath to zero the upper byte lanes.
   //
-  // Spec ref: UCIe 1.0, Section 8.3.1 (stall), Section 4.3.4 (width).
+  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism (stall),
+  //           Section 4.3.7 - Width Degrade in Standard Package Interfaces.
   // -------------------------------------------------------------------------
   always_comb begin
     pl_stallreq   = stallreq_q;
@@ -464,7 +471,7 @@ module d2d_adapter #(
   // (start_link_train_wr, in_band_pres, rdi_state_sts, ltsm_state,
   // trainerror, phyinrecenter) come from the adapter and PHY status.
   //
-  // Spec ref: UCIe 1.0, Section 7.1 (CSR definition).
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (CSR definition).
   // -------------------------------------------------------------------------
   adapter_regfile u_regfile (
     .lclk(lclk),
@@ -512,7 +519,8 @@ module d2d_adapter #(
   // (start_link_train_wr) that sets bit 0 of the UCIe Link Control register
   // inside u_regfile. Once set, it remains high until reset.
   //
-  // Spec ref: UCIe 1.0, Section 7.1 - UCIe Link Control register, bit 0.
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (Table 65 - UCIe Link
+  //           DVSEC - UCIe Link Control, bit 0).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n)            start_link_train_wr <= 1'b0;

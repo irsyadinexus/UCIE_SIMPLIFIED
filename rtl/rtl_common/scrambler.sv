@@ -28,7 +28,7 @@
 //
 //   Each lane is seeded with a unique initial value from the lfsr_seed()
 //   function (also in ucie_pkg) based on the LANE_ID parameter.  Seeds are
-//   per spec Table 47 so that adjacent lanes never produce correlated
+//   per spec Section 4.4.1 so that adjacent lanes never produce correlated
 //   sequences.
 //
 // INTERNAL BLOCK DIAGRAM
@@ -86,6 +86,11 @@
 //   0.0.3  2026-09-23  -           Documentation: expand header to full spec-
 //                                  referenced block, add per-construct comment
 //                                  blocks with spec citations.
+//   0.0.4  2026-09-23  -           Documentation: the lane seeding reference
+//                                  cited Table 47, which is the sideband
+//                                  opcode table. Re-cite to Section 4.4.1
+//                                  (Scrambling and training pattern
+//                                  generation).
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0

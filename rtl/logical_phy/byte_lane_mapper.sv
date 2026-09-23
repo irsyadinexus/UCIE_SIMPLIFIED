@@ -9,13 +9,14 @@
 //               inactive half is forced to zero so the partner observes a
 //               clean, deterministic pattern.
 //
-// Spec refs   : UCIe 1.0 spec section 4.1.1 (lane and width definitions,
-//               byte-to-lane mapping), section 5.2 / Figure 48 (byte-to-
-//               lane mapping table for Standard Package), width-degrade
-//               mechanism.
+// Spec refs   : UCIe 1.0 spec section 4.1.1 (Byte to Lane Mapping, lane and
+//               width definitions), Figure 42 (Byte map for x16 interface),
+//               Figure 43 (Byte to Lane mapping for Standard package x8
+//               degraded), section 4.3.7 (Width Degrade in Standard Package
+//               Interfaces).
 //
 // --------------------------------------------------------------------------
-// Mapping table  (spec 4.1.1 / 5.2 / Figure 48)
+// Mapping table  (spec 4.1.1 / Figures 42-43)
 // --------------------------------------------------------------------------
 //
 //   Mode            Lane l source          Active lanes
@@ -73,6 +74,10 @@
 //   v0.0.2  2026-09-23  Documentation pass: per-construct comment blocks for
 //                        the generate-loop lane mapping and the unused-signal
 //                        suppression, citing UCIe 1.0 Section 4.1.1.
+//   v0.0.3  2026-09-23  Documentation: cite the correct figures. The header
+//                        referenced Figure 48, which is Data Lane remapping.
+//                        Byte-to-lane mapping is Figure 42 (x16 byte map) and
+//                        Figure 43 (Standard package x8 degraded).
 // ============================================================================
 `ifndef ByteLaneMapper_SV
 `define ByteLaneMapper_SV

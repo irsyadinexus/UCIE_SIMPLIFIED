@@ -233,6 +233,14 @@
 //   v0.0.3    2026-09-23    -               Add 2 GHz mbclk and DDR main-band framing (Req.2).
 //   v0.0.4    2026-09-23    -               Req.2: thread mb_tx_valid /
 //                                           mb_rx_valid framing to both dies.
+//   v0.0.5    2026-09-23    -               Documentation: replace the
+//                                           fabricated "Table 68 - Sideband
+//                                           and Configuration signal list"
+//                                           citation. Table 68 is the UCIe
+//                                           Link DVSEC - Error Notification
+//                                           Control. The configuration
+//                                           sideband signals are now cited to
+//                                           Table 115 and Section 5.13.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -545,8 +553,9 @@ module ucie_main #(
   // which the synthesis tool will optimise away, silencing -Wunused-variable
   // and -Wunused-port warnings in Icarus Verilog 12.0 and commercial tools.
   //
-  // Spec ref: UCIe 1.0, Table 114 - RDI Signal List (full-width RDI port map);
-  //           UCIe 1.0, Table 68 - Sideband and Configuration signal list.
+  // Spec ref: UCIe 1.0, Table 114 - RDI signal list (full-width RDI port map);
+  //           Table 115 - FDI signal list (the lp_cfg / pl_cfg configuration
+  //           sideband signals); Section 5.13 - Sideband signaling.
   // --------------------------------------------------------------------------
   logic unused;
   assign unused = sbreset_n | rdi_lp_stallack | pl_cfg[0] | pl_cfg_vld |

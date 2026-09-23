@@ -196,6 +196,7 @@
 //                        timer interface.
 //   v0.0.2  2026-09-22  Fix tmr_start to pulse for 1 cycle on sub-state entry.
 //   v0.0.3  2026-09-22  Enforce 4 ms physical layer RESET minimum (Req.1).
+//   v0.0.4  2026-09-23  Pulse pat_lfsr_reset on LINKINIT entry so LFSR advances.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -784,11 +785,11 @@ module ltsm #(
   //
   // Scrambling is disabled for Per-Lane-ID, VALTRAIN and clock-repair
   // patterns, so the LFSR only runs during LINKINIT, where the LFSR
-  // pattern itself is the payload and the shift register is reseeded on
-  // LINKINIT entry. ref: spec 4.5.3 (LINKINIT), 4.4.1 (scrambling).
-  assign pat_lfsr_reset = (state_q == LT_LINKINIT);
+  // pattern itself is the payload. Reseed is a clean 1-cycle entry pulse
+  // so the LFSR advances freely for the full 4096-UI duration.
+  // ref: spec 4.5.3.6 (LINKINIT), 4.4.1 (scrambling).
+  assign pat_lfsr_reset = (state_q == LT_LINKINIT) && (state_q != state_q_prev);
   assign pat_lfsr_enable= (state_q == LT_LINKINIT);
-
   // =========================================================================
   // LTSM status outputs  (spec 4.5.3 – reported to RDI state machine)
   // =========================================================================

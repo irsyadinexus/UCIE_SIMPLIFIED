@@ -230,8 +230,9 @@
 //                                           4 GT/s, no retimer, no analog PHY,
 //                                           no CXL/PCIe protocol layer.
 //   v0.0.2    2026-09-22    -               Update lclk documentation to 500 MHz.
-//
-// ============================================================================
+//   v0.0.3    2026-09-23    -               Add 2 GHz mbclk and DDR main-band framing (Req.2).
+//   v0.0.4    2026-09-23    -               Req.2: thread mb_tx_valid /
+//                                           mb_rx_valid framing to both dies.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -243,10 +244,10 @@ module ucie_main #(
 ) (
   input  logic        lclk,
   input  logic        lreset_n,
+  input  logic        mbclk,        // 2 GHz forwarded clock fCK (Req.2)
   input  logic        sbclk,
   input  logic        sbreset_n,
   input  logic        start_link_train,
-
   // ---------------------------------------------------------- FDI (Table 115)
   input  logic        lp_irdy,
   input  logic        lp_valid,
@@ -279,7 +280,9 @@ module ucie_main #(
 
   // ------------------------------------------------- main band to partner
   output logic [NLANES-1:0] mb_tx_data,
-  input  logic [NLANES-1:0] mb_rx_data
+  output logic        mb_tx_valid,  // main band framing valid (Req.2)
+  input  logic [NLANES-1:0] mb_rx_data,
+  input  logic        mb_rx_valid   // main band framing valid (Req.2)
 );
 
   // ==========================================================================
@@ -468,10 +471,10 @@ module ucie_main #(
   logical_phy #(.NBYTES(NBYTES), .NLANES(NLANES)) u_lphy (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
+    .mbclk           (mbclk),
     .sbclk           (sbclk),
     .sbreset_n       (sbreset_n),
     .start_link_train(start_link_train),
-    // RDI
     .rdi_lp_state_req(rdi_lp_state_req),
     .rdi_lp_stallack (rdi_lp_stallack),
     .rdi_pl_state_sts(rdi_pl_state_sts),
@@ -497,7 +500,9 @@ module ucie_main #(
     .sb_rx_valid     (sb_rx_valid),
     // main band to partner
     .mb_tx_data      (mb_tx_data),
+    .mb_tx_valid     (mb_tx_valid),
     .mb_rx_data      (mb_rx_data),
+    .mb_rx_valid     (mb_rx_valid),
     // cfg sideband: the adapter drives pl_cfg, so the PHY side floats its
     // observation outputs.
     .lp_cfg          (lp_cfg),

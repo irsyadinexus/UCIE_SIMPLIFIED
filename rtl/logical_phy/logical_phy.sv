@@ -120,7 +120,10 @@
 //                        CSR/config stub.
 //   v0.0.2  2026-09-22  Update lclk and timer cycle comments for 500 MHz.
 //   v0.0.3  2026-09-22  Add 4 ms physical layer RESET minimum timer (Req.1).
-// ============================================================================
+//   v0.0.4  2026-09-23  Add 2 GHz mbclk and 4 GT/s DDR gearboxes (Req.2).
+//   v0.0.5  2026-09-23  Req.2: feed the 128-bit pattern word straight into the
+//                            TX gearbox; pattern engine now emits 8 UIs per
+//                            lclk cycle at the 4 GT/s physical rate.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -133,10 +136,10 @@ module logical_phy #(
 ) (
   input  logic        lclk,
   input  logic        lreset_n,
+  input  logic        mbclk,        // 2 GHz forwarded clock fCK (Req.2)
   input  logic        sbclk,
   input  logic        sbreset_n,
   input  logic        start_link_train,
-
   // ---------------------------------------------------------- RDI (Table 114)
   input  rdi_req_t    rdi_lp_state_req,
   input  logic        rdi_lp_stallack,
@@ -166,7 +169,9 @@ module logical_phy #(
 
   // -------------------------------------------------- main band to partner
   output logic [NLANES-1:0] mb_tx_data,
+  output logic        mb_tx_valid,  // main band framing valid (Req.2)
   input  logic [NLANES-1:0] mb_rx_data,
+  input  logic        mb_rx_valid,  // main band framing valid (Req.2)
   input  logic [NC-1:0]   lp_cfg,
   input  logic            lp_cfg_vld,
   input  logic            lp_cfg_crd,
@@ -455,6 +460,7 @@ module logical_phy #(
   // pat_done signal fires on the final UI of the LFSR pattern (4096 UI) to
   // allow the LTSM to advance from LINKINIT to ACTIVE.
   // ---------------------------------------------------------------------------
+  logic [DATA_W-1:0] pat_data_out;
   pattern_gen #(.NLANES(NLANES)) u_pat_gen (
     .lclk        (lclk),
     .lreset_n    (lreset_n),
@@ -462,10 +468,9 @@ module logical_phy #(
     .pattern     (pat_select),
     .lfsr_reset  (pat_lfsr_reset),
     .lfsr_enable (pat_lfsr_enable),
-    .data        (mb_tx_data),
+    .data        (pat_data_out),
     .pat_done    (pat_done)
   );
-
   // ---------------------------------------------------------------------------
   // Byte-to-Lane Mapper Instantiation  (u_mapper)
   // ---------------------------------------------------------------------------
@@ -578,28 +583,70 @@ module logical_phy #(
   assign pl_cfg_crd = 1'b0;
 
   // ---------------------------------------------------------------------------
-  // RDI datapath pass-through  (spec 8.1 / Table 114 data signals)
+  // Main-Band 4 GT/s DDR Gearboxes (spec 4.1.1, 5.2 -- Req.2)
   // ---------------------------------------------------------------------------
-  // The logical PHY does not terminate the streaming data in this model; the
-  // adapter handles the RDI datapath. rdi_pl_trdy echoes rdi_lp_irdy,
-  // rdi_pl_valid echoes rdi_lp_valid, and rdi_pl_data echoes rdi_lp_data.
-  // This provides a loopback path for simulation verification.
+  // Bridges the 500 MHz 128-bit lclk domain and the 2 GHz 16-lane DDR mainband.
+  // In training states (pat_enable=1), the transmitter serializes the 128-bit
+  // pattern word (8 UIs per lane) over the 8 DDR UIs of each lclk cycle. In
+  // ACTIVE, it serializes the streaming rdi_lp_data from the adapter.
+  //
+  // The receiver deserializes 8 DDR UIs into a 128-bit word on rdi_pl_data.
   // ---------------------------------------------------------------------------
+  logic [DATA_W-1:0] tx_gearbox_word;
+  logic              tx_gearbox_valid;
+  logic [DATA_W-1:0] rx_gearbox_word;
+  logic              rx_gearbox_valid;
+
+  always_comb begin
+    if (pat_enable) begin
+      tx_gearbox_word  = pat_data_out;
+      tx_gearbox_valid = 1'b1;
+    end else begin
+      tx_gearbox_word  = rdi_lp_data;
+      tx_gearbox_valid = rdi_lp_valid;
+    end
+  end
+
+  tx_gearbox #(
+    .NBYTES(NBYTES),
+    .NLANES(NLANES)
+  ) u_tx_gearbox (
+    .lclk       (lclk),
+    .lreset_n   (lreset_n),
+    .mbclk      (mbclk),
+    .tx_word    (tx_gearbox_word),
+    .tx_valid   (tx_gearbox_valid),
+    .tx_load    (1'b1),
+    .mb_tx_data (mb_tx_data),
+    .mb_tx_valid(mb_tx_valid)
+  );
+
+  rx_gearbox #(
+    .NBYTES(NBYTES),
+    .NLANES(NLANES)
+  ) u_rx_gearbox (
+    .lclk       (lclk),
+    .lreset_n   (lreset_n),
+    .mbclk      (mbclk),
+    .mb_rx_data (mb_rx_data),
+    .mb_rx_valid(mb_rx_valid),
+    .rx_word    (rx_gearbox_word),
+    .rx_word_vld(rx_gearbox_valid)
+  );
+
   assign rdi_pl_trdy  = rdi_lp_irdy;
-  assign rdi_pl_valid = rdi_lp_valid;
-  assign rdi_pl_data  = rdi_lp_data;
+  assign rdi_pl_valid = rx_gearbox_valid;
+  assign rdi_pl_data  = rx_gearbox_word;
 
   // ---------------------------------------------------------------------------
   // Lint suppression
   // ---------------------------------------------------------------------------
   // Continuous assign so Icarus Verilog evaluates all bit-select references.
-  // Every signal listed here is either an output of a sub-module that is not
-  // consumed externally, or an input that is not used in this stub build.
   // ---------------------------------------------------------------------------
   logic unused;
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |
                   csr_rdata[0] | phy_retrain_done | sb_msg_timeout |
-                  sb_stall_sent | lane_bytes[0][0] | mb_rx_data[0] |
+                  sb_stall_sent | lane_bytes[0][0] |
                   lp_cfg[0] | lp_cfg_vld | lp_cfg_crd;
 
 endmodule

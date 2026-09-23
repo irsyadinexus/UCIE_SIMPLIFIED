@@ -1,12 +1,15 @@
 // Unit test: scrambler (per-lane LFSR) and ucie_timer.
 // Directed checks against a software reference model.
+//
+// Req.2 note: the scrambler advances 8 LFSR steps per lclk cycle, so the
+// reference model steps 8 times per checked beat and data_out is 8 bits.
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module ut_lfsr;
   logic        lclk, lreset_n;
-  logic        data_out;
+  logic [7:0]  data_out;
   logic [22:0] state_obs;
   logic        lfsr_reset, enable;
 
@@ -22,7 +25,7 @@ module ut_lfsr;
     .lreset_n  (lreset_n),
     .lfsr_reset(lfsr_reset),
     .enable    (enable),
-    .data_in   (1'b0),
+    .data_in   (8'h00),
     .data_out  (data_out),
     .state_obs (state_obs)
   );
@@ -77,19 +80,21 @@ module ut_lfsr;
     ref_state = state_obs;
     enable    = 1'b1;
     repeat (20) begin
-      // data_out is registered: it shows the bit that sat at lfsr_q[0]
-      exp_data_bit = ref_state[0];
+      logic [7:0] exp_data_byte;
+      for (int b = 0; b < 8; b = b + 1) begin
+        exp_data_byte[b] = ref_state[0];
+        step_ref;
+      end
       @(posedge lclk);
       #0.1;
-      step_ref;
       if (state_obs !== ref_state) begin
         $display("FAIL ut_lfsr: state step mismatch, got %h exp %h",
                  state_obs, ref_state);
         errors = errors + 1;
       end
-      if (data_out !== exp_data_bit) begin
+      if (data_out !== exp_data_byte) begin
         $display("FAIL ut_lfsr: data_out mismatch, got %b exp %b",
-                 data_out, exp_data_bit);
+                 data_out, exp_data_byte);
         errors = errors + 1;
       end
     end

@@ -44,13 +44,13 @@ rtl/d2d_adapter/     d2d_adapter.sv, fdi_state_machine.sv,
                      adapter_sb_if.sv
 rtl/logical_phy/     logical_phy.sv, rdi_state_machine.sv, ltsm.sv,
                      sb_codec.sv, pattern_gen.sv, byte_lane_mapper.sv,
-                     phy_csr.sv
+                     mb_gearbox.sv, phy_csr.sv
 ```
 
 Verification (Icarus Verilog 12.0, `make -C sim all`):
 
 ```
-tb/unit/         seven directed unit tests, one per FSM and datapath block
+tb/unit/         eight directed unit tests, one per FSM and datapath block
 tb/bfm/          protocol layer BFM for the FDI stimulus side
 tb/loopback/     two real `ucie_main` instances, sideband and main band both
                  crossed die-to-die
@@ -61,7 +61,9 @@ sim/             Makefile targets compile / unit / loopback / coverage / all,
 ```
 
 The loopback reaches LINK ACTIVE on both dies and completes Raw Mode streaming
-transfers in both directions. Coverage is reported over the 21 training
+transfers in both directions. The main band crosses the die boundary as true
+DDR at 2 GHz fCK, 1 bit per lane per fCK edge, so 16 lanes move a 128-bit
+word every 4 fCK cycles (Req.2). Coverage is reported over the 21 training
 states the reduced capability set actually walks; `PHYRETRAIN`, `TRAINERROR`
 and `L1L2` have no entry transition in this configuration and are reported as
 unreachable rather than counted as holes.
@@ -80,6 +82,7 @@ UCIE Main
   |     |-- LTSM (all 24 state encodings; 21 reachable in this scope)
   |     |-- Sideband codec (64-bit header, CP/DP parity)
   |     |-- Training pattern generator (Per-Lane-ID, VALTRAIN, clock repair, LFSR)
+  |     |-- Main-band DDR gearbox, 500 MHz lclk <-> 2 GHz fCK (Req.2)
   |     |-- Byte-to-lane mapper (x16 and both x8 degrade halves)
   |     `-- PHY CSR (electrical parameter registers only, no analog)
   `-- no other blocks; no retimer, no protocol layer, no analog PHY

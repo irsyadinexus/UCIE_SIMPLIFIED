@@ -11,6 +11,12 @@
 // pl_data of die A after the round trip through the adapter. The scoreboard
 // checks that round trip on each die, one direction named forward on die 0
 // and one direction named reverse on die 1.
+//
+// Clocking note (Req.2): lclk is 500 MHz and mbclk is the 2 GHz forwarded
+// clock fCK. The main band crosses the die boundary as true DDR, 1 bit per
+// lane per fCK edge, so 16 lanes move a 128-bit word every 4 fCK cycles.
+// fCK is gated off while both LTSMs sit in LT_RESET, which is also what a
+// real PHY does before training starts (spec 5.2).
 `ifndef TbLoopbackTop_SV
 `define TbLoopbackTop_SV
 `include "ucie_pkg.sv"
@@ -24,15 +30,20 @@ module tb_loopback_top;
   // clock would sample the single-UI sb_tx_load pulse unreliably in a
   // functional model before Phase 3 CDC is added.
   logic lclk;
+  logic mbclk;
   logic sbclk;
 
   initial begin
     lclk  = 1'b0;
+    mbclk = 1'b0;
     sbclk = 1'b0;
   end
-  always #1.0 lclk  = ~lclk;
-  always #1.0 sbclk = ~sbclk;
-
+  always #1.00 lclk  = ~lclk;   // 500 MHz (2.0 ns period)
+  // Forwarded clock fCK is gated off during LT_RESET (spec 5.2)
+  logic mbclk_en;
+  assign mbclk_en = (d0_ltsm_state != 8'h00) || (d1_ltsm_state != 8'h00);
+  always #0.25 mbclk = mbclk_en ? ~mbclk : 1'b0;
+  always #1.00 sbclk = ~sbclk;
   // ------------------------------------------------------- reset
   logic lreset_n;
   logic sbreset_n;
@@ -47,10 +58,18 @@ module tb_loopback_top;
   end
 
   // ------------------------------------------------------- die crossing
-  logic [NC-1:0]       sb_a2b_data, sb_b2a_data;
-  logic                sb_a2b_valid, sb_b2a_valid;
-  logic [NLANES_MAX-1:0] mb_a2b, mb_b2a;
+  logic [NC-1:0]        sb_a2b_data, sb_b2a_data;
+  logic                 sb_a2b_valid, sb_b2a_valid;
+  logic [NLANES_MAX-1:0] mb_a2b_data, mb_b2a_data;
+  logic                 mb_a2b_valid, mb_b2a_valid;
+  wire  [NLANES_MAX-1:0] mb_a2b_wire, mb_b2a_wire;
+  wire                  mb_a2b_val_wire, mb_b2a_val_wire;
 
+  // Main-band DDR wires across die boundary (instantaneous, zero overhead)
+  assign mb_a2b_wire     = mb_a2b_data;
+  assign mb_a2b_val_wire = mb_a2b_valid;
+  assign mb_b2a_wire     = mb_b2a_data;
+  assign mb_b2a_val_wire = mb_b2a_valid;
   // ------------------------------------------------------- die 0
   logic        d0_start_link_train;
   logic        d0_lp_irdy, d0_lp_valid;
@@ -113,6 +132,7 @@ module tb_loopback_top;
   ucie_main dut_a (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
+    .mbclk           (mbclk),
     .sbclk           (sbclk),
     .sbreset_n       (sbreset_n),
     .start_link_train(d0_start_link_train),
@@ -143,13 +163,16 @@ module tb_loopback_top;
     .sb_tx_valid     (sb_b2a_valid),
     .sb_rx_data      (sb_a2b_data),
     .sb_rx_valid     (sb_a2b_valid),
-    .mb_tx_data      (mb_b2a),
-    .mb_rx_data      (mb_a2b)
+    .mb_tx_data      (mb_b2a_data),
+    .mb_tx_valid     (mb_b2a_valid),
+    .mb_rx_data      (mb_a2b_wire),
+    .mb_rx_valid     (mb_a2b_val_wire)
   );
 
   ucie_main dut_b (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
+    .mbclk           (mbclk),
     .sbclk           (sbclk),
     .sbreset_n       (sbreset_n),
     .start_link_train(d1_start_link_train),
@@ -180,8 +203,10 @@ module tb_loopback_top;
     .sb_tx_valid     (sb_a2b_valid),
     .sb_rx_data      (sb_b2a_data),
     .sb_rx_valid     (sb_b2a_valid),
-    .mb_tx_data      (mb_a2b),
-    .mb_rx_data      (mb_b2a)
+    .mb_tx_data      (mb_a2b_data),
+    .mb_tx_valid     (mb_a2b_valid),
+    .mb_rx_data      (mb_b2a_wire),
+    .mb_rx_valid     (mb_b2a_val_wire)
   );
 
   // ------------------------------------------------------- BFM stimulus
@@ -214,30 +239,14 @@ module tb_loopback_top;
   end
 
   // ------------------------------------------------------- transfer events
+  // A completed and scoreboard-checked streaming beat. push_one pulses the
+  // matching line for one lclk cycle once the round trip has been verified,
+  // which is what the coverage monitor counts as a raw transfer.
   logic xfer_done_0, xfer_done_1;
-  logic [DATA_W-1:0] last_sent_0, last_sent_1;
-  logic [DATA_W-1:0] last_recv_0, last_recv_1;
-
-  // A completed UI on the receive side of die 0 is the reverse direction, and
-  // on die 1 the forward direction, because the BFM pair is symmetric.
-  always @(posedge lclk) begin
-    if (d0_pl_valid && d0_pl_trdy) begin
-      last_recv_0 <= d0_pl_data;
-      xfer_done_1 <= ~xfer_done_1;
-    end
-    if (d1_pl_valid && d1_pl_trdy) begin
-      last_recv_1 <= d1_pl_data;
-      xfer_done_0 <= ~xfer_done_0;
-    end
-  end
 
   initial begin
     xfer_done_0 = 1'b0;
     xfer_done_1 = 1'b0;
-    last_sent_0 = '0;
-    last_sent_1 = '0;
-    last_recv_0 = '0;
-    last_recv_1 = '0;
   end
 
   // ------------------------------------------------------- stall detector
@@ -324,41 +333,53 @@ module tb_loopback_top;
     input [DATA_W-1:0] data;
     begin
       if (which == 0) begin
+        // Die 0 TX -> cross main-band DDR pins -> Die 1 RX
         @(negedge lclk);
         d0_lp_data  = data;
         d0_lp_valid = 1'b1;
         d0_lp_irdy  = 1'b1;
-        // The adapter registers the request, so one extra cycle before the
-        // data appears on the receive side.
-        repeat (3) @(posedge lclk);
+        @(negedge lclk);
+        d0_lp_valid = 1'b0;
+        d0_lp_irdy  = 1'b0;
+        // Wait until destination receives valid beat
+        while (!d1_pl_valid) @(posedge lclk);
         #0.1;
-        got_data = d0_pl_data;
+        got_data = d1_pl_data;
         if (got_data !== data) begin
-          $display("FAIL %0s: die0 data %032h expected %032h", label, got_data, data);
+          $display("FAIL %0s: die1 got %032h expected %032h", label, got_data, data);
           errors = errors + 1;
         end else begin
           $display("PASS %0s: die0 data %032h", label, data);
         end
+        // Mark the checked beat for the coverage monitor. The pulse is held
+        // across a full lclk period so the monitor samples it without a
+        // scheduling race.
+        xfer_done_0 = 1'b1;
+        @(posedge lclk);
         @(negedge lclk);
-        d0_lp_valid = 1'b0;
-        d0_lp_irdy  = 1'b0;
+        xfer_done_0 = 1'b0;
       end else begin
+        // Die 1 TX -> cross main-band DDR pins -> Die 0 RX
         @(negedge lclk);
         d1_lp_data  = data;
         d1_lp_valid = 1'b1;
         d1_lp_irdy  = 1'b1;
-        repeat (3) @(posedge lclk);
+        @(negedge lclk);
+        d1_lp_valid = 1'b0;
+        d1_lp_irdy  = 1'b0;
+        while (!d0_pl_valid) @(posedge lclk);
         #0.1;
-        got_data = d1_pl_data;
+        got_data = d0_pl_data;
         if (got_data !== data) begin
-          $display("FAIL %0s: die1 data %032h expected %032h", label, got_data, data);
+          $display("FAIL %0s: die0 got %032h expected %032h", label, got_data, data);
           errors = errors + 1;
         end else begin
           $display("PASS %0s: die1 data %032h", label, data);
         end
+        xfer_done_1 = 1'b1;
+        @(posedge lclk);
         @(negedge lclk);
-        d1_lp_valid = 1'b0;
-        d1_lp_irdy  = 1'b0;
+        xfer_done_1 = 1'b0;
       end
     end
   endtask
@@ -384,6 +405,9 @@ module tb_loopback_top;
     end
     $display("LINK ACTIVE (die 0)");
     $display("LINK ACTIVE (die 1)");
+
+    // ---- let the last LFSR training beats drain out of both RX gearboxes
+    repeat (10) @(posedge lclk);
 
     // ---- streaming data, both directions
     push_one("RAW MODE TRANSFER OK (die0->die1)", 0, {8{8'h11}});

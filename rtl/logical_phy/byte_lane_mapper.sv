@@ -70,6 +70,9 @@
 // --------------------------------------------------------------------------
 //   v0.0.1  2025-XX-XX  First commit to git. Combinational byte-to-lane
 //                        mapper with x16/x8 modes and byte reversal.
+//   v0.0.2  2026-09-23  Documentation pass: per-construct comment blocks for
+//                        the generate-loop lane mapping and the unused-signal
+//                        suppression, citing UCIe 1.0 Section 4.1.1.
 // ============================================================================
 `ifndef ByteLaneMapper_SV
 `define ByteLaneMapper_SV

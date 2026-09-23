@@ -61,6 +61,12 @@
 //   v0.0.2  2026-09-22  Update lclk documentation to 500 MHz.
 //   v0.0.3  2026-09-23  Documentation: add per-construct comment blocks with
 //                        spec references for register decode outputs.
+//   v0.0.4  2026-09-23  Documentation: correct the electrical parameter
+//                        register citation. The previous reference to Section
+//                        7.7 was wrong; Section 7 ends at 7.6. The fields are
+//                        now cited to Section 7.5 (UCIe Registers, Tables
+//                        64-65) with the unmodelled analog parameters pointed
+//                        at Section 5.4.1 and Table 30.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -146,7 +152,15 @@ module adapter_regfile (
   // reg_el_param2 (offset 0x28) is reserved expansion, reset to zero.
   // Both registers are RW via sideband CfgWr. The address decode selects
   // which register receives the write data.
-  // Spec ref: UCIe 1.0, Section 7.7 - Electrical Parameter registers.
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers. The link speed and lane
+  //           map fields correspond to the UCIe Link Capability and Link
+  //           Control registers of Tables 64-65 (Link Speed enabled, Link
+  //           Width enabled). The voltage swing, clock mode and clock phase
+  //           fields have no register equivalent in this simplified endpoint
+  //           and are held here as software-visible placeholders only; the
+  //           analog parameters they name are specified in Section 5.4.1
+  //           (Receiver Electrical Parameters) and Table 30 (Transmitter
+  //           Electrical Parameters), neither of which is modelled in RTL.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin

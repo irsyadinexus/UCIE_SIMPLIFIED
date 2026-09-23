@@ -92,6 +92,10 @@
 // --------------------------------------------------------------------------
 //   v0.0.1  2025-XX-XX  First commit to git. Four-register CSR block with
 //                        write/read paths and training control output.
+//   v0.0.2  2026-09-23  Documentation pass: per-construct comment blocks for
+//                        the register write path, read decode and the
+//                        unused-signal suppression, citing UCIe 1.0 Section
+//                        8.3 (Register Interface).
 // ============================================================================
 `ifndef PhyCsr_SV
 `define PhyCsr_SV

@@ -144,6 +144,10 @@
 //   v0.0.1  2025-XX-XX  Initial creation.
 //   v0.0.2  2026-09-23  Documentation: expand header, add per-block
 //                        comments.
+//   v0.0.3  2026-09-23  Documentation: give lclk and sbclk their own
+//                        spec-referenced comment blocks and delete the stale
+//                        unindented "Clock Generators" head that duplicated
+//                        the sbclk block below it.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -427,15 +431,7 @@ module ut_ltsm;
 
   initial lclk  = 1'b0;
   initial sbclk = 1'b0;
-// ---------------------------------------------------------------------------
-// Clock Generators: lclk and sbclk
-// ---------------------------------------------------------------------------
-// Both clocks toggle every 1.0 ns, producing a 2 ns period (500 MHz).
-// Using `always #1.0 clk = ~clk` gives a clean, glitch-free waveform
-// suitable for synchronous simulation.  Both clocks are intentionally
-// at the same frequency — the design uses a single clock domain for
-// the proof-of-concept phase (Phase-2), deferring CDC to Phase-3.
-//
+
   // ---------------------------------------------------------------------------
   // Clock generator: lclk - 500 MHz main link clock
   //

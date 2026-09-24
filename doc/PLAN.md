@@ -207,7 +207,7 @@ TRAINERROR `E5h` req / `EAh` resp, subcode `00h`.
 
 ## 5. Finite State Machines
 
-### 5.1 LTSM (spec 4.5.3) — full, all sub-states
+### 5.1 LTSM (spec 4.5.3) — fixed-profile state map
 
 Encoding matches Error Log 0 `State N`:
 
@@ -219,27 +219,27 @@ Encoding matches Error Log 0 `State N`:
 | `03h` | MBINIT.CAL | done req/resp |
 | `04h` | MBINIT.REPAIRCLK | Standard Pkg: no-op pass through handshake |
 | `05h` | MBINIT.REPAIRVAL | Standard Pkg: no-op pass through handshake |
-| `06h` | MBINIT.REVERSALMB | reversal detect, result, done |
+| `06h` | MBINIT.REVERSALMB | init/result sideband handshake, modeled success |
 | `07h` | MBINIT.REPAIRMB | Standard Pkg: no-op pass through handshake |
-| `08h` | MBTRAIN.VALVREF | start/end, VALTRAIN 128 iterations |
-| `09h` | MBTRAIN.DATAVREF | start/end, 4K UI LFSR |
-| `0Ah` | MBTRAIN.SPEEDIDLE | done req/resp; rate = highest common = 4 GT/s |
-| `0Bh` | MBTRAIN.TXSELFCAL | done req/resp, electrical idle |
-| `0Ch` | MBTRAIN.RXCLKCAL | start/done |
-| `0Dh` | MBTRAIN.VALTRAINCENTER | start/done, VALTRAIN pattern |
-| `0Eh` | MBTRAIN.DATATRAINVREF1 | start/end, 4K UI LFSR |
-| `0Fh` | MBTRAIN.RXDESKEW | start/end, 4K UI LFSR |
-| `10h` | MBTRAIN.DATATRAINCENTER2 | start/end, 4K UI LFSR |
-| `11h` | MBTRAIN.LINKSPEED | start, point test, done/repair/degrade |
-| `12h` | MBTRAIN.REPAIR | width degrade (lanes 0-7 or 8-15), then TXSELFCAL |
-| `13h` | PHYRETRAIN | retrain init/start |
+| `08h` | MBTRAIN.VALVREF | start/end sideband handshake, modeled success |
+| `09h` | MBTRAIN.DATAVREF | start/end sideband handshake, modeled success |
+| `0Ah` | MBTRAIN.SPEEDIDLE | done req/resp, fixed 4 GT/s |
+| `0Bh` | MBTRAIN.TXSELFCAL | done req/resp, modeled success |
+| `0Ch` | MBTRAIN.RXCLKCAL | start/done sideband handshake, modeled success |
+| `0Dh` | MBTRAIN.VALTRAINCENTER | start/done sideband handshake, modeled success |
+| `0Eh` | MBTRAIN.DATATRAINVREF1 | start/end sideband handshake, modeled success |
+| `0Fh` | MBTRAIN.RXDESKEW | start/end sideband handshake, modeled success |
+| `10h` | MBTRAIN.DATATRAINCENTER2 | start/end sideband handshake, modeled success |
+| `11h` | MBTRAIN.LINKSPEED | start/done sideband handshake, modeled success |
+| `12h` | MBTRAIN.REPAIR | unsupported in the fixed profile; repair request is fatal |
+| `13h` | PHYRETRAIN | unsupported; RDI Retrain does not change the LTSM |
 | `14h` | LINKINIT | LFSR reset; RDI Active-entry handshake |
 | `15h` | ACTIVE | data flow, scrambled |
 | `16h` | TRAINERROR | entry req/resp, fatal |
-| `17h` | L1/L2 | power management |
+| `17h` | L1/L2 | unsupported; RDI returns PMNAK |
 
-Sub-state exit rule (spec 4.5.3.4): exit only when the req has been sent **and** the
-matching resp received. Loop-backs: SPEEDIDLE -> TXSELFCAL; REPAIR -> TXSELFCAL.
+Sub-state exit rule: exit only when the req has been sent **and** the matching
+response received. The supported loop-back is SPEEDIDLE -> TXSELFCAL.
 
 Residency timer: 8 ms per sub-state. Timeout -> TRAINERROR (escalate as fatal,
 set Error Log 1 bit 8).
@@ -286,7 +286,7 @@ Valid asserted for the first 4 UI of each 8 UI transfer.
 
 ### 6.3 Clock gating (spec 4.1.3)
 
-Gate after 16 UI postamble unless free-running clock mode negotiated.
+Clock gating is not modeled in the fixed profile.
 
 ### 6.4 Scrambler / LFSR (spec 4.4.1)
 
@@ -314,15 +314,18 @@ an independent golden recurrence over 50000 bits and by maximal-length period 2^
 
 ### 6.5 Pattern generation
 
-- Per-Lane-ID: lane ID = binary of logical lane number.
-- VALTRAIN: 4 ones then 4 zeros, 128 iterations, detection on 16 consecutive.
-- Clock repair pattern per spec 4.4.
+This section defines reusable primitives only. The immediate-success profile does
+not emit these patterns or use their counts as an MBINIT or MBTRAIN exit rule.
+
+- Per-Lane-ID: `0101`, logical lane ID least-significant bit first, `0101`.
+- VALTRAIN: 4 ones then 4 zeros. A full electrical test uses 128 iterations.
+- LFSR: a full electrical data test uses 4K UI.
+- Clock repair: 16 high UIs then 8 low UIs, per spec 4.4.
 
 ### 6.6 Width degrade
 
-If failing lanes are all within 0-7 or all within 8-15, degrade to x8 using that half.
-`{MBTRAIN.REPAIR Apply degrade req}` carries lane map `2'b01` (0-7) / `2'b10` (8-15).
-`pl_lnk_cfg` drops `010` -> `001`.
+Width degradation is unsupported in the fixed x16 profile. A repair or
+width-degrade result enters TRAINERROR.
 
 ### 6.7 Adapter datapath
 
@@ -595,3 +598,562 @@ The required final gate is:
 ```text
 make -C sim clean && make -C sim all
 ```
+
+---
+
+## 15. Approved Logical LTSM Implementation Plan
+
+### 15.1 Goal and boundaries
+
+Implement the approved simplified logical LTSM profile in
+`doc/LTSM_LOGICAL_GAP_ASSESSMENT.md`.
+
+The supported paths are:
+
+```text
+RESET -> SBINIT -> MBINIT -> MBTRAIN -> LINKINIT -> ACTIVE
+TRAINERROR -> LinkReset -> RESET
+ACTIVE or LinkReset -> Disabled -> RESET
+```
+
+Runtime PHYRETRAIN, L1, L2, Retimer, and multi-module operation remain
+unsupported. Electrical operations are immediate local success. Their required
+logical sideband exchanges remain mandatory.
+
+Keep all `ucie_main`, FDI, RDI, PHY, mainband, and sideband public ports
+unchanged. Keep `ucie_main` composed of only `d2d_adapter` and `logical_phy`.
+
+Ownership is fixed:
+
+- `ltsm.sv` owns state, packet policy, validation, arbitration, and recovery.
+- `logical_phy.sv` owns CDC, packet transport, codec integration, timers,
+  raw-SBINIT pin muxing, and logical data gating.
+- `sb_codec.sv` serializes and parses packets only.
+- `sb_cdc_mailbox.sv` transports complete bundles only.
+- `rdi_state_machine.sv` maps the LTSM result to RDI status and rejects
+  unsupported runtime requests.
+
+### 15.2 Phase 1: Fixed profile and lossless packet transport
+
+1. Add immutable MBINIT.PARAM constants to `rtl/rtl_common/ucie_pkg.sv`.
+
+   - Request: `SB_OP_MSG_DATA64`, `MsgInfo=16'h0000`, `A5h/00h`,
+     `64'h0000_0000_0000_0210`.
+   - Response: `SB_OP_MSG_DATA64`, `MsgInfo=16'h0000`, `AAh/00h`,
+     `64'h0000_0000_0000_0200`.
+   - Define named masks for Module 0, differential clock, continuous clock,
+     Vswing `01h`, and 4 GT/s.
+   - Define accepted peer Vswing values `01h` through `10h`.
+   - Define all required MBINIT, MBTRAIN, LinkMgmt, and TRAINERROR message
+     roles in the package. Do not use hidden literals in `ltsm.sv`.
+
+2. Preserve `sb_codec.sv` as a codec.
+
+   - Reuse its existing DATA64 serialization and deserialization.
+   - Correct DATA64 DP validation for both parity-bit values.
+   - Do not put packet classification, retries, or state policy in the codec.
+
+3. Widen the private `sbclk`-to-`lclk` receive bundle in `logical_phy.sv`.
+
+   - Carry the 64-bit received payload, opcode, IDs, message fields, and CP/DP
+     results atomically to `ltsm.sv`.
+   - Keep external ports unchanged.
+   - Hold a decoded packet until the one-entry RX mailbox accepts it. A packet
+     must not disappear because the mailbox is busy.
+
+4. Extend the direct LTSM private interface only as needed for received payload,
+   RDI request information, and mainband framing-fault events.
+
+5. Correct the existing training-pattern generator and its simplified gate.
+
+   - Generate VALTRAIN as four 1 UIs then four 0 UIs, repeated. Do not
+     apply a lane-dependent phase.
+   - Generate each 16-UI Per-Lane-ID word as `0101`, logical lane ID
+     least-significant bit first, then `0101`.
+   - Generate clock repair as 16 high UIs then 8 low UIs, repeated.
+   - Retain the existing least-significant-bit-first gearbox order. Do not
+     use a one-hot UI position as a lane ID.
+   - Keep training patterns unscrambled. Use the LFSR only where the
+     specification selects its training pattern.
+   - In the approved immediate-success model, disable pattern emission for
+     every MBINIT and MBTRAIN state. The mainband data output is low.
+   - Do not add the full UCIe electrical pattern selector, calibration loops,
+     test counts, or pattern-completion state machine.
+   - Keep Standard Package REPAIRVAL and REPAIRMB as sideband handshakes only.
+
+### 15.3 Phase 2: LTSM-owned transaction engine
+
+1. Replace the post-SBINIT generic completion flag in `ltsm.sv`.
+
+   Track separately:
+
+   - A local request accepted by the TX CDC.
+   - A matching response to that local request.
+   - A valid peer request that requires a local response.
+   - A queued peer response accepted by the TX CDC.
+   - Duplicate peer-request replay information.
+   - The active transaction, expected packet fields, and payload rule.
+
+2. Apply the approved packet rules.
+
+   - A request never satisfies the response for a local request.
+   - A valid peer request creates a response obligation.
+   - A stale, wrong-state, wrong-role, wrong-ID, wrong-opcode, wrong-code,
+     wrong-subcode, or invalid-payload packet is fatal after SBINIT.
+   - A valid duplicate request receives an idempotent response.
+   - One local request can be outstanding per logical sub-state.
+   - A queued peer response remains pending while the TX CDC is busy.
+
+3. Apply the approved transmission priority.
+
+   ```text
+   LinkError, Disabled, or LinkReset response
+   > TRAINERROR Entry response
+   > current peer-request response
+   > current local request
+   > retry or duplicate response
+   ```
+
+4. Model every MBINIT and MBTRAIN electrical operation as immediate success.
+
+   Immediate success skips electrical calibration and pattern transmission.
+   It does not skip the required init or start, result or done, request, and
+   response exchanges before the state advances.
+
+5. Implement MBINIT.PARAM as the exact DATA64 exchange.
+
+   - Validate the local response as differential, continuous, and 4 GT/s.
+   - Ignore reserved response fields.
+   - Accept a peer request that advertises a higher speed, but return the
+     fixed 4 GT/s response.
+   - Accept only peer continuous clock, differential clock, and Vswing
+     `01h` through `10h`.
+   - Enter TRAINERROR for a reserved swing or an incompatible request or
+     response.
+
+6. Implement fixed-profile LINKSPEED.
+
+   - A successful result exits to LINKINIT.
+   - Error, repair, width-degrade, and speed-degrade results enter
+     TRAINERROR. Do not implement repair, width degradation, or lower speed.
+
+### 15.4 Phase 3: Active Entry, recovery, and runtime policy
+
+1. Keep RESET active for the full 4 ms on every entry.
+
+   After recovery from LinkError, LinkReset, or Disabled, require a fresh RDI
+   NOP-to-Active transition or a fresh software Start request. LinkReset alone
+   is not a training trigger.
+
+2. Keep the existing SBINIT waveform and policy isolated.
+
+   Do not move raw waveform, pattern detection, retry, or timeout policy out
+   of `ltsm.sv` and `sb_init_raw.sv` as currently partitioned.
+
+3. Keep LINKINIT active until the local and remote LinkMgmt.RDI Active exchange
+   completes.
+
+   Reset the LFSR on LINKINIT entry, as required by the specification. A
+   diagnostic pattern, if retained, must not delay Active Entry.
+
+   Only then report PHY training complete and permit RDI Active.
+
+4. Implement fatal handling.
+
+   CP failure, DP failure, invalid training response, PARAM incompatibility,
+   residency timeout, framing fault, and unsupported LINKSPEED result are
+   fatal. When sideband is active, perform the TRAINERROR Entry exchange.
+   Apply the 8 ms TRAINERROR Entry timeout. Assert RDI LinkError and hold
+   TRAINERROR until LinkReset starts recovery.
+
+5. Implement the supported Disabled and LinkReset flows.
+
+   - Exchange the required LinkMgmt request and response.
+   - Enter RESET after the transition completes.
+   - Require the RESET dwell and a new permitted trigger before SBINIT.
+   - Escalate to LinkError after the 8 ms remote-response timeout.
+
+6. Enforce transition priority:
+
+   ```text
+   LinkError > Disabled > LinkReset > normal transaction
+   ```
+
+   A higher-priority transition aborts normal transaction progress but retains
+   its required response obligation.
+
+7. Clear the local Start UCIe Link Training copy after RDI Active Entry.
+
+   Use an internal one-shot or armed-edge path. A held Start level must not
+   cause a later training restart.
+
+### 15.5 Phase 4: RDI, FDI, and Adapter cutover
+
+1. Update `rdi_state_machine.sv`.
+
+   - RDI Active waits for the LTSM Active Entry result.
+   - RDI LinkReset and Disabled remain visible until their LTSM transition
+     reaches RESET.
+   - RDI L1 and L2 return PMNAK without changing the LTSM.
+   - RDI Retrain does not publish Retrain or change the LTSM.
+   - LinkError recovers only through LinkReset.
+   - Consume `lp_stallack` in the required four-phase stall path.
+
+   - Drive `pl_stallreq` only while `lp_stallack` is low.
+   - While `lp_stallack` is high, drive `lp_valid` and `lp_irdy` low.
+   - Include at least one register between the request and acknowledgment.
+
+2. Update the FDI and Adapter request forwarding path.
+
+   - Forward Active, LinkReset, and Disabled.
+   - Reject L1 and L2 consistently with RDI PMNAK behavior.
+   - Hold the current supported state for Retrain.
+   - Remove the stale peer-Active feedback path. PHY sideband Active exchange
+     is the only input to PHY Active policy.
+
+3. Route Adapter and PHY CSR Start requests as internal events.
+
+   Do not add a public start port. Clear both local Start copies after successful
+   Active Entry.
+
+### 15.6 Phase 5: Active data path and framing fault
+
+1. Gate user data in `logical_phy.sv`.
+
+   User data requires completed LTSM Active Entry, RDI Active, no active
+   transition, and no active stall handshake. Training patterns retain their
+   existing path.
+
+2. Add independent TX and RX Active-data scramblers.
+
+   - Reuse `rtl/rtl_common/scrambler.sv`.
+   - Seed each direction at Active Entry.
+   - Hold state across invalid cycles.
+   - Do not reuse the training-pattern scrambler state.
+
+3. Add a private mainband framing-fault event.
+
+   Route it to the LTSM fatal path. Do not add a top-level error port.
+
+### 15.7 Phase 6: Verification and coverage
+
+1. Update `ut_sb_codec.sv` and `ut_sb_cdc.sv`.
+
+   Prove the exact PARAM DATA64 request and response, CP and DP failure,
+   even and odd payload parity, widened payload CDC, busy retention, and
+   one-event coherence.
+
+2. Split focused LTSM policy checks from the nominal `ut_ltsm.sv` walk when
+   needed. Prove:
+
+   - Exact request and response roles for every logical sub-state.
+   - PARAM compatibility and incompatibility.
+   - Duplicate, stale, invalid, and busy-response behavior.
+   - Sideband arbitration priority.
+   - Each fatal cause, 8 ms TRAINERROR Entry timeout, TRAINERROR exchange,
+     LinkError, and LinkReset recovery.
+   - Unsupported L1, L2, and Retrain behavior.
+   - Disabled and LinkReset reset dwell plus fresh-trigger requirements.
+
+3. Update `ut_rdi_sm.sv` and `ut_fdi_sm.sv`.
+
+   Replace expectations that enter L1, L2, or Retrain. Add PMNAK, Disabled,
+   LinkError, LinkReset, Active Entry, and four-phase stall checks.
+
+4. Extend loopback with two-die recovery cases.
+
+   Prove normal delayed-start SBINIT, LinkReset recovery from Active, Disabled
+   recovery, full RESET dwell, no automatic restart, software Start recovery,
+   RDI NOP-to-Active recovery, Active Entry ordering, pre-Active user-data
+   blocking, and bidirectional scrambled-data recovery.
+
+5. Extend `cov_monitor.sv`, `cov_report.py`, and build targets.
+
+   Cover PARAM, request and response roles, arbitration classes, fatal causes,
+   TRAINERROR, LinkReset, Disabled, PMNAK, unsupported request rejection,
+   Active Entry, pre-Active block, scramble, and framing fault. Exclude
+   unsupported L1, L2, and PHYRETRAIN from the reachable-state denominator.
+
+### 15.8 Completion gates
+
+Run the existing full regression after all phases integrate:
+
+```text
+make -C sim clean && make -C sim all
+```
+
+The final run must show:
+
+- Zero compile errors and warnings.
+- Every unit test passed.
+- Both dies reached Active through the approved Active Entry sequence.
+- LinkReset and Disabled recovery passed with a true 4 ms RESET dwell.
+- Unsupported L1, L2, and Retrain requests did not publish unsupported states.
+- DATA64 PARAM exchange, sideband integrity faults, and TRAINERROR recovery
+  passed.
+- Pre-Active user data was blocked.
+- Bidirectional Active-data scrambling and descrambling passed.
+- Coverage reported all approved-policy bins and no unsupported-state holes.
+
+### 15.9 Detailed execution plan
+
+Do not start these phases until the user explicitly requests implementation.
+Each phase ends with its focused proof. Do not merge a phase until its proof
+passes without warnings.
+
+#### Phase A: Packet contracts, private transport, and training primitives
+
+**Goal:** Establish the fixed profile packet contracts before changing LTSM
+policy.
+
+**Modify**
+
+- `rtl/rtl_common/ucie_pkg.sv`
+  - Add immutable PARAM request and response constants, masks, valid Vswing
+    range, and named request and response roles.
+  - Keep existing public types, width constants, and state encodings.
+- `rtl/logical_phy/sb_codec.sv`
+  - Keep packet serialization and parsing policy-free.
+  - Validate DATA64 parity for both received DP values.
+- `rtl/logical_phy/logical_phy.sv`
+  - Replace the positional 37-bit private RX bundle with a named complete
+    packet bundle that includes the 64-bit data payload.
+  - Hold a decoded sbclk-domain packet until the one-entry RX mailbox accepts
+    it. Preserve the raw SBINIT mux and all public ports.
+- `rtl/logical_phy/pattern_gen.sv`
+  - Correct VALTRAIN, Per-Lane-ID, and clock-repair bit equations.
+  - Preserve the LSB-first gearbox order and the reusable LFSR path.
+- `rtl/logical_phy/ltsm.sv`
+  - Disable `pat_enable` for every MBINIT and MBTRAIN state.
+  - Drive low mainband data through the existing disabled pattern path.
+  - Do not add electrical test counts or a state-specific pattern engine.
+
+**Add or modify verification**
+
+- Modify `tb/unit/ut_sb_codec.sv` for exact PARAM DATA64 request and response,
+  plus valid and corrupted even and odd parity payloads.
+- Modify `tb/unit/ut_sb_cdc.sv` for the complete RX bundle, busy retention,
+  and one coherent destination event.
+- Add `tb/unit/ut_pattern_gen.sv` for VALTRAIN, Per-Lane-ID, clock repair,
+  LSB-first byte order, and disabled output.
+
+**Exit proof**
+
+```text
+make -C sim unit
+```
+
+The added tests must print their exact `TEST PASSED` marker. The build must
+report no warnings.
+
+#### Phase B: LTSM transaction engine and fixed profile
+
+**Goal:** Replace generic post-SBINIT completion with role-aware logical
+transactions.
+
+**Modify**
+
+- `rtl/logical_phy/ltsm.sv`
+  - Track local request acceptance, matching local response, peer request
+    obligation, queued peer response, and duplicate replay separately.
+  - Validate the complete received packet against state, role, IDs, opcode,
+    code, subcode, and payload rule.
+  - Apply the required arbitration order before new normal requests.
+  - Use the exact DATA64 PARAM request and response values.
+  - Model MBINIT and MBTRAIN electrical work as immediate success, but retain
+    every required logical init or start and result or done exchange.
+  - Make fixed-profile LINKSPEED success enter LINKINIT.
+  - Send unsupported LINKSPEED results to TRAINERROR.
+- `rtl/logical_phy/logical_phy.sv`
+  - Add only private LTSM packet-payload and TX-acceptance signals.
+  - Keep the mailbox and codec as transport blocks, not policy blocks.
+- `rtl/rtl_common/timer.sv`
+  - Reuse without modification unless a named LTSM timer interface is missing.
+
+**Add or modify verification**
+
+- Modify `tb/unit/ut_ltsm.sv` for complete RX packets and a DATA64 PARAM peer.
+- Add `tb/unit/ut_ltsm_policy.sv` for role separation, stale and wrong-role
+  packets, duplicate replay, busy response retention, arbitration, PARAM
+  compatibility, and LINKSPEED outcomes.
+
+**Exit proof**
+
+```text
+make -C sim unit
+```
+
+The two LTSM tests must prove that a peer request never completes a local
+request.
+
+#### Phase C: Active Entry, fatal recovery, and reset triggers
+
+**Goal:** Make the LTSM the only owner of Active Entry and recovery policy.
+
+**Modify**
+
+- `rtl/logical_phy/ltsm.sv`
+  - Keep RESET active for 4 ms on initial and recovery entries.
+  - Require a fresh software Start event or RDI NOP-to-Active event after
+    LinkError, LinkReset, or Disabled recovery.
+  - Keep LINKINIT active through the local and remote LinkMgmt.RDI Active
+    exchange. Reset the LFSR on entry without waiting for a diagnostic pattern.
+  - Implement TRAINERROR Entry request and response behavior, its 8 ms
+    timeout, RDI LinkError result, and LinkReset-only recovery.
+  - Implement Disabled and LinkReset requests, responses, 8 ms remote
+    response timeouts, and the approved transition priority.
+- `rtl/logical_phy/logical_phy.sv`
+  - Route private RDI request and Active-entry-result signals.
+  - Preserve the existing `sb_init_raw.sv` ownership boundary.
+- `rtl/logical_phy/phy_csr.sv`
+  - Add a private clear input for the local Start copy.
+- `rtl/d2d_adapter/adapter_regfile.sv`
+  - Add a private clear input for the Adapter Start copy.
+
+**Add or modify verification**
+
+- Modify `tb/unit/ut_ltsm.sv` and `tb/unit/ut_ltsm_policy.sv` for Active
+  Entry ordering, TRAINERROR timeout, LinkError hold, Disabled, LinkReset,
+  4 ms RESET dwell, and fresh-trigger behavior.
+- Preserve `tb/unit/ut_sbinit.sv` unchanged unless an interface change
+  requires a mechanical update. It remains the SBINIT waveform proof.
+
+**Exit proof**
+
+```text
+make -C sim unit
+```
+
+Each recovery test must observe RESET residency and reject a held Start level.
+
+#### Phase D: RDI, FDI, Adapter, stall, and Start cutover
+
+**Goal:** Align Adapter and RDI state publication with LTSM policy.
+
+**Modify**
+
+- `rtl/logical_phy/rdi_state_machine.sv`
+  - Wait for the LTSM Active-entry result before RDI Active.
+  - Keep LinkReset and Disabled visible until the LTSM reaches RESET.
+  - Return PMNAK for L1 and L2 without changing the LTSM.
+  - Hold the supported state for Retrain.
+  - Consume `lp_stallack` in the registered four-phase stall path.
+- `rtl/d2d_adapter/fdi_state_machine.sv`
+  - Forward only Active, LinkReset, and Disabled.
+  - Remove L1, L2, Retrain, and stale peer-Active paths from state policy.
+- `rtl/d2d_adapter/d2d_adapter.sv`
+  - Connect the Adapter Start copy to the private training event path.
+  - Preserve the registered stall request and data gate.
+- `rtl/d2d_adapter/adapter_sb_if.sv`
+  - Keep it only as Adapter CSR and request transport.
+  - Remove any remaining peer-Active policy ownership.
+- `rtl/logical_phy/logical_phy.sv` and `rtl/ucie_main.sv`
+  - Add private internal wiring only. Do not change public ports or topology.
+
+**Add or modify verification**
+
+- Modify `tb/unit/ut_rdi_sm.sv` for PMNAK, LinkError, LinkReset, Disabled,
+  completed Active Entry, and all four stall phases.
+- Modify `tb/unit/ut_fdi_sm.sv` for supported forwarding and unsupported
+  request suppression.
+- Modify `tb/unit/ut_stall.sv` if its direct Adapter assertions no longer
+  match the integrated four-phase contract.
+
+**Exit proof**
+
+```text
+make -C sim unit
+```
+
+No test can observe RDI or FDI L1, L2, or Retrain after this phase.
+
+#### Phase E: Active data path and private framing fault
+
+**Goal:** Transfer data only in approved Active and preserve it through
+per-direction scrambling.
+
+**Modify**
+
+- `rtl/logical_phy/logical_phy.sv`
+  - Gate user TX and RX data on completed Active Entry, RDI Active, no
+    transition, and no active stall handshake.
+  - Instantiate independent TX and RX uses of `scrambler.sv`.
+  - Seed both directions at Active Entry and advance only for accepted valid
+    user transfers.
+  - Scramble before the TX gearbox and descramble after the RX gearbox.
+- `rtl/logical_phy/mb_gearbox.sv`
+  - Detect an invalid mainband framing boundary.
+  - Export only a private framing-fault event to `logical_phy.sv`.
+- `rtl/logical_phy/ltsm.sv`
+  - Consume the private framing-fault event through existing fatal policy.
+- `rtl/rtl_common/scrambler.sv`
+  - Reuse unchanged unless a verified lane-word interface defect requires a
+    local correction.
+- `rtl/d2d_adapter/adapter_datapath.sv`
+  - Keep stall gating aligned with the new logical PHY data gate.
+
+**Add or modify verification**
+
+- Modify `tb/loopback/tb_loopback_top.sv` for pre-Active block, recovered
+  bidirectional data, LinkReset and Disabled recovery, held-Start rejection,
+  software Start recovery, and RDI NOP-to-Active recovery.
+- Add framing-fault injection and require TRAINERROR, LinkError, LinkReset,
+  then the full RESET dwell.
+
+**Exit proof**
+
+```text
+make -C sim loopback
+```
+
+The loopback scoreboard must compare descrambled receive data. It must not
+compare mainband wire data.
+
+#### Phase F: Coverage, build gates, and final integration
+
+**Goal:** Make every approved behavior observable and keep unsupported paths
+out of the denominator.
+
+**Modify**
+
+- `tb/monitors/cov_monitor.sv`
+  - Add event coverage for PARAM roles, transaction classes, arbitration,
+    fatal causes, TRAINERROR, LinkReset, Disabled, PMNAK, Active Entry,
+    pre-Active block, scrambling, and framing fault.
+- `sim/cov_report.py`
+  - Add all new evidence keys and include TRAINERROR in reachable coverage.
+  - Exclude only unsupported PHYRETRAIN, L1, and L2 state bins.
+- `sim/Makefile`
+  - Keep the existing `compile`, `unit`, `loopback`, `coverage`, and `all`
+    gates. Add a target only if new evidence artifacts require explicit setup
+    or cleanup.
+
+**Modify verification**
+
+- Update unit evidence output in the relevant testbenches.
+- Update `tb/loopback/tb_loopback_top.sv` monitor connections.
+- Update the completion criteria in this document only if a new approved
+  observable behavior is added.
+
+**Exit proof**
+
+```text
+make -C sim coverage
+make -C sim clean && make -C sim all
+```
+
+The final run must have zero compile warnings, all unit markers, both Active
+observations, recovered data in both directions, all approved coverage bins,
+and no unsupported-state holes.
+
+#### Phase dependencies and file-addition summary
+
+Complete phases in this order: A, B, C, D, E, then F. Do not begin a later
+phase before its predecessor proof passes.
+
+New files are limited to:
+
+- `tb/unit/ut_pattern_gen.sv`
+- `tb/unit/ut_ltsm_policy.sv`
+
+All other work modifies existing files. No public interface file is added.

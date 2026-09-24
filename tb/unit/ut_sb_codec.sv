@@ -81,40 +81,15 @@
 //
 // STIMULUS (DIRECTED TESTS)
 // -------------------------
-// Seven directed tests exercise packet framing and exact training encodings:
+// The test sends header-only packets, exact DATA64 PARAM vectors, and DATA64
+// payloads with both received DP values. It injects one payload UI error into
+// both even and odd parity payloads so the receiver must report DP failure.
 //
-//   Test 1 – Header-only message
-//            A LinkMgmt no-data request (SB_OP_MSG_NODATA) is sent with
-//            representative field values.  All deserialised header fields
-//            must match the transmitted values, and neither cp_err nor
-//            dp_err may be asserted.
+// The PARAM request is DATA64, MsgInfo zero, A5h/00h, and PARAM_REQ_DATA.
+// The PARAM response is DATA64, MsgInfo zero, AAh/00h, and PARAM_RSP_DATA.
+// The remaining vectors preserve packet-gap, SBINIT, and CP-error coverage.
 //
-//   Test 2 – Message with 64-bit payload
-//            A data-bearing message (SB_OP_MSG_DATA64) is sent.  Both the
-//            header and the 64-bit data word must round-trip correctly.
-//            The data pattern (BEEF_DEAD_BEEF_DEAD) has odd popcount to
-//            exercise the data-parity path.
-//
-//   Test 3 – Back-to-back packets
-//            Two header-only packets are transmitted in immediate
-//            succession (the second tx_load is issued as soon as tx_busy
-//            deasserts after the first).  This verifies that the mandatory
-//            inter-packet gap does not corrupt the following header.
-//
-//   Tests 4-6 – SBINIT encodings
-//            Out-of-Reset (91h/00h), Done request (95h/01h), and Done
-//            response (9Ah/01h) use the PHY source and remote-PHY destination.
-//
-//   Test 7 – Parity error injection via corrupt_en mux
-//            A header-only packet is transmitted, but the corruption mux
-//            is enabled for exactly one header UI (UI 10) during
-//            serialisation. The receiver must still deliver the packet with
-//            cp_err high, proving that it detects the injected bit flip.
-//
-//   Spec ref: Section 6.1.2 – Packet Formats
-//             (header and data field layout exercised by tests 1-3)
-//   Spec ref: Section 6.1.3 – Flow Control and Data Integrity
-//             (parity error detection exercised by test 7)
+// Spec ref: UCIe 1.0, Table 56; Section 6.1.2; Section 6.1.3.
 //
 //
 // PASS CRITERIA
@@ -136,6 +111,8 @@
 //                        sideband rate.
 //   v0.0.4  2026-09-24  Add exact Out-of-Reset, Done request, and Done
 //                        response SBINIT encoding vectors.
+//   v0.0.5  2026-09-24  Phase A: add exact PARAM DATA64 vectors and clean
+//                        plus corrupted even and odd payload parity checks.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -347,6 +324,42 @@ module ut_sb_codec;
     end
   endtask
 
+  // Load a DATA64 packet and flip one payload UI after the 64-bit header.
+  // The injected bit never changes the header, so CP stays clean while DP
+  // must report the payload corruption. The task waits for the packet and
+  // gap to complete before it returns to the next directed vector.
+  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity.
+  task send_corrupt_payload;
+    input [7:0] minfo, mcode, msub;
+    input [63:0] data;
+    begin
+      @(negedge sbclk);
+      tx_opcode     = SB_OP_MSG_DATA64;
+      tx_srcid      = SRCID_PHY;
+      tx_dstid      = DSTID_REMOTE_PHY;
+      tx_msginfo    = minfo;
+      tx_msgcode    = mcode;
+      tx_msgsubcode = msub;
+      tx_cr         = 1'b0;
+      tx_addr       = 12'h000;
+      tx_be         = 8'h00;
+      tx_tag        = 5'h00;
+      tx_ep         = 1'b0;
+      tx_data_in    = data;
+      tx_has_data   = 1'b1;
+      tx_load       = 1'b1;
+      @(posedge sbclk);
+      @(negedge sbclk);
+      tx_load       = 1'b0;
+      repeat (64) @(posedge sbclk);
+      corrupt_en = 1'b1;
+      @(posedge sbclk);
+      corrupt_en = 1'b0;
+      @(posedge rx_pkt_vld);
+      wait (!tx_busy);
+    end
+  endtask
+
   // Cross-check the snapshotted received fields against what was sent.
   task check_fields;
     input [4:0]  op;
@@ -466,6 +479,34 @@ module ut_sb_codec;
                  12'hABC, 8'hC3, 5'h07, 1'b1,
                  64'hBEEF_DEAD_BEEF_DEAD, 1'b1);
 
+
+    // 2a-2b. Exact fixed-profile PARAM request and response. PARAM_REQ_DATA
+    // has even parity. PARAM_RSP_DATA has odd parity. Both must arrive clean.
+    send_one(SB_OP_MSG_DATA64, SRCID_PHY, DSTID_REMOTE_PHY,
+             8'h00, MC_MBINIT_REQ, MS_PARAM_CFG, 1'b0,
+             12'h000, 8'h00, 5'h00, 1'b0, PARAM_REQ_DATA, 1'b1);
+    check_fields(SB_OP_MSG_DATA64, SRCID_PHY, DSTID_REMOTE_PHY,
+                 8'h00, MC_MBINIT_REQ, MS_PARAM_CFG, 1'b0,
+                 12'h000, 8'h00, 5'h00, 1'b0, PARAM_REQ_DATA, 1'b1);
+
+    send_one(SB_OP_MSG_DATA64, SRCID_PHY, DSTID_REMOTE_PHY,
+             8'h00, MC_MBINIT_RSP, MS_PARAM_CFG, 1'b0,
+             12'h000, 8'h00, 5'h00, 1'b0, PARAM_RSP_DATA, 1'b1);
+    check_fields(SB_OP_MSG_DATA64, SRCID_PHY, DSTID_REMOTE_PHY,
+                 8'h00, MC_MBINIT_RSP, MS_PARAM_CFG, 1'b0,
+                 12'h000, 8'h00, 5'h00, 1'b0, PARAM_RSP_DATA, 1'b1);
+
+    // 2c-2d. Corrupt one payload UI for both received DP values.
+    send_corrupt_payload(8'h00, MC_MBINIT_REQ, MS_PARAM_CFG, PARAM_REQ_DATA);
+    if (sn_dp_err !== 1'b1 || sn_cp_err !== 1'b0) begin
+      $display("FAIL ut_sb_codec: even payload corruption did not set only DP");
+      errors = errors + 1;
+    end
+    send_corrupt_payload(8'h00, MC_MBINIT_RSP, MS_PARAM_CFG, PARAM_RSP_DATA);
+    if (sn_dp_err !== 1'b1 || sn_cp_err !== 1'b0) begin
+      $display("FAIL ut_sb_codec: odd payload corruption did not set only DP");
+      errors = errors + 1;
+    end
     // 3. Back-to-back packets: the gap must not bleed into the next header.
     send_one(SB_OP_MSG_NODATA, SRCID_ADAPT, SRCID_STACK0,
              8'h00, MC_MBTRAIN_REQ, 8'h05, 1'b0,

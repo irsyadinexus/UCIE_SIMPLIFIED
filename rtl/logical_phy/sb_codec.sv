@@ -96,10 +96,12 @@
 //   2. The RX shift register shifts RIGHT so that the first-arriving bit
 //      (bit 0 of the header) lands in position 0, matching the transmitted
 //      word order.
-//   3. The DP parity check on receive: DP=1 with all-zero data is a valid
-//      encoding (parity of zero is 0, which does NOT equal 1, so it would
-//      be flagged). The spec guarantees payloads are non-trivial when DP
-//      is set.
+//   3. The DP parity check on receive validates that the received DP bit
+//      equals the XOR-reduction of the 64-bit data payload for every
+//      DATA64 packet.  This covers both DP=0 (even-parity payload) and
+//      DP=1 (odd-parity payload).  Non-DATA64 packets carry no payload
+//      and are not checked.  The codec is policy-free: it reports the
+//      error flag but does not decide what to do with it.
 //
 // --------------------------------------------------------------------------
 // Revision history
@@ -112,6 +114,12 @@
 //                        UCIe 1.0 Section 6.1.2, 6.1.3, and Table 47.
 //   v0.0.3  2026-09-23  Req.3: document sbclk-only operation. logical_phy
 //                        now owns the asynchronous LTSM/codec boundaries.
+//   v0.0.4  2026-09-24  Phase A: fix DP parity check to validate DATA64
+//                        packets for both DP=0 (even parity) and DP=1
+//                        (odd parity).  Gate on opcode instead of DP
+//                        value so that a payload with even parity is
+//                        correctly accepted when DP=0.  Codec remains
+//                        policy-free (error flag only).
 // ============================================================================
 `ifndef SbCodec_SV
 `define SbCodec_SV
@@ -488,12 +496,19 @@ module sb_codec (
   // =========================================================================
   // DP parity check  (spec Chapter 6 – Data Parity)
   // =========================================================================
-  // DP is the even parity of the payload. When there is no payload, DP
-  // should be 0. The check fires only when DP (bit 37) is set AND the
-  // XOR-reduction of the data payload does not match bit 37. rx_dp_err is
-  // raised coincident with rx_pkt_vld.
+  // DP is the even parity of the 64-bit data payload. The check validates
+  // that the received DP bit (hdr_lat_q[37]) equals the XOR-reduction of
+  // the latched data payload for every DATA64 packet, regardless of
+  // whether DP is 0 or 1.  This covers both even-parity payloads (DP=0,
+  // XOR=0) and odd-parity payloads (DP=1, XOR=1).  Non-DATA64 packets
+  // carry no payload and are not checked here.  rx_dp_err is raised for
+  // exactly one cycle, coincident with rx_pkt_vld.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity.
   // =========================================================================
-  assign rx_dp_err = rx_pkt_vld && hdr_lat_q[37] && (^data_lat_q != hdr_lat_q[37]);
+  assign rx_dp_err = rx_pkt_vld
+                  && (hdr_lat_q[4:0] == SB_OP_MSG_DATA64)
+                  && (^data_lat_q != hdr_lat_q[37]);
 
 endmodule
 

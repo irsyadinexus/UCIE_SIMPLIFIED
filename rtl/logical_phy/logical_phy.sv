@@ -59,8 +59,9 @@
 //   Sideband: ltsm (lclk) -> async mailbox -> sb_codec (sbclk) -> sideband
 //             pins. During RESET and SBINIT pattern phases, a raw sbclk
 //             waveform/CDC primitive owns the pins and keeps the codec reset.
-//             Received packets and atomic raw-iteration results use separate
-//             mailboxes back to the LTSM lclk domain.
+//             A complete decoded RX packet is held in sbclk until the
+//             sbclk-to-lclk mailbox accepts it. The payload remains private
+//             until the Phase B LTSM transaction-engine cutover.
 //
 // --------------------------------------------------------------------------
 // Parameters
@@ -133,6 +134,12 @@
 //                        codec busy and sideband presence back to lclk.
 //   v0.0.10 2026-09-24  Add the UI-exact Standard Package SBINIT waveform,
 //                        raw/packet mux, and atomic iteration CDC mailboxes.
+//   v0.0.11 2026-09-24  Phase A: widen the private RX packet mailbox to
+//                        include DATA64 and retain decoded packets until
+//                        the mailbox accepts them.
+//   v0.0.12 2026-09-24  Phase A: force low mainband data and framing through
+//                        every immediate-success MBINIT and MBTRAIN state.
+//   v0.0.13 2026-09-24  Clarify the private Phase A DATA64 payload boundary.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -197,7 +204,7 @@ module logical_phy #(
   // The LTSM side uses lclk. The sb_codec side uses sbclk. Each direction
   // carries complete packet fields through a one-entry asynchronous mailbox.
   localparam int unsigned SB_TX_W = 126;
-  localparam int unsigned SB_RX_W = 37;
+  localparam int unsigned SB_RX_W = 101;
 
   // LTSM-facing TX request and codec-facing busy indication.
   logic        sb_tx_load;
@@ -241,6 +248,10 @@ module logical_phy #(
   logic               codec_reset_n;
 
   // Codec-facing RX packet and LTSM-facing packet delivered by sbclk-to-lclk.
+  // Phase A retains the complete decoded packet before it enters the mailbox.
+  // The LTSM keeps its existing private receive interface until Phase B adds
+  // DATA64 transaction validation. The lclk-domain payload signal remains
+  // live only to prove coherent Phase A transport and avoid data loss.
   logic               codec_rx_pkt_vld;
   logic [4:0]         codec_rx_opcode;
   logic [2:0]         codec_rx_srcid;
@@ -248,8 +259,11 @@ module logical_phy #(
   logic [7:0]         codec_rx_msginfo;
   logic [7:0]         codec_rx_msgcode;
   logic [7:0]         codec_rx_msgsubcode;
+  logic [63:0]        codec_rx_data;
   logic               codec_rx_cp_err;
   logic               codec_rx_dp_err;
+  logic [SB_RX_W-1:0] sb_rx_hold_data_q;
+  logic               sb_rx_hold_q;
   logic [SB_RX_W-1:0] sb_rx_cdc_data;
   logic               sb_rx_cdc_busy;
   logic               sb_rx_pkt_vld;
@@ -259,6 +273,7 @@ module logical_phy #(
   logic [7:0]         sb_rx_msginfo;
   logic [7:0]         sb_rx_msgcode;
   logic [7:0]         sb_rx_msgsubcode;
+  logic [63:0]        sb_rx_payload;
   logic               sb_rx_cp_err;
   logic               sb_rx_dp_err;
   logic               sb_rx_valid_meta_q;
@@ -433,9 +448,11 @@ module logical_phy #(
   // and deserializer.
   //
   // The TX mailbox carries the full 126-bit LTSM request bundle to sbclk. The
-  // RX mailbox returns the parsed 37-bit packet bundle to lclk. The busy path
-  // synchronizes codec backpressure into lclk and combines it with mailbox
-  // occupancy before the LTSM can issue another request.
+  // RX mailbox carries 101 bits: packet fields, CP/DP results, and DATA64.
+  // A sbclk-domain hold register preserves a decoded packet if the RX mailbox
+  // is busy. The busy path synchronizes codec backpressure into lclk and
+  // combines it with mailbox occupancy before the LTSM can issue another
+  // request.
   // ---------------------------------------------------------------------------
   sb_cdc_mailbox #(.WIDTH(SB_TX_W)) u_sb_tx_cdc (
     .src_clk    (lclk),
@@ -530,18 +547,51 @@ module logical_phy #(
     .rx_msgsubcode(codec_rx_msgsubcode),
     .rx_cr        (),
     .rx_addr      (),
-    .rx_data      (),
+    .rx_data      (codec_rx_data),
     .rx_cp_err    (codec_rx_cp_err),
     .rx_dp_err    (codec_rx_dp_err)
   );
+  // -------------------------------------------------------------------------
+  // always_ff: sbclk RX packet retention
+  //
+  // Captures every decoded codec packet before the asynchronous RX mailbox.
+  // The register retains the complete 101-bit packet while the mailbox busy
+  // handshake returns from lclk. This prevents a one-cycle codec event from
+  // disappearing because the mailbox cannot accept it on that sbclk edge.
+  // The lclk destination observes the same coherent fields and DATA64 word.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1 packet transport; PLAN.md §15.2 Phase A.
+  // -------------------------------------------------------------------------
+  always_ff @(posedge sbclk or negedge sbreset_n) begin
+    if (!sbreset_n) begin
+      sb_rx_hold_q      <= 1'b0;
+      sb_rx_hold_data_q <= '0;
+    end else if (codec_rx_pkt_vld) begin
+      sb_rx_hold_q      <= 1'b1;
+      sb_rx_hold_data_q <= {codec_rx_opcode, codec_rx_srcid, codec_rx_dstid,
+                            codec_rx_msginfo, codec_rx_msgcode,
+                            codec_rx_msgsubcode, codec_rx_cp_err,
+                            codec_rx_dp_err, codec_rx_data};
+    end else if (!sb_rx_cdc_busy) begin
+      sb_rx_hold_q <= 1'b0;
+    end
+  end
 
+  // -------------------------------------------------------------------------
+  // Instantiation: sb_cdc_mailbox RX transport
+  //
+  // Transfers one retained parsed packet from sbclk to lclk. The source send
+  // level remains asserted until the mailbox accepts the hold register while
+  // not busy. The mailbox therefore transports a coherent payload and error
+  // event without changing the public logical PHY interface.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1; PLAN.md §15.2 private packet transport.
+  // -------------------------------------------------------------------------
   sb_cdc_mailbox #(.WIDTH(SB_RX_W)) u_sb_rx_cdc (
     .src_clk    (sbclk),
     .src_reset_n(sbreset_n),
-    .src_data   ({codec_rx_opcode, codec_rx_srcid, codec_rx_dstid,
-                  codec_rx_msginfo, codec_rx_msgcode, codec_rx_msgsubcode,
-                  codec_rx_cp_err, codec_rx_dp_err}),
-    .src_send   (codec_rx_pkt_vld),
+    .src_data   (sb_rx_hold_data_q),
+    .src_send   (sb_rx_hold_q && !sb_rx_cdc_busy),
     .src_busy   (sb_rx_cdc_busy),
     .dst_clk    (lclk),
     .dst_reset_n(lreset_n),
@@ -549,9 +599,19 @@ module logical_phy #(
     .dst_valid  (sb_rx_pkt_vld)
   );
 
+  // -------------------------------------------------------------------------
+  // assign: complete RX packet unpack
+  //
+  // Unpacks the mailbox destination bundle in exactly the same order used by
+  // the sbclk hold register. DATA64 is retained in the private lclk signal
+  // sb_rx_payload for Phase B. Existing LTSM inputs remain unchanged in Phase A.
+  // CP and DP error bits remain aligned with all decoded packet fields.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.2; PLAN.md §15.2 lossless transport.
+  // -------------------------------------------------------------------------
   assign {sb_rx_opcode, sb_rx_srcid, sb_rx_dstid, sb_rx_msginfo,
-          sb_rx_msgcode, sb_rx_msgsubcode, sb_rx_cp_err, sb_rx_dp_err} =
-         sb_rx_cdc_data;
+          sb_rx_msgcode, sb_rx_msgsubcode, sb_rx_cp_err, sb_rx_dp_err,
+          sb_rx_payload} = sb_rx_cdc_data;
 
   // ---------------------------------------------------------------------------
   // Link Training and Status Machine Instantiation  (u_ltsm)
@@ -874,30 +934,46 @@ module logical_phy #(
   assign pl_cfg_crd = 1'b0;
 
   // ---------------------------------------------------------------------------
-  // Main-Band 4 GT/s DDR Gearboxes (spec 4.1.1, 5.2 -- Req.2)
+  // Main-Band 4 GT/s DDR Gearboxes (spec 4.1.1 and 5.2)
   // ---------------------------------------------------------------------------
-  // Bridges the 500 MHz 128-bit lclk domain and the 2 GHz 16-lane DDR mainband.
-  // In training states (pat_enable=1), the transmitter serializes the 128-bit
-  // pattern word (8 UIs per lane) over the 8 DDR UIs of each lclk cycle. In
-  // ACTIVE, it serializes the streaming rdi_lp_data from the adapter.
+  // The TX gearbox bridges the 500 MHz 128-bit lclk word to eight UI slices
+  // per lane. The RX gearbox reassembles eight received UIs into one lclk
+  // word for rdi_pl_data. The Phase A source mux below selects a LINKINIT
+  // diagnostic, a low immediate-success training state, or Adapter data.
   //
-  // The receiver deserializes 8 DDR UIs into a 128-bit word on rdi_pl_data.
+  // Spec ref: UCIe 1.0, Section 4.1.1, Section 5.2, and Section 8.1.2.
   // ---------------------------------------------------------------------------
   logic [DATA_W-1:0] tx_gearbox_word;
   logic              tx_gearbox_valid;
   logic [DATA_W-1:0] rx_gearbox_word;
   logic              rx_gearbox_valid;
 
+  // always_comb: Phase A mainband source and idle gate
+  //
+  // Routes a selected LINKINIT diagnostic pattern to the TX gearbox when
+  // pat_enable is high. During immediate-success MBINIT and MBTRAIN states,
+  // it drives a zero word with framing low. This prevents Adapter traffic
+  // from bypassing the disabled pattern generator during skipped electrical
+  // actions. All other states retain the existing Adapter data route.
+  //
+  // Phase E replaces the final Adapter branch with completed-Active gating.
+  // This Phase A gate does not add an electrical pattern-count engine.
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3.3, 4.5.3.4; PLAN.md §15.2 Phase A.
+  // -------------------------------------------------------------------------
   always_comb begin
     if (pat_enable) begin
       tx_gearbox_word  = pat_data_out;
       tx_gearbox_valid = 1'b1;
+    end else if ((ltsm_state >= LT_MBINIT_PARAM) &&
+                 (ltsm_state <= LT_MB_REPAIR)) begin
+      tx_gearbox_word  = '0;
+      tx_gearbox_valid = 1'b0;
     end else begin
       tx_gearbox_word  = rdi_lp_data;
       tx_gearbox_valid = rdi_lp_valid;
     end
   end
-
   tx_gearbox #(
     .NBYTES(NBYTES),
     .NLANES(NLANES)
@@ -982,7 +1058,7 @@ module logical_phy #(
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |
                   csr_rdata[0] | phy_retrain_done | sb_msg_timeout |
                   sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |
-                  raw_rx_result_busy | raw_tx_done_busy |
+                  sb_rx_payload[0] | raw_rx_result_busy | raw_tx_done_busy |
                   lp_cfg[0] | lp_cfg_vld | lp_cfg_crd;
 
 endmodule

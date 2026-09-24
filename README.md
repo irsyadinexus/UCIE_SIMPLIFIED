@@ -17,6 +17,8 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - CXL Protocol : Not supported
 - PCIE Protocol : Not supported
 - Retimer : Not supported
+- Runtime PHY retrain : Not supported
+- Runtime power management (L1 / L2) : Not supported
 - Electrical PHY : Not supported (Implement the negotiated parameters but not the analog circuits)
 - **Sideband Frequency** : 800 MHz (spec accurate). Includes method for clock domain crossing (CDC) between lclk and sbclk datapath.
 - **Mainband Frequency** : Physical interface operates as a true 4 GT/s DDR link: 2 GHz forwarded clock (fCK), DDR mainband transfer, with lclk set to 500 MHz (slowest IO data rate).

@@ -45,6 +45,10 @@
 //                                definitions.
 //  15. Sideband credit limits  – Maximum outstanding remote credits
 //                                (spec 6.1.3).
+//  16. MBINIT.PARAM constants  – Immutable request and response 64-bit
+//                                payload values, field masks, accepted
+//                                Vswing range, and named packet roles from
+//                                Table 56.
 //
 // Targeting : Standard Package x16, Streaming / Raw Mode (Format 1),
 //             4 GT/s only.
@@ -95,6 +99,13 @@
 //   0.0.2 2026-09-22  -           Re-anchor lclk to 500 MHz, recalibrate timers, and update spec refs.
 //   0.0.3 2026-09-24  -           Add the Section 4.5.3.2 SBINIT waveform,
 //                                timing, message-subcode, and PHY-ID constants.
+//   0.0.4 2026-09-24  -           Phase A: add immutable MBINIT.PARAM
+//                                request and response 64-bit payloads,
+//                                field masks, accepted Vswing range, and
+//                                named role constants.
+//   0.0.5 2026-09-24  -           Correct PARAM fields and payloads to
+//                                Table 56. Remove unrelated capability
+//                                fields and define request/response roles.
 //
 // ============================================================================
 `ifndef UciePkg_SV
@@ -554,6 +565,65 @@ package ucie_pkg;
   // SB_CRD_MAX : Maximum number of outstanding remote sideband credits.
   //              Each partner may have up to 4 messages in flight.
   localparam int unsigned SB_CRD_MAX = 4;
+
+  // ========================================================================
+  // MBINIT.PARAM Constants  (spec Table 56)
+  // ========================================================================
+  // Table 56 defines the DATA64 configuration request and response. The
+  // request carries Module ID, clock phase, clock mode, voltage swing, and
+  // maximum I/O speed. The response retains clock phase, clock mode, and
+  // maximum I/O speed. All other response bits are reserved.
+  //
+  // The fixed profile sends Module 0, differential clock, continuous clock,
+  // Vswing 01h, and 4 GT/s. The immutable values below are the only PARAM
+  // payload source. PHY CSR values remain observability-only.
+  //
+  // Spec ref: UCIe 1.0, Table 56; Section 4.5.3.3.1 MBINIT.PARAM.
+  // -----------------------------------------------------------------------
+  // Request and response payload masks
+  // -----------------------------------------------------------------------
+  // The request Module ID occupies [12:11]. Clock phase is bit [10], clock
+  // mode is bit [9], Vswing is [8:4], and maximum I/O speed is [3:0].
+  // The response uses bits [10], [9], and [3:0]; response bits [8:4] are
+  // reserved. Each mask is 64 bits because the DATA64 payload is 64 bits.
+  localparam logic [63:0] PARAM_MASK_MODULE_ID   = 64'h0000_0000_0000_1800;
+  localparam logic [63:0] PARAM_MASK_CLOCK_PHASE = 64'h0000_0000_0000_0400;
+  localparam logic [63:0] PARAM_MASK_CLOCK_MODE  = 64'h0000_0000_0000_0200;
+  localparam logic [63:0] PARAM_MASK_VSWING      = 64'h0000_0000_0000_01F0;
+  localparam logic [63:0] PARAM_MASK_MAX_SPEED   = 64'h0000_0000_0000_000F;
+
+  // -----------------------------------------------------------------------
+  // Fixed profile request and response values
+  // -----------------------------------------------------------------------
+  // Module 0 and differential clock encode as zero. Continuous clock sets
+  // bit [9]. Vswing 01h sets bit [4]. 4 GT/s encodes as zero in [3:0].
+  // The response has continuous differential clock at 4 GT/s.
+  localparam logic [63:0] PARAM_REQ_DATA = 64'h0000_0000_0000_0210;
+  localparam logic [63:0] PARAM_RSP_DATA = 64'h0000_0000_0000_0200;
+
+  // -----------------------------------------------------------------------
+  // Accepted request Vswing range
+  // -----------------------------------------------------------------------
+  // The fixed profile accepts every defined request Vswing encoding from
+  // 01h through 10h. Zero and values above 10h are reserved and fatal.
+  localparam logic [4:0] PARAM_VSWING_MIN = 5'h01;
+  localparam logic [4:0] PARAM_VSWING_MAX = 5'h10;
+
+  // -----------------------------------------------------------------------
+  // Named packet roles
+  // -----------------------------------------------------------------------
+  // The LTSM uses these request/response role values with the existing
+  // MBINIT, MBTRAIN, LinkMgmt, and TRAINERROR code constants. The codec and
+  // CDC transport remain role-free.
+  typedef enum logic {SB_ROLE_REQUEST, SB_ROLE_RESPONSE} sb_msg_role_t;
+  localparam sb_msg_role_t ROLE_MBINIT_REQUEST     = SB_ROLE_REQUEST;
+  localparam sb_msg_role_t ROLE_MBINIT_RESPONSE    = SB_ROLE_RESPONSE;
+  localparam sb_msg_role_t ROLE_MBTRAIN_REQUEST    = SB_ROLE_REQUEST;
+  localparam sb_msg_role_t ROLE_MBTRAIN_RESPONSE   = SB_ROLE_RESPONSE;
+  localparam sb_msg_role_t ROLE_LINKMGMT_REQUEST   = SB_ROLE_REQUEST;
+  localparam sb_msg_role_t ROLE_LINKMGMT_RESPONSE  = SB_ROLE_RESPONSE;
+  localparam sb_msg_role_t ROLE_TRAINERROR_REQUEST = SB_ROLE_REQUEST;
+  localparam sb_msg_role_t ROLE_TRAINERROR_RESPONSE= SB_ROLE_RESPONSE;
 
 endpackage
 

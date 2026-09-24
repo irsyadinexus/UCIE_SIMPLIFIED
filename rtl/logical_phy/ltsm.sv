@@ -147,12 +147,13 @@
 // --------------------------------------------------------------------------
 // Pattern generator control  (spec 4.5.3.4, 4.5.3.5)
 // --------------------------------------------------------------------------
-//   The LTSM enables the pattern generator during MBTRAIN sub-states and
-//   LINKINIT. Pattern selection:
-//     - VALVREF, DATAVREF           -> PAT_VALTRAIN  (1010 checkerboard)
-//     - RXDESKEW                    -> PAT_CLKREPAIR (clock-repair toggle)
+//   Phase A disables the pattern generator (pat_enable low) for every MBINIT
+//   and MBTRAIN sub-state. LINKINIT retains the existing LFSR diagnostic
+//   path and its legacy pat_done gate. Phase C replaces that gate with the
+//   required LinkMgmt.RDI Active exchange. This phase does not add electrical
+//   pattern counts or a state-specific pattern selector.
+//   Pattern selection (effective only when pat_enable is high):
 //     - LINKINIT                    -> PAT_LFSR      (4096-UI LFSR)
-//     - all other MBTRAIN states    -> PAT_PERLANEID (lane numbering)
 //
 // --------------------------------------------------------------------------
 // Timer interface
@@ -218,6 +219,14 @@
 //   v0.0.8  2026-09-24  Implement Standard Package SBINIT delayed start. Own
 //                        pattern policy, explicit packet phases, and RESET
 //                        pattern triggering in lclk.
+//   v0.0.9  2026-09-24  Disable pat_enable for all MBINIT and MBTRAIN states.
+//                        Preserve LINKINIT diagnostic path only. Update all
+//                        pattern generator control comments per Phase A.
+//   v0.0.10 2026-09-24  Correct Phase A comments. LINKINIT retains its
+//                        existing pat_done transition until Phase C owns
+//                        Active Entry with the LinkMgmt exchange.
+//   v0.0.11 2026-09-24  Align Phase A comments with logical_phy's low
+//                        mainband-data and framing gate.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -854,60 +863,69 @@ module ltsm #(
   // =========================================================================
   // Pattern generator control  (spec 4.5.3.4, 4.5.3.5)
   // =========================================================================
-  // The pattern generator runs during the MBTRAIN sub-states (VALVREF
-  // through REPAIR, 08h-12h) and during LINKINIT (14h). The pattern
-  // selection follows the spec training sequence:
-  //   - VALVREF, DATAVREF : PAT_VALTRAIN  (alternating 1010 checkerboard)
-  //   - RXDESKEW          : PAT_CLKREPAIR (clock-repair single-UI toggle)
-  //   - LINKINIT          : PAT_LFSR      (per-lane LFSR, 4096 UI)
-  //   - All other MBTRAIN : PAT_PERLANEID (lane numbering identification)
+  // The LTSM disables the pattern generator for every MBINIT (02h-07h) and
+  // MBTRAIN (08h-12h) sub-state. pat_enable is high only during LINKINIT
+  // (14h), where the LFSR diagnostic path emits 4096 UI of PAT_LFSR.
+  // logical_phy applies the matching Phase A low mainband-data and framing
+  // gate while these immediate-success actions are skipped.
   //
-  // The LFSR is reseeded (pat_lfsr_reset) and enabled (pat_lfsr_enable)
-  // only during LINKINIT. Scrambling is off for Per-Lane-ID, VALTRAIN, and
-  // clock-repair patterns per spec.
+  // The LINKINIT diagnostic path preserves the per-lane LFSR reseed
+  // (pat_lfsr_reset) and run (pat_lfsr_enable) sequence. Phase A retains
+  // the existing pat_done transition. Phase C replaces it with the required
+  // LinkMgmt.RDI Active exchange.
+  //
+  // Pattern selection mux (effective only when pat_enable is high):
+  //   LINKINIT          -> PAT_LFSR      (per-lane LFSR, 4096 UI)
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
+  //           Section 4.4.1 - Scrambling and training pattern generation.
   // =========================================================================
-  assign pat_enable     = ((state_q >= LT_MB_VALVREF) &&
-                          (state_q <= LT_MB_REPAIR)) ||
-                          (state_q == LT_LINKINIT);
+  assign pat_enable     = (state_q == LT_LINKINIT);
   // -------------------------------------------------------------------------
   // assign: Training Pattern Selection Mux
   //
   // Selects the training pattern driven onto the main-band lanes based on
-  // the current LTSM sub-state:
-  //   VALVREF / DATAVREF  -> PAT_VALTRAIN   (alternating 1010 checkerboard)
+  // the current LTSM sub-state.  This mux is effective only when pat_enable
+  // is high (LINKINIT state).  During MBINIT and MBTRAIN the pattern
+  // generator is disabled and the output is zero.
   //   LINKINIT            -> PAT_LFSR       (per-lane scrambled LFSR)
-  //   RXDESKEW            -> PAT_CLKREPAIR  (clock-repair single-UI toggle)
-  //   All other MBTRAIN   -> PAT_PERLANEID  (lane numbering identification)
   //
-  // The priority-encoded ternary chain matches the spec ordering; the
-  // default (PAT_PERLANEID) covers remaining MBTRAIN sub-states.
+  // The priority-encoded ternary chain is retained for the LINKINIT
+  // diagnostic path.  The default value (PAT_PERLANEID) is harmless
+  // because pat_enable gates the output.
   //
-  // Spec ref: UCIe 1.0, Section 4.4.1 - Scrambling and training pattern
-  //           generation.
+  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
+  //           Section 4.4.1 - Scrambling and training pattern generation.
   // -------------------------------------------------------------------------
   assign pat_select     = (state_q == LT_MB_VALVREF)  ? PAT_VALTRAIN  :
                           (state_q == LT_MB_DATAVREF) ? PAT_VALTRAIN  :
                           (state_q == LT_LINKINIT)    ? PAT_LFSR      :
                           (state_q == LT_MB_RXDESKEW) ? PAT_CLKREPAIR :
                                                         PAT_PERLANEID;
-  // LFSR reset/enable gating for the training-pattern generator.
+  // -------------------------------------------------------------------------
+  // assign: LFSR Reseed Pulse
   //
-  // Scrambling is disabled for Per-Lane-ID, VALTRAIN and clock-repair
-  // patterns, so the LFSR only runs during LINKINIT, where the LFSR
-  // pattern itself is the payload. Reseed is a clean 1-cycle entry pulse
-  // so the LFSR advances freely for the full 4096-UI duration.
-  // ref: spec 4.5.3.5 (LINKINIT), 4.4.1 (scrambling).
+  // Generates a 1-cycle reset pulse on LINKINIT entry so the per-lane
+  // LFSRs start from a known seed.  Because pat_enable is low for all
+  // MBINIT and MBTRAIN states, the LFSR is only exercised during LINKINIT
+  // where the LFSR pattern IS the training payload.  The clean reseed
+  // ensures the LFSR advances freely for the full 4096-UI duration.
+  //
+  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
+  //           Section 4.4.1 - Scrambling and training pattern generation.
+  // -------------------------------------------------------------------------
   assign pat_lfsr_reset = (state_q == LT_LINKINIT) && (state_q != state_q_prev);
   // -------------------------------------------------------------------------
   // assign: LFSR Enable Gate
   //
-  // Enables the per-lane LFSR only during the LINKINIT sub-state. During
-  // all other states the LFSR holds its current value so it can be cleanly
-  // reseeded on the next LINKINIT entry via pat_lfsr_reset. The LFSR runs
-  // for the full 4096-UI LINKINIT duration, after which pat_done fires.
+  // Enables the per-lane LFSR only during the LINKINIT sub-state (14h).
+  // During all MBINIT, MBTRAIN, and other states the LFSR holds its
+  // current value so it can be cleanly reseeded on the next LINKINIT
+  // entry via pat_lfsr_reset. The existing LINKINIT diagnostic uses the
+  // 4096-UI completion until Phase C replaces its state-exit condition.
   //
-  // Spec ref: UCIe 1.0, Section 4.4.1 - Scrambling and training pattern
-  //           generation.
+  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
+  //           Section 4.4.1 - Scrambling and training pattern generation.
   // -------------------------------------------------------------------------
   assign pat_lfsr_enable= (state_q == LT_LINKINIT);
   // =========================================================================

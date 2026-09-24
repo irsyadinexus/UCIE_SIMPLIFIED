@@ -22,48 +22,33 @@
 // --------------------------------------------------------------------------
 //
 //   D2D Adapter (RDI)
-//      |                               lp_cfg/pl_cfg
-//      |  rdi_lp_*  / rdi_pl_*         (sideband register access)
-//      |                                    |
-//      v                                    v
-//  +---------------------------------------------------------------+
-//  | logical_phy                                                   |
-//  |                                                               |
-//  |  +------------------+      +--------------+                   |
-//  |  | rdi_state_machine|<---->|    ltsm      |                   |
-//  |  | (u_rdi_sm)       |      | (u_ltsm)     |                   |
-//  |  | Spec 8.1.5       |      | Spec 4.5.3   |                   |
-//  |  | Fig 111          |      | Link Training|                   |
-//  |  +------------------+      |  & Status SM |                   |
-//  |         ^                  +------+-------+                   |
-//  |         | phy_link_trained        |                           |
-//  |         | phy_train_error         | sb_tx/rx   pat_*          |
-//  |         | phy_link_reset          |            |              |
-//  |         v                  +------+------+  +-+----------+   |
-//  |  +-----------+             | sb_codec    |  | pattern_gen|   |
-//  |  | phy_csr   |             | (u_sb_codec)|  | (u_pat_gen)|   |
-//  |  | (u_phy_csr|             | Spec Ch 6   |  | Spec 4.5.3|   |
-//  |  | Spec 7.1  |             +-+----------++  |  .4/.6     |   |
-//  |  +-----------+               |          |    +-----+-----+   |
-//  |                              |          |          |          |
-//  |  +------------------+        |          |   mb_tx_data       |
-//  |  | byte_lane_mapper |        |          |          |          |
-//  |  | (u_mapper)       |        |          |          v          |
-//  |  | Spec 5.2/4.1.1   |        |          |   [NLANES-1:0]     |
-//  |  +------------------+        |          |          |          |
-//  |                              |          |          |          |
-//  |  +------------------+        |          |          |          |
-//  |  | ucie_timer x 2   |        |          |          |          |
-//  |  | (u_resid_timer)  |--------+          |          |          |
-//  |  | (u_reset_timer)  |                   |          |          |
-//  |  +------------------+                   |          |          |
-//  +---------------------------------------------------------------+
-//      |               |                    |          |
-//      v               v                    v          v
-//   sb_tx_data     sb_rx_data           mb_tx_data  mb_rx_data
-//   sb_tx_valid    sb_rx_valid          (to partner)(from partner)
-//   (sideband      (sideband
-//    to partner)    from partner)
+//          |
+//          v
+//  +--------------------------------------------------------------------+
+//  | logical_phy                                                        |
+//  |                                                                    |
+//  |  +-------------------+       +-------------------+                 |
+//  |  | rdi_state_machine |<----->|       ltsm        |                 |
+//  |  +-------------------+       | policy in lclk    |                 |
+//  |          ^                    +----+---------+----+                 |
+//  |          |                         |         |                      |
+//  |  +-------+------+       packet CDC |         | raw levels/events    |
+//  |  |   phy_csr   |                   v         v                      |
+//  |  +--------------+             +---------+ +----------------+       |
+//  |                               |sb_codec | | SBINIT raw     |       |
+//  |                               | sbclk   | | primitive sbclk|       |
+//  |                               +----+----+ +-------+--------+       |
+//  |                                    \            /                 |
+//  |                                     +---- mux ---+                 |
+//  |                                              |                     |
+//  |  +------------------+   +---------------+    |                     |
+//  |  | byte_lane_mapper |   |  pattern_gen  |    |                     |
+//  |  +------------------+   +-------+-------+    |                     |
+//  |                                  |            |                     |
+//  |  +------------------+            v            v                     |
+//  |  | ucie_timer x 2   |        mb_tx_data   sideband pins             |
+//  |  +------------------+                                               |
+//  +--------------------------------------------------------------------+
 //
 // --------------------------------------------------------------------------
 // Data flow (simplified)
@@ -72,8 +57,10 @@
 //             During training: ltsm -> pattern_gen -> mb_tx_data pins.
 //   RX path : mb_rx_data pins -> (future CRC / scrambler) -> rdi_pl_data.
 //   Sideband: ltsm (lclk) -> async mailbox -> sb_codec (sbclk) -> sideband
-//             pins. Received packets cross through the reverse mailbox to
-//             the ltsm lclk domain.
+//             pins. During RESET and SBINIT pattern phases, a raw sbclk
+//             waveform/CDC primitive owns the pins and keeps the codec reset.
+//             Received packets and atomic raw-iteration results use separate
+//             mailboxes back to the LTSM lclk domain.
 //
 // --------------------------------------------------------------------------
 // Parameters
@@ -88,7 +75,8 @@
 //                     the adapter. Implements the state machine of spec 8.1.5
 //                     and the Active-entry handshake of 8.1.6.
 //   Sideband pins   : sb_tx_data/valid, sb_rx_data/valid toward the partner
-//                     die. Serialised 64-bit packets per spec Chapter 6.
+//                     die. They carry the raw SBINIT waveform before they
+//                     carry serialized 64-bit packets from the codec.
 //   Main-band pins  : mb_tx_data, mb_rx_data. One bit per lane per UI.
 //   CSR/cfg         : lp_cfg/pl_cfg sideband register access path (stubbed
 //                     in this reduced-capability build).
@@ -97,8 +85,9 @@
 // Clock domains
 // --------------------------------------------------------------------------
 //   lclk     : 500 MHz link clock for the main-band path and LTSM.
-//   sbclk    : 800 MHz sideband clock for sb_codec. Toggle mailboxes carry
-//              complete sideband packets safely between lclk and sbclk.
+//   sbclk    : 800 MHz sideband clock for sb_codec and the UI-exact SBINIT
+//              primitive. Toggle mailboxes carry packets and iteration events
+//              safely between lclk and sbclk.
 //
 // --------------------------------------------------------------------------
 // Implementation notes
@@ -142,6 +131,8 @@
 //   v0.0.9  2026-09-23  Req.3: add paired asynchronous mailboxes between the
 //                        lclk LTSM and the 800 MHz sbclk codec. Synchronize
 //                        codec busy and sideband presence back to lclk.
+//   v0.0.10 2026-09-24  Add the UI-exact Standard Package SBINIT waveform,
+//                        raw/packet mux, and atomic iteration CDC mailboxes.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -243,6 +234,11 @@ module logical_phy #(
   logic               codec_tx_busy;
   logic               codec_tx_busy_meta_q;
   logic               codec_tx_busy_sync_q;
+  logic               codec_tx_inflight_q;
+  logic               codec_tx_busy_seen_q;
+  logic [NC-1:0]      codec_sb_tx_data;
+  logic               codec_sb_tx_valid;
+  logic               codec_reset_n;
 
   // Codec-facing RX packet and LTSM-facing packet delivered by sbclk-to-lclk.
   logic               codec_rx_pkt_vld;
@@ -270,6 +266,31 @@ module logical_phy #(
   logic               sb_msg_timeout;
   logic               sb_stall_sent;
 
+  // --------------------------------------- LTSM <-> raw SBINIT primitive
+  logic               pattern_run_enable;
+  logic               sbinit_raw_mode;
+  logic               sbinit_rx_iter_vld;
+  logic               sbinit_rx_iter_match;
+  logic               sbinit_tx_iter_done;
+  logic               sbinit_tx_idle;
+
+  logic               codec_packet_ready_meta_q;
+  logic               codec_packet_ready_sync_q;
+  logic               raw_tx_idle_meta_q;
+  logic               raw_tx_idle_sync_q;
+  logic               raw_mode_active_s;
+  logic               raw_rx_low_sample;
+  logic               raw_tx_idle_s;
+
+  logic [NC-1:0]      raw_sb_tx_data;
+  logic               raw_sb_tx_valid;
+  logic               raw_tx_iter_done_s;
+  logic               raw_rx_iter_vld_s;
+  logic               raw_rx_iter_match_s;
+  logic               raw_rx_result_busy;
+  logic               raw_tx_done_busy;
+  logic [0:0]         raw_rx_result_l;
+
   // ------------------------------------------------- LTSM <-> pattern gen
   logic        pat_enable;
   pat_t        pat_select;
@@ -281,6 +302,7 @@ module logical_phy #(
   logic        tmr_start;
   logic        tmr_run;
   logic        tmr_expired;
+  logic        rst_tmr_start;
   logic        rst_tmr_expired;
   // ------------------------------------------------- LTSM <-> adapter
   logic        csr_start_link_train;
@@ -303,6 +325,103 @@ module logical_phy #(
   logic [63:0] csr_wdata;
   logic [63:0] csr_rdata;
   logic        csr_rdata_vld;
+
+  // ---------------------------------------------------------------------------
+  // Standard Package SBINIT Raw Primitive (spec 4.5.3.2)
+  // ---------------------------------------------------------------------------
+  // The raw waveform helper owns only sbclk-rate serialization and candidate
+  // sampling. LTSM keeps every SBINIT policy decision in lclk. logical_phy
+  // retains the CDC mailboxes and selects raw or packet codec pin ownership.
+  // ---------------------------------------------------------------------------
+  sb_init_raw u_sb_init_raw (
+    .sbclk              (sbclk),
+    .sbreset_n          (sbreset_n),
+    .pattern_run_enable (pattern_run_enable),
+    .sbinit_raw_mode    (sbinit_raw_mode),
+    .sb_rx_data         (sb_rx_data),
+    .sb_rx_valid        (sb_rx_valid),
+    .raw_rx_result_busy (raw_rx_result_busy),
+    .sb_tx_data         (raw_sb_tx_data),
+    .sb_tx_valid        (raw_sb_tx_valid),
+    .raw_mode_active    (raw_mode_active_s),
+    .raw_rx_low_sample  (raw_rx_low_sample),
+    .raw_tx_idle        (raw_tx_idle_s),
+    .raw_tx_iter_done   (raw_tx_iter_done_s),
+    .raw_rx_iter_vld    (raw_rx_iter_vld_s),
+    .raw_rx_iter_match  (raw_rx_iter_match_s)
+  );
+
+  // Atomic remote-result mailbox. The one-bit payload and its destination
+  // valid pulse are captured together, so a mismatch cannot be reordered with
+  // a neighboring match. Well-formed iterations are 96 sbclk cycles apart,
+  // which exceeds the mailbox acknowledgement round trip.
+  sb_cdc_mailbox #(.WIDTH(1)) u_sbinit_rx_result_cdc (
+    .src_clk    (sbclk),
+    .src_reset_n(sbreset_n),
+    .src_data   (raw_rx_iter_match_s),
+    .src_send   (raw_rx_iter_vld_s),
+    .src_busy   (raw_rx_result_busy),
+    .dst_clk    (lclk),
+    .dst_reset_n(lreset_n),
+    .dst_data   (raw_rx_result_l),
+    .dst_valid  (sbinit_rx_iter_vld)
+  );
+
+  assign sbinit_rx_iter_match = raw_rx_result_l[0];
+
+  // Independent local-completion mailbox. It reports every completed local
+  // 96-UI waveform once and carries no phase, count, or completion policy.
+  sb_cdc_mailbox #(.WIDTH(1)) u_sbinit_tx_done_cdc (
+    .src_clk    (sbclk),
+    .src_reset_n(sbreset_n),
+    .src_data   (1'b1),
+    .src_send   (raw_tx_iter_done_s),
+    .src_busy   (raw_tx_done_busy),
+    .dst_clk    (lclk),
+    .dst_reset_n(lreset_n),
+    .dst_data   (),
+    .dst_valid  (sbinit_tx_iter_done)
+  );
+
+  // Keep the packet codec reset throughout raw receive mode. After the LTSM
+  // selects packet mode, release the codec only on an observed low boundary.
+  // A partner can already be partway through a repeated Out-of-Reset packet;
+  // this boundary wait prevents that suffix from becoming a partial header.
+  logic codec_packet_ready_s;
+  always_ff @(posedge sbclk or negedge sbreset_n) begin
+    if (!sbreset_n) begin
+      codec_packet_ready_s <= 1'b0;
+    end else if (raw_mode_active_s) begin
+      codec_packet_ready_s <= 1'b0;
+    end else if (!codec_packet_ready_s && raw_rx_low_sample) begin
+      codec_packet_ready_s <= 1'b1;
+    end
+  end
+
+  assign codec_reset_n = sbreset_n && codec_packet_ready_s;
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      codec_packet_ready_meta_q <= 1'b0;
+      codec_packet_ready_sync_q <= 1'b0;
+      raw_tx_idle_meta_q        <= 1'b1;
+      raw_tx_idle_sync_q        <= 1'b1;
+    end else begin
+      codec_packet_ready_meta_q <= codec_packet_ready_s;
+      codec_packet_ready_sync_q <= codec_packet_ready_meta_q;
+      raw_tx_idle_meta_q        <= raw_tx_idle_s;
+      raw_tx_idle_sync_q        <= raw_tx_idle_meta_q;
+    end
+  end
+
+  assign sbinit_tx_idle = raw_tx_idle_sync_q;
+
+  // Raw mode owns the public pins for the entire pattern phase, including its
+  // 1 ms idle windows. Packet pins become visible only after the boundary-safe
+  // mode change has reset and released the codec.
+  assign sb_tx_data  = raw_mode_active_s ? raw_sb_tx_data  :
+                                           codec_sb_tx_data;
+  assign sb_tx_valid = raw_mode_active_s ? raw_sb_tx_valid :
+                                           codec_sb_tx_valid;
 
   // ---------------------------------------------------------------------------
   // Sideband CDC and Codec Instantiations  (u_sb_tx_cdc/u_sb_codec/u_sb_rx_cdc)
@@ -337,8 +456,8 @@ module logical_phy #(
           codec_tx_ep, codec_tx_addr, codec_tx_data_in, codec_tx_has_data} =
          sb_tx_cdc_data;
 
-  // Synchronize sbclk-domain levels that the lclk-side PHY consumes. The busy
-  // level gates new LTSM requests. sb_rx_valid only feeds RDI in-band presence.
+  // Synchronize codec busy and packet-mode sideband presence into lclk.
+  // Raw pattern valid is excluded from RDI in-band presence.
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_busy_meta_q <= 1'b0;
@@ -348,16 +467,41 @@ module logical_phy #(
     end else begin
       codec_tx_busy_meta_q <= codec_tx_busy;
       codec_tx_busy_sync_q <= codec_tx_busy_meta_q;
-      sb_rx_valid_meta_q   <= sb_rx_valid;
+      sb_rx_valid_meta_q   <= sb_rx_valid && codec_packet_ready_s;
       sb_rx_valid_sync_q   <= sb_rx_valid_meta_q;
     end
   end
 
-  assign sb_tx_busy = sb_tx_cdc_busy | codec_tx_busy_sync_q;
+  // A mailbox acknowledgement means that sbclk received the bundle, not that
+  // the packet finished. Hold the lclk busy contract until codec busy has been
+  // observed high and then low. This closes the acknowledgement/busy CDC gap
+  // for repeated Out-of-Reset packets and queued Done responses.
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      codec_tx_inflight_q  <= 1'b0;
+      codec_tx_busy_seen_q <= 1'b0;
+    end else if (sbinit_raw_mode) begin
+      codec_tx_inflight_q  <= 1'b0;
+      codec_tx_busy_seen_q <= 1'b0;
+    end else if (sb_tx_load && !sb_tx_busy) begin
+      codec_tx_inflight_q  <= 1'b1;
+      codec_tx_busy_seen_q <= 1'b0;
+    end else if (codec_tx_inflight_q) begin
+      if (codec_tx_busy_sync_q) codec_tx_busy_seen_q <= 1'b1;
+      if (codec_tx_busy_seen_q && !codec_tx_busy_sync_q &&
+          !sb_tx_cdc_busy) begin
+        codec_tx_inflight_q  <= 1'b0;
+        codec_tx_busy_seen_q <= 1'b0;
+      end
+    end
+  end
+
+  assign sb_tx_busy = sb_tx_cdc_busy | codec_tx_busy_sync_q |
+                      codec_tx_inflight_q | !codec_packet_ready_sync_q;
 
   sb_codec u_sb_codec (
     .sbclk        (sbclk),
-    .sbreset_n    (sbreset_n),
+    .sbreset_n    (codec_reset_n),
     .tx_load      (codec_tx_load),
     .tx_opcode    (codec_tx_opcode),
     .tx_srcid     (codec_tx_srcid),
@@ -373,10 +517,10 @@ module logical_phy #(
     .tx_data_in   (codec_tx_data_in),
     .tx_has_data  (codec_tx_has_data),
     .tx_busy      (codec_tx_busy),
-    .sb_tx_data   (sb_tx_data),
-    .sb_tx_valid  (sb_tx_valid),
+    .sb_tx_data   (codec_sb_tx_data),
+    .sb_tx_valid  (codec_sb_tx_valid),
     .sb_rx_data   (sb_rx_data),
-    .sb_rx_valid  (sb_rx_valid),
+    .sb_rx_valid  (sb_rx_valid && codec_packet_ready_s),
     .rx_pkt_vld   (codec_rx_pkt_vld),
     .rx_opcode    (codec_rx_opcode),
     .rx_srcid     (codec_rx_srcid),
@@ -423,9 +567,10 @@ module logical_phy #(
   // the CSR TRAIN_CTL write. On exit, it reports link_trained, train_error,
   // and link_reset_out to the RDI state machine and the CSR block.
   //
-  // Control of the pattern generator (pat_enable, pat_select, etc.) is
-  // driven entirely by the LTSM based on the current training sub-state.
-  // The 8 ms residency timer (u_resid_timer) provides timeout enforcement
+  // The LTSM owns SBINIT phase and retry policy. It controls the raw
+  // primitive through stable levels and consumes atomic iteration events.
+  // It also controls the later main-band pattern generator. The 8 ms
+  // residency timer (u_resid_timer) provides timeout enforcement
   // per spec 4.5.3. The 4 ms reset timer (u_reset_timer) enforces the
   // minimum RESET duration requirement per spec 4.5.3.1.
   // ---------------------------------------------------------------------------
@@ -466,6 +611,12 @@ module logical_phy #(
     .sb_rx_dp_err    (sb_rx_dp_err),
     .sb_msg_timeout  (sb_msg_timeout),
     .sb_stall_sent   (sb_stall_sent),
+    .pattern_run_enable(pattern_run_enable),
+    .sbinit_raw_mode (sbinit_raw_mode),
+    .sbinit_rx_iter_vld(sbinit_rx_iter_vld),
+    .sbinit_rx_iter_match(sbinit_rx_iter_match),
+    .sbinit_tx_iter_done(sbinit_tx_iter_done),
+    .sbinit_tx_idle  (sbinit_tx_idle),
     .pat_enable      (pat_enable),
     .pat_select      (pat_select),
     .pat_lfsr_reset  (pat_lfsr_reset),
@@ -473,17 +624,18 @@ module logical_phy #(
     .pat_done        (pat_done),
     .tmr_start       (tmr_start),
     .tmr_run         (tmr_run),
+    .rst_tmr_start   (rst_tmr_start),
     .tmr_expired     (tmr_expired),
     .rst_tmr_expired (rst_tmr_expired)
   );
   // ---------------------------------------------------------------------------
   // 8 ms Residency Timer Instantiation  (u_resid_timer)
   // ---------------------------------------------------------------------------
-  // Spec reference : 4.5 – every training sub-state is bounded by an 8 ms
-  //                  residency window. The LTSM asserts tmr_start on entry to
-  //                  each new sub-state and holds tmr_run while the handshake
-  //                  is pending. If tmr_expired fires before the handshake
-  //                  completes, the LTSM escalates to TRAINERROR per 4.5.3.8.
+  // Spec reference : 4.5 – every timed training state is bounded by an
+  //                  8 ms residency window. The LTSM asserts tmr_start on
+  //                  state entry and holds tmr_run across every private
+  //                  SBINIT phase. If tmr_expired fires before completion,
+  //                  the LTSM escalates to TRAINERROR per 4.5.3.8.
   //
   // ucie_timer is parameterised with C_RESIDENCY = 4_000_000 lclk cycles
   // (8 ms at 500 MHz).
@@ -500,14 +652,16 @@ module logical_phy #(
   // 4 ms RESET Minimum Timer Instantiation (u_reset_timer)
   // ---------------------------------------------------------------------------
   // Spec reference : 4.5.3.1 – Physical Layer must stay in RESET for a
-  //                  minimum of 4 ms upon every entry to RESET.
+  //                  minimum of 4 ms upon every entry to RESET. The separate
+  //                  rst_tmr_start pulse prevents later state entries from
+  //                  restarting this RESET-epoch timer.
   // ucie_timer is parameterised with C_RESET_MIN = 2_000_000 lclk cycles
   // (4 ms at 500 MHz).
   // ---------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN)) u_reset_timer (
     .clk      (lclk),
     .reset_n  (lreset_n),
-    .start    (tmr_start),
+    .start    (rst_tmr_start),
     .running  (ltsm_state == ucie_pkg::LT_RESET),
     .expired  (rst_tmr_expired)
   );
@@ -827,7 +981,8 @@ module logical_phy #(
   logic unused;
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |
                   csr_rdata[0] | phy_retrain_done | sb_msg_timeout |
-                  sb_stall_sent | lane_bytes[0][0] |
+                  sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |
+                  raw_rx_result_busy | raw_tx_done_busy |
                   lp_cfg[0] | lp_cfg_vld | lp_cfg_crd;
 
 endmodule

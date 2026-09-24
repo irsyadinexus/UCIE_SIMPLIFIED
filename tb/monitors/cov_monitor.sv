@@ -23,18 +23,19 @@
 // -------------------------------------------------------------------------
 // What is observed?
 // -------------------------------------------------------------------------
-// The monitor observes three broad categories of activity:
+// The monitor observes four broad categories of activity:
 //
 //   1. LTSM state histogram  – Records which Link Training State Machine
 //      states have been visited by either die.  A one-hot bitmask
 //      (ltsm_state_hits) is indexed by the 8-bit state encoding from
 //      ucie_pkg.  The NSTATES parameter (default LT_NUM_STATES) sets the
-//      upper bound so out-of-range indices are ignored.
+//      upper bound so out-of-range indices are ignored. Per-die SBINIT phase
+//      masks and ordered progress record Pattern, Out-of-Reset, and Done.
 //      Spec ref: Section 4.5.3 - Link Training State Machine.
 //
-//   2. Sideband opcode & msgcode histograms – On every valid sideband
-//      packet reception (sb_rx_pkt_vld asserted), the 5-bit opcode and
-//      8-bit message code are used to index 32-bit counter arrays.
+//   2. Sideband packet histograms – On every valid sideband packet, the
+//      opcode and message code update shared histograms. Each die also has a
+//      message-subcode histogram for SBINIT evidence.
 //      Because both dies' RX paths are monitored, traffic in both
 //      directions of the sideband crossing is captured.
 //      Spec ref: Section 6.1.1 - Packet Types (opcode and msgcode
@@ -84,9 +85,11 @@
 //
 //   Per-die observables (suffix _0 for Die 0, _1 for Die 1):
 //     ltsm_state_N      [7:0]  – Current LTSM state encoding.
+//     sbinit_phase_N     [1:0]  – Private SBINIT phase for ordered evidence.
 //     link_active_N             – Asserted when the die's RDI is ACTIVE.
 //     sb_rx_opcode_N    [4:0]  – Received sideband packet opcode.
 //     sb_rx_msgcode_N   [7:0]  – Received sideband message code.
+//     sb_rx_msgsubcode_N[7:0]  – Received sideband message subcode.
 //     sb_rx_pkt_vld_N           – Pulse indicating a valid SB packet RX.
 //     rdi_state_sts_N   [3:0]  – RDI pl_state_sts from the PHY layer.
 //
@@ -161,6 +164,8 @@
 //                                 packet fields and valid strobes on lclk.
 //   0.0.6 2026-09-23  -           Req.3: remove stale sbclk-domain coverage
 //                                 sampling text from the port documentation.
+//   0.0.7 2026-09-24  -           Add per-die SBINIT phase/order and received
+//                                 message-subcode evidence.
 //
 // ============================================================================
 `ifndef CovMonitor_SV
@@ -178,17 +183,21 @@ module cov_monitor #(
 
   // Die 0 observables
   input logic [7:0]  ltsm_state_0,
+  input logic [1:0]  sbinit_phase_0,
   input logic        link_active_0,
   input logic [4:0]  sb_rx_opcode_0,
   input logic [7:0]  sb_rx_msgcode_0,
+  input logic [7:0]  sb_rx_msgsubcode_0,
   input logic        sb_rx_pkt_vld_0,
   input logic [3:0]  rdi_state_sts_0,
 
   // Die 1 observables
   input logic [7:0]  ltsm_state_1,
+  input logic [1:0]  sbinit_phase_1,
   input logic        link_active_1,
   input logic [4:0]  sb_rx_opcode_1,
   input logic [7:0]  sb_rx_msgcode_1,
+  input logic [7:0]  sb_rx_msgsubcode_1,
   input logic        sb_rx_pkt_vld_1,
   input logic [3:0]  rdi_state_sts_1,
 
@@ -204,9 +213,15 @@ module cov_monitor #(
 
   // ------------------------------------------------------- counters
   logic [NSTATES-1:0] ltsm_state_hits;
-  logic [31:0] sb_opcode_hits  [0:31];
-  logic [31:0] sb_msgcode_hits [0:255];
-  logic [31:0] rdi_state_hits  [0:15];
+  logic [3:0] sbinit_phase_hits_0;
+  logic [3:0] sbinit_phase_hits_1;
+  logic [1:0] sbinit_phase_order_0;
+  logic [1:0] sbinit_phase_order_1;
+  logic [31:0] sb_opcode_hits      [0:31];
+  logic [31:0] sb_msgcode_hits     [0:255];
+  logic [31:0] sb_msgsubcode_hits_0[0:255];
+  logic [31:0] sb_msgsubcode_hits_1[0:255];
+  logic [31:0] rdi_state_hits      [0:15];
 
   logic [31:0] c_rdi_active_entry_done;
   logic [31:0] c_stall_4phase_done;
@@ -218,10 +233,20 @@ module cov_monitor #(
   logic [31:0] c_crc_off_adv;
 
   initial begin
-    ltsm_state_hits = '0;
-    for (int i = 0; i < 32;  i = i + 1) sb_opcode_hits[i]  = 32'd0;
-    for (int i = 0; i < 256; i = i + 1) sb_msgcode_hits[i] = 32'd0;
-    for (int i = 0; i < 16;  i = i + 1) rdi_state_hits[i]  = 32'd0;
+    ltsm_state_hits      = '0;
+    sbinit_phase_hits_0  = '0;
+    sbinit_phase_hits_1  = '0;
+    sbinit_phase_order_0 = 2'd0;
+    sbinit_phase_order_1 = 2'd0;
+    for (int i = 0; i < 32; i = i + 1)
+      sb_opcode_hits[i] = 32'd0;
+    for (int i = 0; i < 256; i = i + 1) begin
+      sb_msgcode_hits[i]      = 32'd0;
+      sb_msgsubcode_hits_0[i] = 32'd0;
+      sb_msgsubcode_hits_1[i] = 32'd0;
+    end
+    for (int i = 0; i < 16; i = i + 1)
+      rdi_state_hits[i] = 32'd0;
     c_rdi_active_entry_done  = 32'd0;
     c_stall_4phase_done      = 32'd0;
     c_width_degrade_done     = 32'd0;
@@ -267,6 +292,25 @@ module cov_monitor #(
       if (ltsm_state_1 < NSTATES) ltsm_state_hits[ltsm_state_1] <= 1'b1;
       rdi_state_hits[rdi_state_sts_0] <= 1'b1;
       rdi_state_hits[rdi_state_sts_1] <= 1'b1;
+
+      if (ltsm_state_0 == LT_SBINIT) begin
+        sbinit_phase_hits_0[sbinit_phase_0] <= 1'b1;
+        case (sbinit_phase_order_0)
+          2'd0: if (sbinit_phase_0 == 2'd0) sbinit_phase_order_0 <= 2'd1;
+          2'd1: if (sbinit_phase_0 == 2'd2) sbinit_phase_order_0 <= 2'd2;
+          2'd2: if (sbinit_phase_0 == 2'd3) sbinit_phase_order_0 <= 2'd3;
+          default: sbinit_phase_order_0 <= sbinit_phase_order_0;
+        endcase
+      end
+      if (ltsm_state_1 == LT_SBINIT) begin
+        sbinit_phase_hits_1[sbinit_phase_1] <= 1'b1;
+        case (sbinit_phase_order_1)
+          2'd0: if (sbinit_phase_1 == 2'd0) sbinit_phase_order_1 <= 2'd1;
+          2'd1: if (sbinit_phase_1 == 2'd2) sbinit_phase_order_1 <= 2'd2;
+          2'd2: if (sbinit_phase_1 == 2'd3) sbinit_phase_order_1 <= 2'd3;
+          default: sbinit_phase_order_1 <= sbinit_phase_order_1;
+        endcase
+      end
     end
   end
 
@@ -291,10 +335,14 @@ module cov_monitor #(
     if (sb_rx_pkt_vld_0) begin
       sb_opcode_hits[sb_rx_opcode_0]   <= sb_opcode_hits[sb_rx_opcode_0]   + 1'b1;
       sb_msgcode_hits[sb_rx_msgcode_0] <= sb_msgcode_hits[sb_rx_msgcode_0] + 1'b1;
+      sb_msgsubcode_hits_0[sb_rx_msgsubcode_0] <=
+        sb_msgsubcode_hits_0[sb_rx_msgsubcode_0] + 1'b1;
     end
     if (sb_rx_pkt_vld_1) begin
       sb_opcode_hits[sb_rx_opcode_1]   <= sb_opcode_hits[sb_rx_opcode_1]   + 1'b1;
       sb_msgcode_hits[sb_rx_msgcode_1] <= sb_msgcode_hits[sb_rx_msgcode_1] + 1'b1;
+      sb_msgsubcode_hits_1[sb_rx_msgsubcode_1] <=
+        sb_msgsubcode_hits_1[sb_rx_msgsubcode_1] + 1'b1;
     end
   end
 
@@ -354,6 +402,22 @@ module cov_monitor #(
         if (i != NSTATES-1) $fwrite(fd, ", ");
       end
       $fwrite(fd, "],\n");
+      $fwrite(fd, "  \"sbinit_phase_hits_0\": [");
+      for (i = 0; i < 4; i = i + 1) begin
+        $fwrite(fd, "%0d", sbinit_phase_hits_0[i]);
+        if (i != 3) $fwrite(fd, ", ");
+      end
+      $fwrite(fd, "],\n");
+      $fwrite(fd, "  \"sbinit_phase_hits_1\": [");
+      for (i = 0; i < 4; i = i + 1) begin
+        $fwrite(fd, "%0d", sbinit_phase_hits_1[i]);
+        if (i != 3) $fwrite(fd, ", ");
+      end
+      $fwrite(fd, "],\n");
+      $fwrite(fd, "  \"sbinit_phase_order_0\": %0d,\n",
+              sbinit_phase_order_0);
+      $fwrite(fd, "  \"sbinit_phase_order_1\": %0d,\n",
+              sbinit_phase_order_1);
       $fwrite(fd, "  \"sb_opcode_hits\": [");
       for (i = 0; i < 32; i = i + 1) begin
         $fwrite(fd, "%0d", sb_opcode_hits[i]);
@@ -363,6 +427,18 @@ module cov_monitor #(
       $fwrite(fd, "  \"sb_msgcode_hits\": [");
       for (i = 0; i < 256; i = i + 1) begin
         $fwrite(fd, "%0d", sb_msgcode_hits[i]);
+        if (i != 255) $fwrite(fd, ", ");
+      end
+      $fwrite(fd, "],\n");
+      $fwrite(fd, "  \"sb_msgsubcode_hits_0\": [");
+      for (i = 0; i < 256; i = i + 1) begin
+        $fwrite(fd, "%0d", sb_msgsubcode_hits_0[i]);
+        if (i != 255) $fwrite(fd, ", ");
+      end
+      $fwrite(fd, "],\n");
+      $fwrite(fd, "  \"sb_msgsubcode_hits_1\": [");
+      for (i = 0; i < 256; i = i + 1) begin
+        $fwrite(fd, "%0d", sb_msgsubcode_hits_1[i]);
         if (i != 255) $fwrite(fd, ", ");
       end
       $fwrite(fd, "],\n");

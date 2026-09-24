@@ -16,15 +16,15 @@
 // --------------------------------------------------------------------------
 //
 //  +-----------+
-//  |  RESET    |  4.5.3.1  Wait for adapter start_link_train.
-//  |  (00h)    |           Exit -> SBINIT.
+//  |  RESET    |  4.5.3.1  Wait for the 4 ms minimum and either a
+//  |  (00h)    |           local or two-pattern training trigger.
 //  +-----+-----+
 //        |
 //        v
 //  +-----------+
-//  |  SBINIT   |  4.5.3.2  Out-of-band sideband reset handshake.
-//  |  (01h)    |           SB_DONE_REQ / SB_DONE_RSP exchange.
-//  +-----+-----+           Exit -> MBINIT.PARAM.
+//  |  SBINIT   |  4.5.3.2  Raw 64-UI/32-UI pattern and four-iteration
+//  |  (01h)    |           tail, repeated Out-of-Reset, then explicit
+//  +-----+-----+           Done request/response. Exit -> MBINIT.PARAM.
 //        |
 //        v
 //  +===================================+
@@ -121,10 +121,10 @@
 // --------------------------------------------------------------------------
 // Sub-state exit rule  (spec 4.5.3.4)
 // --------------------------------------------------------------------------
-//   A sub-state exits when the local side has sent its request AND received
-//   the partner's response. Both endpoints run the identical sequence, so a
-//   partner's request with the correct code/subcode is accepted as the
-//   response (symmetric handshake optimisation).
+//   Outside SBINIT, a sub-state exits when the local side has sent its
+//   request and received the partner handshake message. The existing later
+//   MBINIT/MBTRAIN symmetric-request behavior remains unchanged. SBINIT uses
+//   explicit message roles: a Done request never satisfies a Done response.
 //
 //   Every sub-state is bounded by an 8 ms residency timer. A sub-state
 //   that exceeds 8 ms without completing escalates to TRAINERROR.
@@ -132,10 +132,17 @@
 // --------------------------------------------------------------------------
 // Sideband message coding  (Tables 53, 54, 56)
 // --------------------------------------------------------------------------
-//   Each LTSM state maps to a {MsgCode, MsgSubcode} pair through three
-//   lookup functions: msg_req_code(), msg_rsp_code(), msg_subcode().
-//   MsgInfo carries supplementary qualifiers; only the REPAIR sub-state
-//   reads MsgInfo (LKS_DONE / LKS_EXIT_REP / LKS_EXIT_DEG).
+//   SBINIT selects explicit Out-of-Reset, Done request, and Done response
+//   pairs. Later states map through msg_req_code(), msg_rsp_code(), and
+//   msg_subcode(). MsgInfo carries the SBINIT primary-pair result and the
+//   later REPAIR qualifier.
+//
+// --------------------------------------------------------------------------
+// Raw SBINIT control  (spec 4.5.3.2)
+// --------------------------------------------------------------------------
+//   The LTSM owns match streaks, active/idle windows, four-tail counting,
+//   packet phases, request/response obligations, and the residency timeout.
+//   The sbclk primitive owns only the waveform and atomic event transport.
 //
 // --------------------------------------------------------------------------
 // Pattern generator control  (spec 4.5.3.4, 4.5.3.5)
@@ -150,9 +157,9 @@
 // --------------------------------------------------------------------------
 // Timer interface
 // --------------------------------------------------------------------------
-//   tmr_start       : pulsed on entry to each new sub-state (state_q != prev).
-//   tmr_run         : held while the handshake is pending (timer_start_q &&
-//                     !resp_rcvd_q). On expiry the LTSM transitions to TRAINERROR.
+//   tmr_start       : pulses on entry to each timed training state.
+//   tmr_run         : stays high for one uninterrupted state residency window.
+//   rst_tmr_start   : pulses only when the LTSM re-enters RESET.
 //   rst_tmr_expired : 4 ms physical layer RESET minimum timeout (spec 4.5.3.1).
 //
 // --------------------------------------------------------------------------
@@ -168,18 +175,22 @@
 //                 ltsm_state (8-bit state encoding for Error Log 0),
 //                 lnk_is_x8, degrade_lanes.
 //   Sideband    : Full TX field set (sb_tx_load..sb_tx_has_data) driving
-//                 the sb_codec, and full RX field set (sb_rx_pkt_vld..
-//                 sb_rx_dp_err) from the sb_codec.
+//                 the packet CDC, and full RX field set (sb_rx_pkt_vld..
+//                 sb_rx_dp_err) from the packet CDC.
+//   Raw SBINIT  : pattern_run_enable and sbinit_raw_mode levels; atomic
+//                 remote-result and local-completion events; synchronized
+//                 transmitter-idle boundary status.
 //   Pattern gen : pat_enable, pat_select, pat_lfsr_reset, pat_lfsr_enable,
-//                 pat_done.
-//   Timers      : tmr_start, tmr_run, tmr_expired, rst_tmr_expired.
+//                 pat_done for later main-band training.
+//   Timers      : tmr_start, tmr_run, rst_tmr_start, tmr_expired, and
+//                 rst_tmr_expired.
 //
 // --------------------------------------------------------------------------
 // Implementation notes
 // --------------------------------------------------------------------------
-//   1. The LTSM is purely a sequencer; it does not contain any analog or
-//      calibration logic. The pattern generator and scrambler provide the
-//      physical-layer data.
+//   1. The LTSM is purely a sequencer. It owns SBINIT policy but no UI-level
+//      waveform or CDC state. The pattern generator and scrambler provide the
+//      later main-band training data.
 //   2. In the loopback test, sub-state exit relies on the handshake, not
 //      the timer, keeping simulation at tens of millions of cycles. Timer
 //      paths remain wired and are exercised on the ucie_timer unit.
@@ -204,6 +215,9 @@
 //                        4.5.3.5, 4.5.3.6, and 4.5.3.7, respectively.
 //   v0.0.7  2026-09-23  Req.3: remove unused sbclk/sbreset_n ports. The LTSM
 //                        now uses only lclk-facing asynchronous mailboxes.
+//   v0.0.8  2026-09-24  Implement Standard Package SBINIT delayed start. Own
+//                        pattern policy, explicit packet phases, and RESET
+//                        pattern triggering in lclk.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -255,6 +269,14 @@ module ltsm #(
   output logic        sb_msg_timeout,
   output logic        sb_stall_sent,
 
+  // ---- raw SBINIT waveform/CDC primitive
+  output logic        pattern_run_enable,
+  output logic        sbinit_raw_mode,
+  input  logic        sbinit_rx_iter_vld,
+  input  logic        sbinit_rx_iter_match,
+  input  logic        sbinit_tx_iter_done,
+  input  logic        sbinit_tx_idle,
+
   // ---- training pattern generator
   output logic        pat_enable,
   output pat_t        pat_select,
@@ -265,111 +287,115 @@ module ltsm #(
   // ---- timers
   output logic        tmr_start,
   output logic        tmr_run,
+  output logic        rst_tmr_start,
   input  logic        tmr_expired,
   input  logic        rst_tmr_expired
 );
 
   // =========================================================================
-  // State and handshake registers
+  // State, handshake, and SBINIT policy registers
   // =========================================================================
-  // Spec 4.5.3 – The LTSM state encoding uses ltsm_state_t (8 bits), with
-  // values defined in ucie_pkg (LT_RESET through LT_L1L2). The handshake
-  // registers track whether the local side has sent its sub-state request
-  // (req_sent_q) and whether the partner's response has been received
-  // (resp_rcvd_q). timer_start_q arms the 8 ms residency timer on each
-  // sub-state entry. retrain_req_q records a pending PHYRETRAIN request.
-  //
-  // Reset clears the state to LT_RESET and de-asserts all handshake flags.
-  // On each clock edge the next-state values computed in the always_comb
-  // block are registered here.
+  // The public LTSM encoding remains unchanged. A private phase register owns
+  // the four Standard Package SBINIT activities inside LT_SBINIT. The raw
+  // sbclk primitive reports only complete iteration events; all detection,
+  // retry, tail-count, packet-order, and timeout policy remains here in lclk.
   // =========================================================================
+  typedef enum logic [1:0] {
+    SBI_PATTERN_ACTIVE = 2'd0,
+    SBI_PATTERN_IDLE   = 2'd1,
+    SBI_OUT_OF_RESET   = 2'd2,
+    SBI_DONE           = 2'd3
+  } sbinit_phase_t;
+
   ltsm_state_t state_q, state_d;
-  logic        req_sent_q;       // local side sent its sub-state request
-  logic        resp_rcvd_q;      // partner's response received
-  logic        timer_start_q;
-  logic        reset_min_done_q; // 4 ms RESET minimum met
-  logic        retrain_req_q;
-  logic        req_sent_d, resp_rcvd_d, timer_start_d, retrain_req_d, reset_min_done_d;
+  sbinit_phase_t sbinit_phase_q, sbinit_phase_d;
+
+  logic        req_sent_q, req_sent_d;
+  logic        resp_rcvd_q, resp_rcvd_d;
+  logic        timer_start_q, timer_start_d;
+  logic        reset_min_done_q, reset_min_done_d;
+  logic        retrain_req_q, retrain_req_d;
+
+  logic [1:0]  sbinit_match_streak_q, sbinit_match_streak_d;
+  logic        pattern_trigger_pending_q, pattern_trigger_pending_d;
+  logic [2:0]  sbinit_tail_count_q, sbinit_tail_count_d;
+  logic [31:0] sbinit_window_count_q, sbinit_window_count_d;
+  logic        sbinit_oor_sent_q, sbinit_oor_sent_d;
+  logic        sbinit_oor_received_q, sbinit_oor_received_d;
+  logic        sbinit_done_req_sent_q, sbinit_done_req_sent_d;
+  logic        sbinit_done_rsp_sent_q, sbinit_done_rsp_sent_d;
+  logic        sbinit_done_rsp_received_q, sbinit_done_rsp_received_d;
+  logic [7:0]  sbinit_done_rsp_pending_q, sbinit_done_rsp_pending_d;
+
   // -------------------------------------------------------------------------
-  // always_ff: State and Handshake Register Bank
-  //
-  // Registers the LTSM state (state_q) and five handshake/control flags on
-  // the rising edge of lclk, with asynchronous active-low reset. On reset
-  // the state machine enters LT_RESET and all handshake flags are cleared.
-  // On each active clock edge, the next-state values computed by the
-  // always_comb block are captured:
-  //   state_q          – current LTSM state encoding (8-bit ltsm_state_t).
-  //   req_sent_q       – local sideband request accepted by the CDC mailbox.
-  //   resp_rcvd_q      – partner response delivered by the CDC mailbox.
-  //   timer_start_q    – 8 ms residency timer armed for this sub-state.
-  //   reset_min_done_q – 4 ms RESET minimum timer has elapsed.
-  //   retrain_req_q    – a PHYRETRAIN request is pending.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // State and policy register bank
   // -------------------------------------------------------------------------
+  // The match streak saturates at two. The trigger remains sticky until a new
+  // RESET epoch. SBINIT packet flags remain independent so a received request
+  // can never satisfy the local response requirement.
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      state_q          <= LT_RESET;
-      req_sent_q       <= 1'b0;
-      resp_rcvd_q      <= 1'b0;
-      timer_start_q    <= 1'b0;
-      reset_min_done_q <= 1'b0;
-      retrain_req_q    <= 1'b0;
+      state_q                       <= LT_RESET;
+      sbinit_phase_q                <= SBI_PATTERN_ACTIVE;
+      req_sent_q                    <= 1'b0;
+      resp_rcvd_q                   <= 1'b0;
+      timer_start_q                 <= 1'b0;
+      reset_min_done_q              <= 1'b0;
+      retrain_req_q                 <= 1'b0;
+      sbinit_match_streak_q         <= 2'd0;
+      pattern_trigger_pending_q     <= 1'b0;
+      sbinit_tail_count_q           <= 3'd0;
+      sbinit_window_count_q         <= 32'd0;
+      sbinit_oor_sent_q             <= 1'b0;
+      sbinit_oor_received_q         <= 1'b0;
+      sbinit_done_req_sent_q        <= 1'b0;
+      sbinit_done_rsp_sent_q        <= 1'b0;
+      sbinit_done_rsp_received_q    <= 1'b0;
+      sbinit_done_rsp_pending_q     <= 8'd0;
     end else begin
-      state_q          <= state_d;
-      req_sent_q       <= req_sent_d;
-      resp_rcvd_q      <= resp_rcvd_d;
-      timer_start_q    <= timer_start_d;
-      reset_min_done_q <= reset_min_done_d;
-      retrain_req_q    <= retrain_req_d;
+      state_q                       <= state_d;
+      sbinit_phase_q                <= sbinit_phase_d;
+      req_sent_q                    <= req_sent_d;
+      resp_rcvd_q                   <= resp_rcvd_d;
+      timer_start_q                 <= timer_start_d;
+      reset_min_done_q              <= reset_min_done_d;
+      retrain_req_q                 <= retrain_req_d;
+      sbinit_match_streak_q         <= sbinit_match_streak_d;
+      pattern_trigger_pending_q     <= pattern_trigger_pending_d;
+      sbinit_tail_count_q           <= sbinit_tail_count_d;
+      sbinit_window_count_q         <= sbinit_window_count_d;
+      sbinit_oor_sent_q             <= sbinit_oor_sent_d;
+      sbinit_oor_received_q         <= sbinit_oor_received_d;
+      sbinit_done_req_sent_q        <= sbinit_done_req_sent_d;
+      sbinit_done_rsp_sent_q        <= sbinit_done_rsp_sent_d;
+      sbinit_done_rsp_received_q    <= sbinit_done_rsp_received_d;
+      sbinit_done_rsp_pending_q     <= sbinit_done_rsp_pending_d;
     end
   end
 
   // =========================================================================
   // Previous-state edge detector
   // =========================================================================
-  // Spec 4.5.3 – A sub-state boundary is detected when state_q differs from
-  // its one-cycle-delayed copy (state_q_prev). On this edge the handshake
-  // flags are cleared and the residency timer is re-armed.
-  // =========================================================================
+  // Separate RESET and residency restart pulses are derived from this delayed
+  // state. This gives each RESET entry a fresh 4 ms epoch without restarting
+  // the SBINIT 8 ms deadline at private phase changes.
   ltsm_state_t state_q_prev;
 
-  // -------------------------------------------------------------------------
-  // always_ff: Previous-State Pipeline Register
-  //
-  // Captures the one-cycle-delayed copy of state_q into state_q_prev.
-  // The comparison (state_q != state_q_prev) generates the sub-state entry
-  // edge used to clear handshake flags, re-arm the residency timer, and
-  // pulse pat_lfsr_reset. Resets to LT_RESET so no false entry edge is
-  // produced on power-up.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
-  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) state_q_prev <= LT_RESET;
     else           state_q_prev <= state_q;
   end
 
+  wire state_entry = (state_q != state_q_prev);
+  wire reset_entry = state_entry && (state_q == LT_RESET);
+
   // =========================================================================
-  // Message code lookup tables  (Tables 53, 54, 56)
+  // Message lookup tables for post-SBINIT training
   // =========================================================================
-  // Spec 4.5.3 / Tables 53, 54, 56 – Each LTSM state maps to a request
-  // MsgCode, a response MsgCode, and a MsgSubcode that together uniquely
-  // identify the sideband message for that sub-state. The three functions
-  // below are used by both the TX path (to construct outgoing messages) and
-  // the RX path (to match incoming messages to the current sub-state).
-  //
-  // msg_req_code : Returns the request MsgCode for the given state.
-  //   - SBINIT           -> MC_SB_DONE_REQ  (0x95)       Table 53
-  //   - MBINIT.*         -> MC_MBINIT_REQ   (0xA5)       Table 54
-  //   - MBTRAIN.*        -> MC_MBTRAIN_REQ  (0xB5)       Table 54
-  //   - PHYRETRAIN       -> MC_PHYR_REQ     (0xC5)       Table 56
-  //   - TRAINERROR       -> MC_TE_REQ       (0xE5)       Table 56
-  //   - All others       -> MC_NOP_CRD      (0x00)       (no message)
-  // =========================================================================
+  // SBINIT uses explicit phase-dependent codes below. These lookup functions
+  // retain the existing MBINIT, MBTRAIN, PHYRETRAIN, and TRAINERROR behavior.
   function automatic logic [7:0] msg_req_code(input ltsm_state_t s);
     case (s)
-      LT_SBINIT:        msg_req_code = MC_SB_DONE_REQ;
       LT_MBINIT_PARAM,
       LT_MBINIT_CAL,
       LT_MBINIT_RPCLK,
@@ -393,21 +419,8 @@ module ltsm #(
     endcase
   endfunction
 
-  // =========================================================================
-  // msg_rsp_code  (Tables 53, 54, 56)
-  // =========================================================================
-  // Returns the response MsgCode for the given state. The response code is
-  // the complement of the request code per the spec pairing convention.
-  //   - SBINIT           -> MC_SB_DONE_RSP  (0x9A)       Table 53
-  //   - MBINIT.*         -> MC_MBINIT_RSP   (0xAA)       Table 54
-  //   - MBTRAIN.*        -> MC_MBTRAIN_RSP  (0xBA)       Table 54
-  //   - PHYRETRAIN       -> MC_PHYR_RSP     (0xCA)       Table 56
-  //   - TRAINERROR       -> MC_TE_RSP       (0xEA)       Table 56
-  //   - All others       -> MC_NOP_CRD      (0x00)
-  // =========================================================================
   function automatic logic [7:0] msg_rsp_code(input ltsm_state_t s);
     case (s)
-      LT_SBINIT:        msg_rsp_code = MC_SB_DONE_RSP;
       LT_MBINIT_PARAM,
       LT_MBINIT_CAL,
       LT_MBINIT_RPCLK,
@@ -431,39 +444,8 @@ module ltsm #(
     endcase
   endfunction
 
-  // =========================================================================
-  // msg_subcode  (Tables 53, 54, 56)
-  // =========================================================================
-  // Returns the MsgSubcode that identifies the specific sub-state within a
-  // state group. The subcode disambiguates messages within MBINIT (six sub-
-  // states sharing MC_MBINIT_REQ/RSP) and MBTRAIN (eleven sub-states sharing
-  // MC_MBTRAIN_REQ/RSP).
-  //
-  // Mapping per state:
-  //   SBINIT           -> MC_SB_OOB_RESET   (0x91)   spec 4.5.3.2
-  //   MBINIT.PARAM     -> MS_PARAM_CFG      (0x00)   spec 4.5.3.3
-  //   MBINIT.CAL       -> MS_CAL_DONE       (0x02)   spec 4.5.3.3
-  //   MBINIT.RPCLK     -> MS_RPCLK_INIT     (0x03)   spec 4.5.3.3
-  //   MBINIT.RPVAL     -> MS_RPVAL_INIT     (0x09)   spec 4.5.3.3
-  //   MBINIT.REVMB     -> MS_REVMB_INIT     (0x0D)   spec 4.5.3.3
-  //   MBINIT.RPMB      -> MS_RPMB_START     (0x11)   spec 4.5.3.3
-  //   MB.VALVREF       -> MS_VALVREF_START  (0x00)   spec 4.5.3.4
-  //   MB.DATAVREF      -> MS_DATAVREF_START (0x02)   spec 4.5.3.4
-  //   MB.SPEEDIDLE     -> MS_SPEEDIDLE_DONE (0x04)   spec 4.5.3.4
-  //   MB.TXSELFCAL     -> MS_TXSELFCAL_DONE(0x05)   spec 4.5.3.4
-  //   MB.RXCLKCAL      -> MS_RXCLKCAL_START (0x06)   spec 4.5.3.4
-  //   MB.VTCENTER      -> MS_VTC_START      (0x08)   spec 4.5.3.4
-  //   MB.DTVREF1       -> MS_DTV_START      (0x0E)   spec 4.5.3.4
-  //   MB.RXDESKEW      -> MS_DESKEW_START   (0x11)   spec 4.5.3.4
-  //   MB.DTCENTER2     -> MS_DTC2_START     (0x13)   spec 4.5.3.4
-  //   MB.LINKSPEED     -> MS_LKS_START      (0x15)   spec 4.5.3.4
-  //   MB.REPAIR        -> MS_REPAIR_INIT    (0x1B)   spec 4.5.3.4
-  //   PHYRETRAIN       -> MS_PHYR_INIT      (0x00)   spec 4.5.3.7
-  //   TRAINERROR       -> MS_TE_ENTRY       (0x00)   spec 4.5.3.8
-  // =========================================================================
   function automatic logic [7:0] msg_subcode(input ltsm_state_t s);
     case (s)
-      LT_SBINIT:        msg_subcode = MC_SB_OOB_RESET;
       LT_MBINIT_PARAM:  msg_subcode = MS_PARAM_CFG;
       LT_MBINIT_CAL:    msg_subcode = MS_CAL_DONE;
       LT_MBINIT_RPCLK:  msg_subcode = MS_RPCLK_INIT;
@@ -487,153 +469,270 @@ module ltsm #(
     endcase
   endfunction
 
-  // =========================================================================
-  // msg_info  (Table 54 MsgInfo field)
-  // =========================================================================
-  // Spec 4.5.3.4 REPAIR – MsgInfo carries a supplementary qualifier for the
-  // REPAIR sub-state. A partner with no repair to perform signals
-  // LinkSpeed.Done (MS_LKS_DONE). This is what two identical endpoints send
-  // to each other. All other states carry MsgInfo = 0x00.
-  // =========================================================================
   function automatic logic [7:0] msg_info(input ltsm_state_t s);
     case (s)
-      LT_MB_REPAIR:    msg_info = MS_LKS_DONE;
-      default:         msg_info = 8'h00;
+      LT_MB_REPAIR: msg_info = MS_LKS_DONE;
+      default:      msg_info = 8'h00;
     endcase
   endfunction
 
   // =========================================================================
-  // Sideband RX message classification  (spec 4.5.3 handshake protocol)
+  // Sideband receive classification
   // =========================================================================
-  // msg_is_req : True when the incoming sideband packet matches the current
-  //              sub-state's request code. Because both endpoints run the
-  //              identical sequence, the partner's request arrives with the
-  //              same opcode as our own.
-  // msg_is_rsp : True when the incoming packet matches the response code AND
-  //              the expected subcode. This covers the asymmetric-partner
-  //              case where the partner sends an explicit response.
-  // can_send   : True when the codec is idle and the local request has not
-  //              yet been sent for this sub-state.
-  // =========================================================================
-  wire msg_is_req  = (sb_rx_opcode == SB_OP_MSG_NODATA) &&
-                     (sb_rx_msgcode == msg_req_code(state_q));
-  wire msg_is_rsp  = (sb_rx_opcode == SB_OP_MSG_NODATA) &&
-                     (sb_rx_msgcode == msg_rsp_code(state_q)) &&
-                     (sb_rx_msgsubcode == msg_subcode(state_q));
+  // Every training packet must be a parity-clean no-data PHY-to-PHY message.
+  // SBINIT compares explicit code/subcode pairs. Later training retains its
+  // existing symmetric request/response acceptance rule.
+  wire rx_phy_msg_valid = sb_rx_pkt_vld &&
+                          !sb_rx_cp_err && !sb_rx_dp_err &&
+                          (sb_rx_opcode == SB_OP_MSG_NODATA) &&
+                          (sb_rx_srcid == SRCID_PHY) &&
+                          (sb_rx_dstid == DSTID_REMOTE_PHY);
 
-  wire can_send = !sb_tx_busy && !req_sent_q;
+  wire sbinit_oor_rx = rx_phy_msg_valid &&
+                       (sb_rx_msgcode == MC_SB_OOB_RESET) &&
+                       (sb_rx_msgsubcode == MS_SB_OOB_RESET);
+  wire sbinit_done_req_rx = rx_phy_msg_valid &&
+                            (sb_rx_msgcode == MC_SB_DONE_REQ) &&
+                            (sb_rx_msgsubcode == MS_SB_DONE);
+  wire sbinit_done_rsp_rx = rx_phy_msg_valid &&
+                            (sb_rx_msgcode == MC_SB_DONE_RSP) &&
+                            (sb_rx_msgsubcode == MS_SB_DONE);
 
-
-  // =========================================================================
-  // Residency timer interface  (spec 4.5 – 8 ms per sub-state timeout)
-  // =========================================================================
-  // Each sub-state pulses tmr_start for 1 cycle on entry (state_q != state_q_prev).
-  // The timer runs while the handshake is pending (timer_start_q && !resp_rcvd_q).
-  // If tmr_expired fires before the handshake completes, the always_comb
-  // block transitions to TRAINERROR (spec 4.5.3.8).
-  // =========================================================================
-  assign tmr_start = (state_q != state_q_prev);
-  // -------------------------------------------------------------------------
-  // assign: Timer Run Enable
-  //
-  // Holds the 8 ms residency timer running while the current sub-state
-  // handshake is pending (timer armed AND response not yet received).
-  // Once resp_rcvd_q is set the timer stops, preventing a late expiry
-  // from incorrectly escalating to TRAINERROR.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
-  // -------------------------------------------------------------------------
-  assign tmr_run   = timer_start_q && !resp_rcvd_q;
+  wire msg_is_req = rx_phy_msg_valid &&
+                    (sb_rx_msgcode == msg_req_code(state_q)) &&
+                    (sb_rx_msgsubcode == msg_subcode(state_q));
+  wire msg_is_rsp = rx_phy_msg_valid &&
+                    (sb_rx_msgcode == msg_rsp_code(state_q)) &&
+                    (sb_rx_msgsubcode == msg_subcode(state_q));
 
   // =========================================================================
-  // Next-state combinational logic  (spec 4.5.3.1 through 4.5.3.9)
+  // Sideband transmit scheduling
   // =========================================================================
-  // This is the main LTSM sequencer. It computes the next state (state_d)
-  // and the next handshake flags (req_sent_d, resp_rcvd_d, timer_start_d,
-  // retrain_req_d) based on the current state, the sideband handshake
-  // status, the residency timer, and the pattern generator status.
-  //
-  // Sub-state boundary detection (state_q != state_q_prev) clears the
-  // handshake flags and re-arms the timer. Within a sub-state:
-  //   - sb_tx_load firing records the local request as sent.
-  //   - A matching RX packet (response or symmetric request) records the
-  //     partner's acknowledgement.
-  //   - When both req_sent_q and resp_rcvd_q are set, the sub-state exit
-  //     condition is met and the state advances to the next in sequence.
-  //
-  // State-specific behaviour is detailed inline with spec sub-section
-  // references.
+  // Out-of-Reset repeats until a valid peer copy arrives. Done responses have
+  // priority over the one local Done request. The pending counter preserves a
+  // separate response obligation for every valid peer Done request.
+  wire generic_send = !state_entry && (state_q != LT_SBINIT) &&
+                      !sb_tx_busy && !req_sent_q &&
+                      (msg_req_code(state_q) != MC_NOP_CRD);
+  wire sbinit_oor_send = (state_q == LT_SBINIT) &&
+                         (sbinit_phase_q == SBI_OUT_OF_RESET) &&
+                         !sbinit_oor_received_q && !sb_tx_busy;
+  wire sbinit_done_rsp_send = (state_q == LT_SBINIT) &&
+                              (sbinit_phase_q == SBI_DONE) &&
+                              (sbinit_done_rsp_pending_q != 8'd0) &&
+                              !sb_tx_busy;
+  wire sbinit_done_req_send = (state_q == LT_SBINIT) &&
+                              (sbinit_phase_q == SBI_DONE) &&
+                              (sbinit_done_rsp_pending_q == 8'd0) &&
+                              !sbinit_done_req_sent_q && !sb_tx_busy;
+
+  // =========================================================================
+  // Timer interfaces
+  // =========================================================================
+  // The residency timer starts only for a new timed LTSM state. Private
+  // SBINIT phases never restart it. The RESET timer has an independent entry
+  // pulse and runs for each complete RESET epoch.
+  assign tmr_start = state_entry && (state_q != LT_RESET) &&
+                     (state_q != LT_ACTIVE) && (state_q != LT_L1L2) &&
+                     (state_q != LT_TRAINERROR);
+  assign rst_tmr_start = reset_entry;
+  assign tmr_run       = timer_start_q;
+
+  // =========================================================================
+  // Next-state and SBINIT policy
   // =========================================================================
   always_comb begin
-    state_d       = state_q;
-    req_sent_d    = req_sent_q;
-    resp_rcvd_d   = resp_rcvd_q;
-    timer_start_d = timer_start_q;
-    reset_min_done_d = reset_min_done_q;
-    retrain_req_d = retrain_req_q;
-    // A new sub-state entry clears the handshake flags and arms the timer.
-    if (state_q != state_q_prev) begin
-      req_sent_d       = 1'b0;
-      resp_rcvd_d      = 1'b0;
-      timer_start_d    = 1'b1;
-      reset_min_done_d = 1'b0;
-    end else begin
-      // Record the local request once the codec accepts it.
-      if (sb_tx_load)            req_sent_d  = 1'b1;
-      // Both endpoints run the identical sequence, so the partner's request
-      // arrives with this sub-state's code and subcode. Accept it as the
-      // response; the explicit response codes cover an asymmetric partner.
-      if (sb_rx_pkt_vld && (msg_is_rsp ||
-                            (msg_is_req &&
-                             sb_rx_msgsubcode == msg_subcode(state_q))))
-        resp_rcvd_d = 1'b1;
-      // Disarm the residency timer once the sub-state handshake completes or
-      // fires, so the next sub-state re-arms on its own entry.
+    state_d                    = state_q;
+    sbinit_phase_d             = sbinit_phase_q;
+    req_sent_d                 = req_sent_q;
+    resp_rcvd_d                = resp_rcvd_q;
+    timer_start_d              = timer_start_q;
+    reset_min_done_d           = reset_min_done_q;
+    retrain_req_d              = retrain_req_q;
+    sbinit_match_streak_d      = sbinit_match_streak_q;
+    pattern_trigger_pending_d  = pattern_trigger_pending_q;
+    sbinit_tail_count_d        = sbinit_tail_count_q;
+    sbinit_window_count_d      = sbinit_window_count_q;
+    sbinit_oor_sent_d          = sbinit_oor_sent_q;
+    sbinit_oor_received_d      = sbinit_oor_received_q;
+    sbinit_done_req_sent_d     = sbinit_done_req_sent_q;
+    sbinit_done_rsp_sent_d     = sbinit_done_rsp_sent_q;
+    sbinit_done_rsp_received_d = sbinit_done_rsp_received_q;
+    sbinit_done_rsp_pending_d  = sbinit_done_rsp_pending_q;
+
+    // State entry resets only state-scoped handshakes. A new RESET epoch also
+    // clears every sticky pattern and SBINIT policy register.
+    if (state_entry) begin
+      req_sent_d    = 1'b0;
+      resp_rcvd_d   = 1'b0;
+      timer_start_d = (state_q != LT_RESET) &&
+                      (state_q != LT_ACTIVE) &&
+                      (state_q != LT_L1L2) &&
+                      (state_q != LT_TRAINERROR);
+
+      if (state_q == LT_RESET) begin
+        reset_min_done_d           = 1'b0;
+        sbinit_phase_d             = SBI_PATTERN_ACTIVE;
+        sbinit_match_streak_d      = 2'd0;
+        pattern_trigger_pending_d  = 1'b0;
+        sbinit_tail_count_d        = 3'd0;
+        sbinit_window_count_d      = 32'd0;
+        sbinit_oor_sent_d          = 1'b0;
+        sbinit_oor_received_d      = 1'b0;
+        sbinit_done_req_sent_d     = 1'b0;
+        sbinit_done_rsp_sent_d     = 1'b0;
+        sbinit_done_rsp_received_d = 1'b0;
+        sbinit_done_rsp_pending_d  = 8'd0;
+      end else if (state_q == LT_SBINIT) begin
+        sbinit_phase_d             = SBI_PATTERN_ACTIVE;
+        sbinit_tail_count_d        = 3'd0;
+        sbinit_window_count_d      = 32'd0;
+        sbinit_oor_sent_d          = 1'b0;
+        sbinit_oor_received_d      = 1'b0;
+        sbinit_done_req_sent_d     = 1'b0;
+        sbinit_done_rsp_sent_d     = 1'b0;
+        sbinit_done_rsp_received_d = 1'b0;
+        sbinit_done_rsp_pending_d  = 8'd0;
+      end
+    end else if (state_q != LT_SBINIT) begin
+      // Preserve the established one-request handshake for later training.
+      if (sb_tx_load) req_sent_d = 1'b1;
+      if (rx_phy_msg_valid && (msg_is_rsp || msg_is_req)) resp_rcvd_d = 1'b1;
       if (resp_rcvd_d || tmr_expired) timer_start_d = 1'b0;
+    end
+
+    // Consume each atomic remote iteration result in lclk. A mismatch clears
+    // only the current streak. The second match sets a sticky epoch trigger.
+    if (!reset_entry && sbinit_rx_iter_vld &&
+        ((state_q == LT_RESET) ||
+         ((state_q == LT_SBINIT) &&
+          ((sbinit_phase_q == SBI_PATTERN_ACTIVE) ||
+           (sbinit_phase_q == SBI_PATTERN_IDLE))))) begin
+      if (sbinit_rx_iter_match) begin
+        if (sbinit_match_streak_q < SBINIT_DETECT_ITERS)
+          sbinit_match_streak_d = sbinit_match_streak_q + 1'b1;
+        if (sbinit_match_streak_q >= (SBINIT_DETECT_ITERS - 1)) begin
+          sbinit_match_streak_d     = SBINIT_DETECT_ITERS;
+          pattern_trigger_pending_d = 1'b1;
+        end
+      end else begin
+        sbinit_match_streak_d = 2'd0;
+      end
     end
 
     case (state_q)
       // -----------------------------------------------------------------
       // 4.5.3.1 RESET
       // -----------------------------------------------------------------
-      // Wait for the adapter to release the reset and for the sideband to
-      // be usable. Spec 4.5.3.1 enforces a minimum 4 ms residency upon
-      // entry to RESET. The exit stimulus is start_link_train (from the top-
-      // level pin or CSR write); transition to SBINIT occurs only after
-      // the 4 ms reset timer has elapsed.
-      // -----------------------------------------------------------------
+      // RESET exits only after the local 4 ms minimum and either the local
+      // training request or the sticky two-consecutive-pattern trigger.
       LT_RESET: begin
         if (rst_tmr_expired) reset_min_done_d = 1'b1;
-        if (start_link_train && (rst_tmr_expired || reset_min_done_q)) state_d = LT_SBINIT;
+        if (!reset_entry && (rst_tmr_expired || reset_min_done_q) &&
+            (start_link_train || pattern_trigger_pending_d))
+          state_d = LT_SBINIT;
       end
 
       // -----------------------------------------------------------------
       // 4.5.3.2 SBINIT
       // -----------------------------------------------------------------
-      // Out-of-band reset handshake. The local side sends SB_DONE_REQ
-      // (MC_SB_DONE_REQ, 0x95) and waits for the partner's SB_DONE_RSP
-      // (MC_SB_DONE_RSP, 0x9A). On completion, transition to
-      // MBINIT.PARAM.
-      // -----------------------------------------------------------------
+      // Pattern policy alternates 1 ms active and 1 ms fully-idle windows
+      // before detection. After detection, the fourth completion event moves
+      // to repeated Out-of-Reset packets. Done uses distinct request and
+      // response obligations and shares this state's single 8 ms deadline.
       LT_SBINIT: begin
-        if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_PARAM;
+        case (sbinit_phase_q)
+          SBI_PATTERN_ACTIVE,
+          SBI_PATTERN_IDLE: begin
+            if (!pattern_trigger_pending_q && pattern_trigger_pending_d) begin
+              sbinit_phase_d        = SBI_PATTERN_ACTIVE;
+              sbinit_tail_count_d   = 3'd0;
+              sbinit_window_count_d = 32'd0;
+            end else if (pattern_trigger_pending_q) begin
+              if (sbinit_tx_iter_done) begin
+                if (sbinit_tail_count_q < SBINIT_POST_DETECT_ITERS)
+                  sbinit_tail_count_d = sbinit_tail_count_q + 1'b1;
+                if (sbinit_tail_count_q == (SBINIT_POST_DETECT_ITERS - 1)) begin
+                  sbinit_phase_d        = SBI_OUT_OF_RESET;
+                  sbinit_window_count_d = 32'd0;
+                end
+              end
+            end else if (sbinit_phase_q == SBI_PATTERN_ACTIVE) begin
+              // Count only while the synchronized primitive is not idle, so
+              // the active window excludes lclk-to-sbclk startup latency.
+              if (!sbinit_tx_idle) begin
+                if (sbinit_window_count_q == (SBINIT_ACTIVE_LCLK_CYCLES - 1)) begin
+                  sbinit_phase_d        = SBI_PATTERN_IDLE;
+                  sbinit_window_count_d = 32'd0;
+                end else begin
+                  sbinit_window_count_d = sbinit_window_count_q + 1'b1;
+                end
+              end
+            end else begin
+              // Start the idle window only after the raw primitive reaches a
+              // low boundary and reports idle back into lclk.
+              if (sbinit_tx_idle) begin
+                if (sbinit_window_count_q == (SBINIT_IDLE_LCLK_CYCLES - 1)) begin
+                  sbinit_phase_d        = SBI_PATTERN_ACTIVE;
+                  sbinit_window_count_d = 32'd0;
+                end else begin
+                  sbinit_window_count_d = sbinit_window_count_q + 1'b1;
+                end
+              end
+            end
+          end
+
+          SBI_OUT_OF_RESET: begin
+            if (sbinit_oor_rx)   sbinit_oor_received_d = 1'b1;
+            if (sbinit_oor_send) sbinit_oor_sent_d     = 1'b1;
+
+            // Preserve an early peer Done request until packet mode reaches
+            // the Done phase. This does not satisfy the response we await.
+            if (sbinit_done_req_rx &&
+                (sbinit_done_rsp_pending_q != 8'hFF))
+              sbinit_done_rsp_pending_d = sbinit_done_rsp_pending_q + 1'b1;
+
+            if (sbinit_oor_sent_d && sbinit_oor_received_d &&
+                !sb_tx_busy && !sb_tx_load)
+              sbinit_phase_d = SBI_DONE;
+          end
+
+          SBI_DONE: begin
+            if (sbinit_done_req_send) sbinit_done_req_sent_d = 1'b1;
+            if (sbinit_done_rsp_send) sbinit_done_rsp_sent_d = 1'b1;
+
+            // Queue every peer request and retire one obligation for every
+            // response accepted by the TX mailbox. Simultaneous events leave
+            // the queue depth unchanged.
+            case ({sbinit_done_req_rx, sbinit_done_rsp_send})
+              2'b10: begin
+                if (sbinit_done_rsp_pending_q != 8'hFF)
+                  sbinit_done_rsp_pending_d = sbinit_done_rsp_pending_q + 1'b1;
+              end
+              2'b01: sbinit_done_rsp_pending_d =
+                       sbinit_done_rsp_pending_q - 1'b1;
+              default: sbinit_done_rsp_pending_d = sbinit_done_rsp_pending_q;
+            endcase
+
+            // An early response cannot complete a request that was not sent.
+            if (sbinit_done_rsp_rx && sbinit_done_req_sent_q)
+              sbinit_done_rsp_received_d = 1'b1;
+
+            if (sbinit_done_req_sent_d && sbinit_done_rsp_sent_d &&
+                sbinit_done_rsp_received_d &&
+                (sbinit_done_rsp_pending_d == 8'd0) &&
+                !sbinit_done_req_rx && !sb_tx_busy && !sb_tx_load) begin
+              state_d       = LT_MBINIT_PARAM;
+              timer_start_d = 1'b0;
+            end
+          end
+
+          default: sbinit_phase_d = SBI_PATTERN_ACTIVE;
+        endcase
       end
 
       // -----------------------------------------------------------------
       // 4.5.3.3 MBINIT sub-states
-      // -----------------------------------------------------------------
-      // Main-band initialisation proceeds through six sub-states in
-      // strict sequence. Each sub-state exchanges MBINIT_REQ (0xA5) /
-      // MBINIT_RSP (0xAA) with the sub-state-specific MsgSubcode.
-      //
-      // PARAM  (02h) : Exchange electrical parameters. Spec 4.5.3.3.
-      // CAL    (03h) : Calibration done handshake.   Spec 4.5.3.3.
-      // RPCLK  (04h) : Clock repair initialisation.  Spec 4.5.3.3.
-      // RPVAL  (05h) : Validation repair init.        Spec 4.5.3.3.
-      // REVMB  (06h) : Main-band reversal.            Spec 4.5.3.3.
-      // RPMB   (07h) : Main-band repair start.        Spec 4.5.3.3.
-      //
-      // After RPMB completes, the LTSM transitions to MBTRAIN.VALVREF.
       // -----------------------------------------------------------------
       LT_MBINIT_PARAM: if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_CAL;
       LT_MBINIT_CAL:   if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_RPCLK;
@@ -645,30 +744,8 @@ module ltsm #(
       // -----------------------------------------------------------------
       // 4.5.3.4 MBTRAIN sub-states
       // -----------------------------------------------------------------
-      // Main-band training proceeds through eleven sub-states. Each
-      // exchanges MBTRAIN_REQ (0xB5) / MBTRAIN_RSP (0xBA) with the
-      // sub-state-specific MsgSubcode.
-      //
-      // VALVREF    (08h) : Validation Vref training.     Spec 4.5.3.4.
-      //                    Pattern: PAT_VALTRAIN (1010).
-      // DATAVREF   (09h) : Data Vref training.           Spec 4.5.3.4.
-      //                    Pattern: PAT_VALTRAIN (1010).
-      // SPEEDIDLE  (0Ah) : Speed/idle negotiation.       Spec 4.5.3.4.
-      // TXSELFCAL  (0Bh) : TX self-calibration.          Spec 4.5.3.4.
-      // RXCLKCAL   (0Ch) : RX clock calibration.         Spec 4.5.3.4.
-      // VTCENTER   (0Dh) : Voltage/timing centering.     Spec 4.5.3.4.
-      // DTVREF1    (0Eh) : Data timing Vref pass 1.      Spec 4.5.3.4.
-      // RXDESKEW   (0Fh) : RX de-skew.                   Spec 4.5.3.4.
-      //                    Pattern: PAT_CLKREPAIR.
-      // DTCENTER2  (10h) : Data timing centering pass 2. Spec 4.5.3.4.
-      // LINKSPEED  (11h) : Link speed negotiation.       Spec 4.5.3.4.
-      // REPAIR     (12h) : Lane repair decision.         Spec 4.5.3.4.
-      //                    May loop back to TXSELFCAL on EXIT_REP/DEG,
-      //                    or proceed to LINKINIT on LKS_DONE.
-      // -----------------------------------------------------------------
-      LT_MB_VALVREF:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_DATAVREF;
-      LT_MB_DATAVREF: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_SPEEDIDLE;
-      // SPEEDIDLE loops back to TXSELFCAL when the partner is not ready.
+      LT_MB_VALVREF:   if (req_sent_q && resp_rcvd_q) state_d = LT_MB_DATAVREF;
+      LT_MB_DATAVREF:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_SPEEDIDLE;
       LT_MB_SPEEDIDLE: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_TXSELFCAL;
       LT_MB_TXSELFCAL: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_RXCLKCAL;
       LT_MB_RXCLKCAL:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_VTCENTER;
@@ -677,19 +754,12 @@ module ltsm #(
       LT_MB_RXDESKEW:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_DTCENTER2;
       LT_MB_DTCENTER2: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_LINKSPEED;
       LT_MB_LINKSPEED: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_REPAIR;
-      // -----------------------------------------------------------------
-      // 4.5.3.4 REPAIR sub-state  (spec 4.5.3.4 REPAIR)
-      // -----------------------------------------------------------------
-      // The REPAIR sub-state reads MsgInfo from the partner to determine
-      // the next action:
-      //   MS_LKS_EXIT_REP (0x17) : Loop back to TXSELFCAL for repair.
-      //   MS_LKS_EXIT_DEG (0x18) : Degrade to x8, loop to TXSELFCAL.
-      //   MS_LKS_DONE     (0x19) : Training complete, proceed to LINKINIT.
-      // -----------------------------------------------------------------
+
       LT_MB_REPAIR: begin
         if (req_sent_q && resp_rcvd_q) begin
-          if (sb_rx_msginfo == MS_LKS_EXIT_REP) state_d = LT_MB_TXSELFCAL;
-          else if (sb_rx_msginfo == MS_LKS_EXIT_DEG) begin
+          if (sb_rx_msginfo == MS_LKS_EXIT_REP) begin
+            state_d = LT_MB_TXSELFCAL;
+          end else if (sb_rx_msginfo == MS_LKS_EXIT_DEG) begin
             state_d = LT_MB_TXSELFCAL;
           end else if (sb_rx_msginfo == MS_LKS_DONE) begin
             state_d = LT_LINKINIT;
@@ -698,56 +768,24 @@ module ltsm #(
       end
 
       // -----------------------------------------------------------------
-      // 4.5.3.5 LINKINIT
-      // -----------------------------------------------------------------
-      // Reseed the per-lane LFSRs (pat_lfsr_reset asserted) and run the
-      // LFSR pattern for 4096 UI (pat_select = PAT_LFSR). The sub-state
-      // exits when the pattern generator asserts pat_done, transitioning
-      // the LTSM to ACTIVE.
+      // 4.5.3.5 LINKINIT through 4.5.3.9 terminal/runtime states
       // -----------------------------------------------------------------
       LT_LINKINIT: begin
         if (pat_done) state_d = LT_ACTIVE;
       end
 
-      // -----------------------------------------------------------------
-      // 4.5.3.6 ACTIVE
-      // -----------------------------------------------------------------
-      // Data may flow on the main band. The link holds ACTIVE until a
-      // retrain request (retrain_req_q) transitions to PHYRETRAIN, or
-      // until a LINKRESET arrives (handled by the global timeout/error
-      // logic below).
-      // -----------------------------------------------------------------
       LT_ACTIVE: begin
-        if (retrain_req_q)  state_d = LT_PHYRETRAIN;
+        if (retrain_req_q) state_d = LT_PHYRETRAIN;
       end
 
-      // -----------------------------------------------------------------
-      // 4.5.3.7 PHYRETRAIN
-      // -----------------------------------------------------------------
-      // Re-run the requested subset of training. The sideband exchanges
-      // PHYR_REQ (0xC5) / PHYR_RSP (0xCA). On completion the LTSM
-      // returns to ACTIVE.
-      // -----------------------------------------------------------------
       LT_PHYRETRAIN: begin
         if (req_sent_q && resp_rcvd_q) state_d = LT_ACTIVE;
       end
 
-      // -----------------------------------------------------------------
-      // 4.5.3.9 L1L2 (low-power)
-      // -----------------------------------------------------------------
-      // Hold in low-power state until the adapter re-requests training
-      // (start_link_train), which returns the LTSM to RESET.
-      // -----------------------------------------------------------------
       LT_L1L2: begin
         if (start_link_train) state_d = LT_RESET;
       end
 
-      // -----------------------------------------------------------------
-      // 4.5.3.8 TRAINERROR
-      // -----------------------------------------------------------------
-      // Unrecoverable training failure. Only a LINKRESET (via
-      // start_link_train) clears this state and returns to RESET.
-      // -----------------------------------------------------------------
       LT_TRAINERROR: begin
         if (start_link_train) state_d = LT_RESET;
       end
@@ -755,73 +793,63 @@ module ltsm #(
       default: state_d = LT_RESET;
     endcase
 
-    // -------------------------------------------------------------------
-    // Residency timeout escalation to TRAINERROR (Section 4.5.3.8)
-    // -------------------------------------------------------------------
-    // If the 8 ms residency timer expires while a training sub-state
-    // handshake is pending, the LTSM escalates to TRAINERROR. States
-    // ACTIVE, L1L2, and TRAINERROR are exempt (they have no handshake
-    // deadline).
-    // -------------------------------------------------------------------
-    if (tmr_expired && timer_start_q && state_q != LT_ACTIVE &&
-        state_q != LT_L1L2 && state_q != LT_TRAINERROR && state_q != LT_RESET) begin
+    // Every timed training state uses one uninterrupted residency deadline.
+    if (tmr_expired && timer_start_q &&
+        (state_q != LT_ACTIVE) && (state_q != LT_L1L2) &&
+        (state_q != LT_TRAINERROR) && (state_q != LT_RESET)) begin
       state_d       = LT_TRAINERROR;
       timer_start_d = 1'b0;
     end
-
-    // A sideband parity error is a correctable event in this model.
-    // Non-fatal errors do not disturb the training sequence.
   end
 
+  // =========================================================================
+  // Sideband TX packet interface
+  // =========================================================================
+  // The specialized SBINIT scheduler selects 91h/00h, 95h/01h, or 9Ah/01h.
+  // All other training states use the existing lookup tables. Every Physical
+  // Layer training packet uses the UCIe-Link PHY source and remote-PHY IDs.
+  assign sb_tx_load = generic_send || sbinit_oor_send ||
+                      sbinit_done_rsp_send || sbinit_done_req_send;
+  assign sb_tx_opcode = SB_OP_MSG_NODATA;
+  assign sb_tx_srcid = SRCID_PHY;
+  assign sb_tx_dstid = DSTID_REMOTE_PHY;
+  assign sb_tx_msginfo = sbinit_oor_send ? SBINIT_RESULT_PRIMARY :
+                                              msg_info(state_q);
+  assign sb_tx_msgcode = sbinit_oor_send      ? MC_SB_OOB_RESET :
+                             sbinit_done_rsp_send ? MC_SB_DONE_RSP  :
+                             sbinit_done_req_send ? MC_SB_DONE_REQ  :
+                                                    msg_req_code(state_q);
+  assign sb_tx_msgsubcode = sbinit_oor_send      ? MS_SB_OOB_RESET :
+                                (sbinit_done_rsp_send ||
+                                 sbinit_done_req_send) ? MS_SB_DONE :
+                                                        msg_subcode(state_q);
+  assign sb_tx_be       = 8'h00;
+  assign sb_tx_tag      = 5'h00;
+  assign sb_tx_ep       = 1'b0;
+  assign sb_tx_addr     = 12'h000;
+  assign sb_tx_data_in  = 64'h0;
+  assign sb_tx_has_data = 1'b0;
+  assign sb_msg_timeout = 1'b0;
+  assign sb_stall_sent  = 1'b0;
 
   // =========================================================================
-  // Sideband TX interface  (spec 4.5.3 sideband request channel)
+  // Raw SBINIT primitive controls
   // =========================================================================
-  // The LTSM emits the request for the current sub-state when the codec is
-  // free (can_send) and the state has a valid request code (not NOP_CRD).
-  // All messages use opcode SB_OP_MSG_NODATA (message without data payload),
-  // srcid/dstid = SRCID_STACK0, and no data/tag/addr/BE/EP fields.
-  //
-  // sb_msg_timeout and sb_stall_sent are tied to zero: message timeout
-  // recovery and stall insertion are not implemented in this build.
-  // =========================================================================
-  assign sb_tx_load      = can_send && (msg_req_code(state_q) != MC_NOP_CRD);
-  // -------------------------------------------------------------------------
-  // assign (group): Sideband TX Packet Field Tie-Offs
-  //
-  // These 14 continuous assignments drive the fixed fields of every
-  // sideband message transmitted by the LTSM:
-  //   sb_tx_opcode     – SB_OP_MSG_NODATA; all LTSM messages are headerless.
-  //   sb_tx_srcid      – SRCID_STACK0; this endpoint's stack identifier.
-  //   sb_tx_dstid      – SRCID_STACK0; partner shares the same stack.
-  //   sb_tx_msginfo    – msg_info(state_q); non-zero only in REPAIR.
-  //   sb_tx_msgcode    – msg_req_code(state_q); request code per Tables 53/54.
-  //   sb_tx_msgsubcode – msg_subcode(state_q); sub-state disambiguator.
-  //   sb_tx_be         – 8'h00; no byte-enable (no data payload).
-  //   sb_tx_tag        – 5'h00; tag unused for training messages.
-  //   sb_tx_ep         – 1'b0;  no error/poison bit.
-  //   sb_tx_addr       – 12'h000; no register address targeted.
-  //   sb_tx_data_in    – 64'h0; no data payload.
-  //   sb_tx_has_data   – 1'b0;  marks packet as header-only.
-  //   sb_msg_timeout   – 1'b0;  timeout recovery not implemented.
-  //   sb_stall_sent    – 1'b0;  stall insertion not implemented.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.2 - Packet Formats.
-  // -------------------------------------------------------------------------
-  assign sb_tx_opcode    = SB_OP_MSG_NODATA;
-  assign sb_tx_srcid     = SRCID_STACK0;
-  assign sb_tx_dstid     = SRCID_STACK0;
-  assign sb_tx_msginfo   = msg_info(state_q);
-  assign sb_tx_msgcode   = msg_req_code(state_q);
-  assign sb_tx_msgsubcode= msg_subcode(state_q);
-  assign sb_tx_be        = 8'h00;
-  assign sb_tx_tag       = 5'h00;
-  assign sb_tx_ep        = 1'b0;
-  assign sb_tx_addr      = 12'h000;
-  assign sb_tx_data_in   = 64'h0;
-  assign sb_tx_has_data  = 1'b0;
-  assign sb_msg_timeout  = 1'b0;
-  assign sb_stall_sent   = 1'b0;
+  // Raw receive mode includes RESET and both pattern windows. The transmitter
+  // runs throughout an active pre-detection window. After detection it drops
+  // the level after the third observed completion, while the already-started
+  // fourth iteration finishes at its low boundary. The fourth event advances
+  // the LTSM to packet mode.
+  assign sbinit_raw_mode = (state_q == LT_RESET) ||
+                           ((state_q == LT_SBINIT) &&
+                            ((sbinit_phase_q == SBI_PATTERN_ACTIVE) ||
+                             (sbinit_phase_q == SBI_PATTERN_IDLE)));
+
+  assign pattern_run_enable = (state_q == LT_SBINIT) &&
+                              (sbinit_phase_q == SBI_PATTERN_ACTIVE) &&
+                              (!pattern_trigger_pending_q ||
+                               (sbinit_tail_count_q <
+                                (SBINIT_POST_DETECT_ITERS - 1)));
 
   // =========================================================================
   // Pattern generator control  (spec 4.5.3.4, 4.5.3.5)

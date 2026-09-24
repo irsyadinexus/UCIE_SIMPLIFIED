@@ -471,3 +471,127 @@ Strategy (legal, does not change RTL timer values):
 | Data | same run | `RAW MODE TRANSFER OK (die0->die1)` and `(die1->die0)` |
 | Coverage | `make -C sim coverage` | every counter non-zero; `COVERAGE: 100%` |
 | Full | `make -C sim all` | exit 0 |
+
+---
+
+## 14. Approved SBINIT Delayed-Start Plan
+
+### 14.1 Goal
+
+Implement the Standard Package SBINIT procedure so that independent Die 0 and
+Die 1 Stage 0 completion times can differ. The first required integration
+scenario releases Die 1 from reset 2.5 ms after Die 0 and must complete link
+bring-up.
+
+This plan preserves the existing `ucie_main -> d2d_adapter + logical_phy`
+topology. It does not change FDI, RDI, or external main-band interface
+definitions.
+
+### 14.2 Scope
+
+The implementation changes only:
+
+- `rtl/rtl_common/ucie_pkg.sv`
+- `rtl/logical_phy/sb_codec.sv`
+- `rtl/logical_phy/ltsm.sv`
+- `rtl/logical_phy/logical_phy.sv`
+- focused unit tests, loopback checks, coverage, and simulation targets
+
+`d2d_adapter` remains unchanged. The paired lclk/sbclk CDC mailbox inside each
+logical PHY remains unchanged. Each die can have an independent reset pair, but
+the lclk and sbclk resets inside one die must assert together.
+
+### 14.3 Protocol Requirements
+
+Implement the Standard Package sequence in UCIe 1.0 Section 4.5.3.2:
+
+1. After the local 4 ms RESET minimum, a die can enter SBINIT after either a
+   local training trigger or a received SBINIT-pattern trigger.
+2. The received-pattern trigger requires two consecutive valid remote
+   iterations. Each iteration is 64 UI of the SBINIT clock pattern plus 32 UI
+   low.
+3. A detected pattern trigger is sticky for the current RESET epoch. It cannot
+   bypass the 4 ms minimum.
+4. A die sends 64 UI of the SBINIT clock pattern followed by 32 UI low.
+5. After detection, it sends exactly four more local iterations.
+6. Before detection, it uses 1 ms pattern-active and 1 ms idle windows.
+7. It sends `{SBINIT Out of Reset}` (`91h`/`00h`) until it receives the same
+   valid peer message.
+8. It sends `{SBINIT done req}` (`95h`/`01h`).
+9. It sends `{SBINIT done resp}` (`9Ah`/`01h`) for each valid peer Done request.
+10. It enters MBINIT only after its Done request and peer Done response complete.
+
+All SBINIT phases share the existing 8 ms residency deadline. A request is not a
+response. Invalid parity, IDs, opcode, code, and subcode must not advance state.
+
+### 14.4 RTL Design
+
+`ucie_pkg.sv` becomes the sole definition site for SBINIT constants. Add PHY
+source ID `3'b010`, remote-PHY destination ID `3'b110`, SBINIT message
+subcodes, and named pattern/retry limits.
+
+`ltsm.sv` owns the complete SBINIT sequence in the 500 MHz `lclk` domain.
+It owns the pattern, Out-of-Reset, and Done phases, all retry and timeout
+policy, and every state transition. During RESET it maintains a saturating
+two-match streak from atomic remote-iteration results. The second consecutive
+match latches a pattern training trigger for the RESET epoch.
+
+LT_RESET exits only after its 4 ms minimum and either
+`start_link_train` or the latched pattern trigger. Under the existing public
+interface, deasserted local reset represents that local Stage 0 no longer holds
+the PHY in RESET. No new public readiness port is added. LTSM retains a detected
+pattern across RESET-to-SBINIT, counts four local tail-iteration completions,
+and schedules `91h`/`00h`, `95h`/`01h`, and `9Ah`/`01h` through the existing
+lclk-facing packet interface.
+
+`sb_codec.sv` remains an sbclk-only sideband message codec. It serializes and
+parses sideband messages, but it does not contain an SBINIT phase machine,
+retry policy, timeout, iteration counter, or LTSM state transition.
+
+`logical_phy.sv` owns the lclk-to-sbclk transport. Its rate-adapter CDC
+primitive listens for remote pattern iterations whenever the local reset pair
+is released, including while LTSM is in RESET.
+
+LTSM controls transmission with one stable `pattern_run_enable` level. While
+the synchronized level is high, the primitive repeats the 64-UI pattern plus
+32-UI-low waveform without a CDC round trip between iterations. When LTSM
+deasserts the level, the primitive finishes the current waveform and stops at
+the following low boundary. The primitive does not choose when to start, stop,
+retry, idle, or advance any SBINIT phase.
+
+The primitive sends each remote iteration through an atomic one-bit result
+mailbox, where the payload is match or mismatch. It sends each local completed
+iteration through a separate event mailbox. LTSM consumes both events in lclk.
+It uses local iteration-completion events to enforce the four-tail count and
+its own lclk timers to enforce the 1 ms active and 1 ms idle policy.
+
+The primitive cannot store a detected state, count consecutive matches or tail
+iterations, report a collapsed `pattern_detected` or `sbinit_complete` level,
+or contain training policy. Reset pairs remain aligned within each die so these
+CDC mailboxes retain their documented reset contract.
+
+Split RESET-timer restart from general residency-timer restart so the RESET
+timer starts only when RESET is entered.
+
+### 14.5 Verification
+
+Add `tb/unit/ut_sbinit.sv` for exact SBINIT pattern, atomic match/mismatch
+events, two-consecutive-match triggering during RESET, four tail iterations,
+Out-of-Reset, Done ordering, invalid packet, and timeout behavior. Update
+`ut_sb_codec.sv` for the three SBINIT message encodings. Update `ut_ltsm.sv`
+for the pattern-trigger RESET exit, explicit request/response behavior, and the
+true 8 ms timeout.
+
+Update `tb/loopback/tb_loopback_top.sv` to use independent local reset pairs.
+Release Die 1 reset 2.5 ms after Die 0. Assert Die 0's local training trigger,
+but leave Die 1's trigger low. Require the received SBINIT pattern to start
+Die 1 after its own 4 ms RESET minimum. Check reset duration, the Stage 0 skew,
+SBINIT order, absence of early main-band activity, both ACTIVE observations,
+and both Raw Mode data directions. Use a 20 ms integration watchdog.
+
+Extend `cov_monitor.sv` with per-die SBINIT phase and message-subcode evidence.
+The required final gate is:
+
+```text
+make -C sim clean && make -C sim all
+```

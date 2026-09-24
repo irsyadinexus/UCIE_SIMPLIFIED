@@ -17,8 +17,10 @@
 //
 // The test covers two independent scenarios:
 //
-//   1.  Happy-Path Training Walk
-//       The LTSM is started and driven through the complete training flow:
+//   1.  Pattern-Triggered Training Walk
+//       After the true 4 ms RESET minimum, atomic match/mismatch results drive
+//       remote-pattern entry. Four tail events and explicit SBINIT packets
+//       then lead into the complete later training flow:
 //         RESET → SBINIT → MBINIT_PARAM → MBINIT_CAL → MBINIT_RPCLK →
 //         MBINIT_RPVAL → MBINIT_REVMB → MBINIT_RPMB → MB_VALVREF →
 //         MB_DATAVREF → MB_SPEEDIDLE → MB_TXSELFCAL → MB_RXCLKCAL →
@@ -38,10 +40,10 @@
 //
 // STIMULUS
 // --------
-// A partner sb_codec instance deserializes messages sent by the local
-// codec and a responder always block echoes every received request back
-// as the matching response (swapping src/dst and mapping request message
-// codes to their response counterparts via the rsp_for() function).
+// Direct lclk packet injection controls the SBINIT response ordering. After
+// SBINIT, a partner sb_codec deserializes local messages and the responder
+// maps each later training request to its matching response. Both packet
+// codecs remain behind the asynchronous mailboxes.
 //
 // A simple 14-bit counter replaces the real LFSR pattern generator.
 // When the counter reaches LFSR_PATTERN_UI-1, the pat_done flag is
@@ -154,6 +156,9 @@
 //                        lclk. The test now exercises the LTSM CDC boundary.
 //   v0.0.6  2026-09-23  Req.3: remove the obsolete single-clock-domain
 //                        description from the test header.
+//   v0.0.7  2026-09-24  Verify pattern-triggered RESET exit, mismatch streak
+//                        reset, four tail events, explicit SBINIT Done order,
+//                        invalid packets, and the true 8 ms timeout.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -170,8 +175,11 @@ module ut_ltsm;
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
   logic        sb_msg_timeout, sb_stall_sent;
+  logic        pattern_run_enable, sbinit_raw_mode;
+  logic        sbinit_rx_iter_vld, sbinit_rx_iter_match;
+  logic        sbinit_tx_iter_done, sbinit_tx_idle;
   logic        pat_enable, pat_lfsr_reset, pat_lfsr_enable, pat_done;
-  logic        tmr_start, tmr_run, tmr_expired;
+  logic        tmr_start, tmr_run, rst_tmr_start, tmr_expired;
   int          errors;
 
   // LTSM <-> local codec
@@ -194,6 +202,20 @@ module ut_ltsm;
   logic [2:0]  sb_rx_srcid, sb_rx_dstid;
   logic [7:0]  sb_rx_msginfo, sb_rx_msgcode, sb_rx_msgsubcode;
   logic        sb_rx_cp_err, sb_rx_dp_err;
+
+  // Direct packet injection is used only for deterministic SBINIT ordering
+  // checks. Later training packets still traverse both codecs and mailboxes.
+  logic        inject_rx_pkt_vld;
+  logic [4:0]  inject_rx_opcode;
+  logic [2:0]  inject_rx_srcid, inject_rx_dstid;
+  logic [7:0]  inject_rx_msginfo, inject_rx_msgcode;
+  logic [7:0]  inject_rx_msgsubcode;
+  logic        inject_rx_cp_err, inject_rx_dp_err;
+  logic        cdc_rx_pkt_vld;
+  logic [4:0]  cdc_rx_opcode;
+  logic [2:0]  cdc_rx_srcid, cdc_rx_dstid;
+  logic [7:0]  cdc_rx_msginfo, cdc_rx_msgcode, cdc_rx_msgsubcode;
+  logic        cdc_rx_cp_err, cdc_rx_dp_err;
 
   // Req.3 CDC signals. The LTSM remains in lclk. The local codec remains in
   // sbclk, so complete sideband packets cross through the same mailboxes used
@@ -274,9 +296,16 @@ module ut_ltsm;
     .sb_rx_msgsubcode(sb_rx_msgsubcode),
     .sb_rx_cp_err(sb_rx_cp_err), .sb_rx_dp_err(sb_rx_dp_err),
     .sb_msg_timeout(sb_msg_timeout), .sb_stall_sent(sb_stall_sent),
+    .pattern_run_enable(pattern_run_enable),
+    .sbinit_raw_mode(sbinit_raw_mode),
+    .sbinit_rx_iter_vld(sbinit_rx_iter_vld),
+    .sbinit_rx_iter_match(sbinit_rx_iter_match),
+    .sbinit_tx_iter_done(sbinit_tx_iter_done),
+    .sbinit_tx_idle(sbinit_tx_idle),
     .pat_enable(pat_enable), .pat_select(), .pat_lfsr_reset(pat_lfsr_reset),
     .pat_lfsr_enable(pat_lfsr_enable), .pat_done(pat_done),
-    .tmr_start(tmr_start), .tmr_run(tmr_run), .tmr_expired(tmr_expired),
+    .tmr_start(tmr_start), .tmr_run(tmr_run),
+    .rst_tmr_start(rst_tmr_start), .tmr_expired(tmr_expired),
     .rst_tmr_expired(rst_tmr_expired)
   );
 // ---------------------------------------------------------------------------
@@ -337,11 +366,26 @@ module ut_ltsm;
                loc_rx_msgcode, loc_rx_msgsubcode, loc_rx_cp_err, loc_rx_dp_err}),
     .src_send(loc_rx_pkt_vld), .src_busy(rx_cdc_busy),
     .dst_clk(lclk), .dst_reset_n(lreset_n),
-    .dst_data(rx_cdc_data), .dst_valid(sb_rx_pkt_vld)
+    .dst_data(rx_cdc_data), .dst_valid(cdc_rx_pkt_vld)
   );
-  assign {sb_rx_opcode, sb_rx_srcid, sb_rx_dstid, sb_rx_msginfo,
-          sb_rx_msgcode, sb_rx_msgsubcode, sb_rx_cp_err, sb_rx_dp_err} =
-         rx_cdc_data;
+  assign {cdc_rx_opcode, cdc_rx_srcid, cdc_rx_dstid, cdc_rx_msginfo,
+          cdc_rx_msgcode, cdc_rx_msgsubcode, cdc_rx_cp_err,
+          cdc_rx_dp_err} = rx_cdc_data;
+
+  // Select a direct lclk packet only while its one-cycle valid pulse is high.
+  // This isolates SBINIT request/response ordering from codec serialization.
+  always_comb begin
+    sb_rx_pkt_vld    = inject_rx_pkt_vld || cdc_rx_pkt_vld;
+    sb_rx_opcode     = inject_rx_pkt_vld ? inject_rx_opcode : cdc_rx_opcode;
+    sb_rx_srcid      = inject_rx_pkt_vld ? inject_rx_srcid : cdc_rx_srcid;
+    sb_rx_dstid      = inject_rx_pkt_vld ? inject_rx_dstid : cdc_rx_dstid;
+    sb_rx_msginfo    = inject_rx_pkt_vld ? inject_rx_msginfo : cdc_rx_msginfo;
+    sb_rx_msgcode    = inject_rx_pkt_vld ? inject_rx_msgcode : cdc_rx_msgcode;
+    sb_rx_msgsubcode = inject_rx_pkt_vld ? inject_rx_msgsubcode :
+                                            cdc_rx_msgsubcode;
+    sb_rx_cp_err     = inject_rx_pkt_vld ? inject_rx_cp_err : cdc_rx_cp_err;
+    sb_rx_dp_err     = inject_rx_pkt_vld ? inject_rx_dp_err : cdc_rx_dp_err;
+  end
 
 // ---------------------------------------------------------------------------
 // Partner Sideband Codec: sb_codec u_par
@@ -372,7 +416,31 @@ module ut_ltsm;
     .rx_cp_err(par_rx_cp_err), .rx_dp_err(par_rx_dp_err)
   );
 
-  logic par_enable_resp = 1'b1;
+  logic par_enable_resp;
+  integer local_oor_count;
+  integer local_done_count;
+  logic [7:0] local_done_code [0:3];
+
+  // Record only the local SBINIT packets received by the partner codec. The
+  // directed sequence later checks that a queued peer request causes a Done
+  // response before the local Done request.
+  always @(posedge sbclk or negedge sbreset_n) begin
+    if (!sbreset_n) begin
+      local_oor_count  <= 0;
+      local_done_count <= 0;
+    end else if (par_rx_pkt_vld && !par_rx_cp_err && !par_rx_dp_err) begin
+      if ((par_rx_msgcode == MC_SB_OOB_RESET) &&
+          (par_rx_msgsubcode == MS_SB_OOB_RESET))
+        local_oor_count <= local_oor_count + 1;
+      if (((par_rx_msgcode == MC_SB_DONE_REQ) ||
+           (par_rx_msgcode == MC_SB_DONE_RSP)) &&
+          (par_rx_msgsubcode == MS_SB_DONE) && (local_done_count < 4)) begin
+        local_done_code[local_done_count] <= par_rx_msgcode;
+        local_done_count <= local_done_count + 1;
+      end
+    end
+  end
+
 // ---------------------------------------------------------------------------
 // Responder Always Block
 // ---------------------------------------------------------------------------
@@ -386,9 +454,9 @@ module ut_ltsm;
 // The guard signal par_enable_resp allows the timeout test to silence
 // the partner and verify the TRAINERROR path.
 //
-// Responder: on each received request, send the paired response with the
-// same subcode. The LTSM accepts a request whose subcode matches its own as
-// a response, so a symmetric echo completes the handshake either way.
+// The responder stays disabled during the directed SBINIT checks. It then
+// sends the paired response for each later training request with the same
+// subcode, preserving the established post-SBINIT handshake behavior.
   always @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       par_tx_load  <= 1'b0;
@@ -409,8 +477,8 @@ module ut_ltsm;
       if (par_enable_resp && par_rx_pkt_vld && !par_tx_busy && !par_tx_load) begin
         par_tx_load    <= 1'b1;
         par_tx_opcode  <= par_rx_opcode;
-        par_tx_srcid   <= par_rx_dstid;
-        par_tx_dstid   <= par_rx_srcid;
+        par_tx_srcid   <= SRCID_PHY;
+        par_tx_dstid   <= DSTID_REMOTE_PHY;
         par_tx_msginfo <= (par_rx_msgsubcode == MS_REPAIR_INIT)
                           ? MS_LKS_DONE : par_rx_msginfo;
         par_tx_msgcode <= rsp_for(par_rx_msgcode);
@@ -492,7 +560,7 @@ module ut_ltsm;
 //
 // Reset Timer: True to spec (LIMIT_CYCLES=C_RESET_MIN = 2,000,000 lclk cycles = 4 ms).
   ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN)) u_rst_tmr (
-    .clk(lclk), .reset_n(lreset_n), .start(tmr_start),
+    .clk(lclk), .reset_n(lreset_n), .start(rst_tmr_start),
     .running(ltsm_state == ucie_pkg::LT_RESET), .expired(rst_tmr_expired)
   );
 
@@ -549,6 +617,58 @@ module ut_ltsm;
     end
   end
 
+  // Deliver one atomic remote-iteration result in the LTSM clock domain.
+  task pulse_rx_iteration;
+    input logic match;
+    begin
+      @(negedge lclk);
+      sbinit_rx_iter_match = match;
+      sbinit_rx_iter_vld   = 1'b1;
+      @(posedge lclk);
+      #0.1;
+      @(negedge lclk);
+      sbinit_rx_iter_vld   = 1'b0;
+    end
+  endtask
+
+  // Deliver one complete local 64-UI pattern plus 32-UI-low iteration event.
+  task pulse_tx_iteration_done;
+    begin
+      @(negedge lclk);
+      sbinit_tx_iter_done = 1'b1;
+      @(posedge lclk);
+      #0.1;
+      @(negedge lclk);
+      sbinit_tx_iter_done = 1'b0;
+    end
+  endtask
+
+  // Inject one complete sideband header at the direct lclk endpoint. The
+  // caller controls the IDs and parity to exercise acceptance boundaries.
+  task inject_sbinit_packet;
+    input logic [7:0] code;
+    input logic [7:0] subcode;
+    input logic [2:0] srcid;
+    input logic [2:0] dstid;
+    input logic       cp_err;
+    begin
+      @(negedge lclk);
+      inject_rx_opcode     = SB_OP_MSG_NODATA;
+      inject_rx_srcid      = srcid;
+      inject_rx_dstid      = dstid;
+      inject_rx_msginfo    = 8'h00;
+      inject_rx_msgcode    = code;
+      inject_rx_msgsubcode = subcode;
+      inject_rx_cp_err     = cp_err;
+      inject_rx_dp_err     = 1'b0;
+      inject_rx_pkt_vld    = 1'b1;
+      @(posedge lclk);
+      #0.1;
+      @(negedge lclk);
+      inject_rx_pkt_vld    = 1'b0;
+    end
+  endtask
+
   task expect_state;
     input ltsm_state_t exp;
     begin
@@ -572,29 +692,154 @@ module ut_ltsm;
   endtask
 
   initial begin
-    errors = 0;
-    seen_n = 0;
-    lreset_n        = 1'b0;
-    sbreset_n       = 1'b0;
-    start_link_train= 1'b0;
+    errors             = 0;
+    seen_n             = 0;
+    lreset_n           = 1'b0;
+    sbreset_n          = 1'b0;
+    start_link_train   = 1'b0;
     adapter_active_req = 1'b0;
+    sbinit_rx_iter_vld   = 1'b0;
+    sbinit_rx_iter_match = 1'b0;
+    sbinit_tx_iter_done  = 1'b0;
+    sbinit_tx_idle       = 1'b1;
+    inject_rx_pkt_vld    = 1'b0;
+    inject_rx_opcode     = '0;
+    inject_rx_srcid      = '0;
+    inject_rx_dstid      = '0;
+    inject_rx_msginfo    = '0;
+    inject_rx_msgcode    = '0;
+    inject_rx_msgsubcode = '0;
+    inject_rx_cp_err     = 1'b0;
+    inject_rx_dp_err     = 1'b0;
+    par_enable_resp      = 1'b0;
     #5;
-    lreset_n        = 1'b1;
-    sbreset_n       = 1'b1;
+    lreset_n           = 1'b1;
+    sbreset_n          = 1'b1;
+    adapter_active_req = 1'b1;
 
-    // RESET must hold until training is requested.
-    @(negedge lclk);
-    if (ltsm_state !== ucie_pkg::LT_RESET) begin
-      $display("FAIL ut_ltsm: not in RESET after power-on");
+    // Keep the local request low. RESET must remain until its true 4 ms
+    // minimum expires and the remote detector reports two consecutive matches.
+    @(posedge rst_tmr_expired);
+    #0.1;
+    if (ltsm_state !== LT_RESET || start_link_train !== 1'b0) begin
+      $display("FAIL ut_ltsm: RESET left before a remote pattern trigger");
       errors = errors + 1;
     end
 
-    start_link_train = 1'b1;
-    adapter_active_req = 1'b1;
+    // A mismatch breaks the streak. The following single match must not exit
+    // RESET even though the 4 ms condition is already satisfied.
+    pulse_rx_iteration(1'b1);
+    if (u_dut.sbinit_match_streak_q !== 2'd1) begin
+      $display("FAIL ut_ltsm: first remote match was not counted");
+      errors = errors + 1;
+    end
+    pulse_rx_iteration(1'b0);
+    if (u_dut.sbinit_match_streak_q !== 2'd0) begin
+      $display("FAIL ut_ltsm: mismatch did not clear the match streak");
+      errors = errors + 1;
+    end
+    pulse_rx_iteration(1'b1);
+    if ((ltsm_state !== LT_RESET) ||
+        (u_dut.sbinit_match_streak_q !== 2'd1)) begin
+      $display("FAIL ut_ltsm: one post-mismatch match triggered RESET exit");
+      errors = errors + 1;
+    end
+    pulse_rx_iteration(1'b1);
+    if ((ltsm_state !== LT_SBINIT) ||
+        (u_dut.pattern_trigger_pending_q !== 1'b1)) begin
+      $display("FAIL ut_ltsm: two matches did not trigger SBINIT after 4 ms");
+      errors = errors + 1;
+    end
 
-    // Walk every sub-state in order. Each call blocks until the LTSM moves on.
-    expect_state(LT_RESET);
-    expect_state(LT_SBINIT);
+    // The pattern trigger is retained across RESET exit. Exactly four local
+    // iteration-completion events are required before packet mode begins.
+    repeat (2) @(posedge lclk);
+    #0.1;
+    for (int tail = 1; tail <= SBINIT_POST_DETECT_ITERS; tail = tail + 1) begin
+      pulse_tx_iteration_done();
+      if (u_dut.sbinit_tail_count_q !== tail[2:0]) begin
+        $display("FAIL ut_ltsm: tail count got %0d expected %0d",
+                 u_dut.sbinit_tail_count_q, tail);
+        errors = errors + 1;
+      end
+      if ((tail < SBINIT_POST_DETECT_ITERS) &&
+          (u_dut.sbinit_phase_q !== 2'd0)) begin
+        $display("FAIL ut_ltsm: packet phase started after only %0d tails", tail);
+        errors = errors + 1;
+      end
+      if ((tail < (SBINIT_POST_DETECT_ITERS - 1)) &&
+          (pattern_run_enable !== 1'b1)) begin
+        $display("FAIL ut_ltsm: raw transmitter stopped before tail %0d", tail + 1);
+        errors = errors + 1;
+      end
+      if ((tail >= (SBINIT_POST_DETECT_ITERS - 1)) &&
+          (pattern_run_enable !== 1'b0)) begin
+        $display("FAIL ut_ltsm: raw run level did not stop at the final boundary");
+        errors = errors + 1;
+      end
+    end
+    if ((ltsm_state !== LT_SBINIT) || (u_dut.sbinit_phase_q !== 2'd2) ||
+        (sbinit_raw_mode !== 1'b0)) begin
+      $display("FAIL ut_ltsm: four tails did not enter Out-of-Reset packet mode");
+      errors = errors + 1;
+    end
+
+    // Wait until the local Out-of-Reset packet reaches the partner codec.
+    wait (local_oor_count != 0);
+
+    // A Done response received before the local request is not completion.
+    inject_sbinit_packet(MC_SB_DONE_RSP, MS_SB_DONE,
+                         SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+    if (u_dut.sbinit_done_rsp_received_q !== 1'b0) begin
+      $display("FAIL ut_ltsm: early Done response satisfied a future request");
+      errors = errors + 1;
+    end
+
+    // Reject a packet with the correct code and subcode but the wrong source.
+    inject_sbinit_packet(MC_SB_OOB_RESET, MS_SB_OOB_RESET,
+                         SRCID_ADAPT, DSTID_REMOTE_PHY, 1'b0);
+    if (u_dut.sbinit_oor_received_q !== 1'b0) begin
+      $display("FAIL ut_ltsm: invalid Out-of-Reset packet advanced SBINIT");
+      errors = errors + 1;
+    end
+
+    // Queue the peer request while still in Out-of-Reset. After the valid
+    // peer Out-of-Reset packet, the local response must precede its request.
+    inject_sbinit_packet(MC_SB_DONE_REQ, MS_SB_DONE,
+                         SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+    if (u_dut.sbinit_done_rsp_pending_q !== 8'd1) begin
+      $display("FAIL ut_ltsm: peer Done request did not create an obligation");
+      errors = errors + 1;
+    end
+    inject_sbinit_packet(MC_SB_OOB_RESET, MS_SB_OOB_RESET,
+                         SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+    wait (u_dut.sbinit_phase_q == 2'd3);
+    wait (local_done_count >= 2);
+    if ((local_done_code[0] !== MC_SB_DONE_RSP) ||
+        (local_done_code[1] !== MC_SB_DONE_REQ)) begin
+      $display("FAIL ut_ltsm: Done order got %02h then %02h",
+               local_done_code[0], local_done_code[1]);
+      errors = errors + 1;
+    end
+    if (ltsm_state !== LT_SBINIT) begin
+      $display("FAIL ut_ltsm: Done request advanced without a peer response");
+      errors = errors + 1;
+    end
+
+    // Wrong-subcode completion is ignored. Only the explicit valid Done
+    // response can advance the LTSM to MBINIT.PARAM.
+    inject_sbinit_packet(MC_SB_DONE_RSP, MS_SB_OOB_RESET,
+                         SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+    if (ltsm_state !== LT_SBINIT) begin
+      $display("FAIL ut_ltsm: invalid Done response advanced SBINIT");
+      errors = errors + 1;
+    end
+    inject_sbinit_packet(MC_SB_DONE_RSP, MS_SB_DONE,
+                         SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+    wait (ltsm_state == LT_MBINIT_PARAM);
+    par_enable_resp = 1'b1;
+
+    // Walk every later sub-state in order through the codec and CDC path.
     expect_state(LT_MBINIT_PARAM);
     expect_state(LT_MBINIT_CAL);
     expect_state(LT_MBINIT_RPCLK);

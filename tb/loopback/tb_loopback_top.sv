@@ -128,8 +128,8 @@
 //               not in LT_RESET (state != 8'h00).
 //   sbclk     : 800 MHz phase-offset clock generated after 0.1875 ns, then
 //               toggled every 0.625 ns. It is asynchronous to lclk.
-//   lreset_n  : Active-low synchronous reset, deasserted after 20 ns.
-//   sbreset_n : Active-low sideband reset, deasserted together with lreset_n.
+//   d0_lreset_n/d0_sbreset_n : Die 0 aligned local reset pair.
+//   d1_lreset_n/d1_sbreset_n : Die 1 aligned pair, released 2.5 ms later.
 //
 // DESIGN NOTES
 //   - The two `ucie_main` instances share one sbclk, but sbclk is independent
@@ -161,6 +161,9 @@
 //                        lclk and document the logical-PHY CDC mailboxes.
 //   v0.0.4  2026-09-23  Req.3: sample mailbox-delivered sideband coverage in
 //                        lclk so packet fields and valid strobes stay coherent.
+//   v0.0.5  2026-09-24  Add aligned per-die reset pairs, a 2.5 ms delayed Die
+//                        1 start, received-pattern entry, SBINIT order checks,
+//                        no-early-mainband checks, and a 20 ms watchdog.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -241,17 +244,33 @@ module tb_loopback_top;
     #0.1875;
     forever #0.625 sbclk = ~sbclk;
   end
-  // ------------------------------------------------------- reset
-  logic lreset_n;
-  logic sbreset_n;
+  // ------------------------------------------------------- per-die reset pairs
+  // Each die releases its lclk/sbclk reset pair on the same lclk edge. Die 1
+  // releases exactly 2.5 ms after Die 0 so the CDC mailbox reset contract is
+  // preserved locally while the two Stage 0 timelines remain independent.
+  logic d0_lreset_n;
+  logic d0_sbreset_n;
+  logic d1_lreset_n;
+  logic d1_sbreset_n;
+  time  d0_reset_release_time;
+  time  d1_reset_release_time;
 
   initial begin
-    lreset_n  = 1'b0;
-    sbreset_n = 1'b0;
+    d0_lreset_n = 1'b0;
+    d0_sbreset_n = 1'b0;
+    d1_lreset_n = 1'b0;
+    d1_sbreset_n = 1'b0;
+    d0_reset_release_time = 0;
+    d1_reset_release_time = 0;
     #20;
     @(negedge lclk);
-    lreset_n  = 1'b1;
-    sbreset_n = 1'b1;
+    d0_lreset_n = 1'b1;
+    d0_sbreset_n = 1'b1;
+    d0_reset_release_time = $time;
+    repeat (1_250_000) @(negedge lclk);
+    d1_lreset_n = 1'b1;
+    d1_sbreset_n = 1'b1;
+    d1_reset_release_time = $time;
   end
 
   // ------------------------------------------------------- die crossing
@@ -299,6 +318,8 @@ module tb_loopback_top;
   logic [3:0]  d0_rdi_state_sts;
   logic [4:0]  d0_sb_rx_opcode;
   logic [7:0]  d0_sb_rx_msgcode;
+  logic [7:0]  d0_sb_rx_msgsubcode;
+  logic [1:0]  d0_sbinit_phase;
   logic        d0_sb_rx_pkt_vld;
 
   // ------------------------------------------------------- die 1
@@ -317,6 +338,8 @@ module tb_loopback_top;
   logic [3:0]  d1_rdi_state_sts;
   logic [4:0]  d1_sb_rx_opcode;
   logic [7:0]  d1_sb_rx_msgcode;
+  logic [7:0]  d1_sb_rx_msgsubcode;
+  logic [1:0]  d1_sbinit_phase;
   logic        d1_sb_rx_pkt_vld;
 
   // ------------------------------------------------------- observed wires
@@ -362,12 +385,16 @@ module tb_loopback_top;
   // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission.
   // Spec ref: UCIe 1.0, Section 5.13 - Sideband signaling.
   // -------------------------------------------------------------------------
-  assign d0_sb_rx_opcode   = dut_a.u_lphy.sb_rx_opcode;
-  assign d0_sb_rx_msgcode  = dut_a.u_lphy.sb_rx_msgcode;
-  assign d0_sb_rx_pkt_vld  = dut_a.u_lphy.sb_rx_pkt_vld;
-  assign d1_sb_rx_opcode   = dut_b.u_lphy.sb_rx_opcode;
-  assign d1_sb_rx_msgcode  = dut_b.u_lphy.sb_rx_msgcode;
-  assign d1_sb_rx_pkt_vld  = dut_b.u_lphy.sb_rx_pkt_vld;
+  assign d0_sb_rx_opcode     = dut_a.u_lphy.sb_rx_opcode;
+  assign d0_sb_rx_msgcode    = dut_a.u_lphy.sb_rx_msgcode;
+  assign d0_sb_rx_msgsubcode = dut_a.u_lphy.sb_rx_msgsubcode;
+  assign d0_sbinit_phase     = dut_a.u_lphy.u_ltsm.sbinit_phase_q;
+  assign d0_sb_rx_pkt_vld    = dut_a.u_lphy.sb_rx_pkt_vld;
+  assign d1_sb_rx_opcode     = dut_b.u_lphy.sb_rx_opcode;
+  assign d1_sb_rx_msgcode    = dut_b.u_lphy.sb_rx_msgcode;
+  assign d1_sb_rx_msgsubcode = dut_b.u_lphy.sb_rx_msgsubcode;
+  assign d1_sbinit_phase     = dut_b.u_lphy.u_ltsm.sbinit_phase_q;
+  assign d1_sb_rx_pkt_vld    = dut_b.u_lphy.sb_rx_pkt_vld;
   assign d0_link_active_obs = dut_a.link_active_obs;
   assign d1_link_active_obs = dut_b.link_active_obs;
 
@@ -388,10 +415,10 @@ module tb_loopback_top;
   // -------------------------------------------------------------------------
   ucie_main dut_a (
     .lclk            (lclk),
-    .lreset_n        (lreset_n),
+    .lreset_n        (d0_lreset_n),
     .mbclk           (mbclk),
     .sbclk           (sbclk),
-    .sbreset_n       (sbreset_n),
+    .sbreset_n       (d0_sbreset_n),
     .start_link_train(d0_start_link_train),
     .lp_irdy         (d0_lp_irdy),
     .lp_valid        (d0_lp_valid),
@@ -442,10 +469,10 @@ module tb_loopback_top;
   // -------------------------------------------------------------------------
   ucie_main dut_b (
     .lclk            (lclk),
-    .lreset_n        (lreset_n),
+    .lreset_n        (d1_lreset_n),
     .mbclk           (mbclk),
     .sbclk           (sbclk),
-    .sbreset_n       (sbreset_n),
+    .sbreset_n       (d1_sbreset_n),
     .start_link_train(d1_start_link_train),
     .lp_irdy         (d1_lp_irdy),
     .lp_valid        (d1_lp_valid),
@@ -503,10 +530,10 @@ module tb_loopback_top;
     d1_lp_stream        = STREAM_ID_S0_STREAMING;
     d1_lp_stallack      = 1'b0;
 
+    wait (d0_lreset_n === 1'b1);
     @(negedge lclk);
-    #1;
     d0_start_link_train = 1'b1;
-    d1_start_link_train = 1'b1;
+    d1_start_link_train = 1'b0;
   end
 
   // ------------------------------------------------------- transfer events
@@ -540,7 +567,7 @@ module tb_loopback_top;
   // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism.
   // -------------------------------------------------------------------------
   always @(posedge lclk) begin
-    if (!lreset_n) begin
+    if (!d0_lreset_n) begin
       stall_seen_req  <= 1'b0;
       stall_seen_ack  <= 1'b0;
       stall_seen_stop <= 1'b0;
@@ -593,20 +620,24 @@ module tb_loopback_top;
   // Spec ref: UCIe 1.0, Section 8.0 - Interface Definitions.
   // -------------------------------------------------------------------------
   cov_monitor u_cov (
-    .lclk            (lclk),
-    .lreset_n        (lreset_n),
-    .sbclk           (sbclk),
-    .ltsm_state_0    (d0_ltsm_state),
-    .link_active_0   (d0_link_active_obs),
-    .sb_rx_opcode_0  (d0_sb_rx_opcode),
-    .sb_rx_msgcode_0 (d0_sb_rx_msgcode),
-    .sb_rx_pkt_vld_0 (d0_sb_rx_pkt_vld),
-    .rdi_state_sts_0 (d0_rdi_state_sts),
-    .ltsm_state_1    (d1_ltsm_state),
-    .link_active_1   (d1_link_active_obs),
-    .sb_rx_opcode_1  (d1_sb_rx_opcode),
-    .sb_rx_msgcode_1 (d1_sb_rx_msgcode),
-    .sb_rx_pkt_vld_1 (d1_sb_rx_pkt_vld),
+    .lclk              (lclk),
+    .lreset_n          (d0_lreset_n && d1_lreset_n),
+    .sbclk             (sbclk),
+    .ltsm_state_0      (d0_ltsm_state),
+    .sbinit_phase_0    (d0_sbinit_phase),
+    .link_active_0     (d0_link_active_obs),
+    .sb_rx_opcode_0    (d0_sb_rx_opcode),
+    .sb_rx_msgcode_0   (d0_sb_rx_msgcode),
+    .sb_rx_msgsubcode_0(d0_sb_rx_msgsubcode),
+    .sb_rx_pkt_vld_0   (d0_sb_rx_pkt_vld),
+    .rdi_state_sts_0   (d0_rdi_state_sts),
+    .ltsm_state_1      (d1_ltsm_state),
+    .sbinit_phase_1    (d1_sbinit_phase),
+    .link_active_1     (d1_link_active_obs),
+    .sb_rx_opcode_1    (d1_sb_rx_opcode),
+    .sb_rx_msgcode_1   (d1_sb_rx_msgcode),
+    .sb_rx_msgsubcode_1(d1_sb_rx_msgsubcode),
+    .sb_rx_pkt_vld_1   (d1_sb_rx_pkt_vld),
     .rdi_state_sts_1 (d1_rdi_state_sts),
     .xfer_done_0     (xfer_done_0),
     .xfer_done_1     (xfer_done_1),
@@ -620,9 +651,144 @@ module tb_loopback_top;
 
   // ------------------------------------------------------- main sequence
   integer errors;
-  integer i;
+  integer d0_sbinit_order;
+  integer d1_sbinit_order;
+  logic   reset_pair_error_seen;
+  logic   early_mainband_error_seen;
+  logic   d1_pattern_trigger_seen;
+  logic [2:0] d0_sbinit_msg_hits;
+  logic [2:0] d1_sbinit_msg_hits;
+  logic [7:0] d0_prev_ltsm_state;
+  logic [7:0] d1_prev_ltsm_state;
+  time d0_sbinit_entry_time;
+  time d1_sbinit_entry_time;
+  time stage0_skew;
   logic [DATA_W-1:0] exp_data;
   logic [DATA_W-1:0] got_data;
+
+  // Check the delayed-start contract on the actual two-die surface. Pattern
+  // and packet subphases are private observations only. Public DUT ports stay
+  // unchanged.
+  always @(posedge lclk) begin
+    if (((d0_lreset_n !== d0_sbreset_n) ||
+         (d1_lreset_n !== d1_sbreset_n)) && !reset_pair_error_seen) begin
+      $display("FAIL tb_loopback_top: a local reset pair was not aligned");
+      errors = errors + 1;
+      reset_pair_error_seen = 1'b1;
+    end
+    if (d1_start_link_train !== 1'b0) begin
+      $display("FAIL tb_loopback_top: Die 1 local training trigger asserted");
+      errors = errors + 1;
+      d1_start_link_train = 1'b0;
+    end
+
+    if (d1_lreset_n && (d1_ltsm_state == LT_RESET) &&
+        dut_b.u_lphy.u_ltsm.pattern_trigger_pending_q)
+      d1_pattern_trigger_seen = 1'b1;
+
+    if (d0_lreset_n && (d0_prev_ltsm_state == LT_RESET) &&
+        (d0_ltsm_state == LT_SBINIT) && (d0_sbinit_entry_time == 0)) begin
+      d0_sbinit_entry_time = $time;
+      if (($time - d0_reset_release_time) < 4_000_000) begin
+        $display("FAIL tb_loopback_top: Die 0 left RESET before 4 ms");
+        errors = errors + 1;
+      end
+    end
+    if (d1_lreset_n && (d1_prev_ltsm_state == LT_RESET) &&
+        (d1_ltsm_state == LT_SBINIT) && (d1_sbinit_entry_time == 0)) begin
+      d1_sbinit_entry_time = $time;
+      if (($time - d1_reset_release_time) < 4_000_000) begin
+        $display("FAIL tb_loopback_top: Die 1 left RESET before 4 ms");
+        errors = errors + 1;
+      end
+      if (!d1_pattern_trigger_seen ||
+          !dut_b.u_lphy.u_ltsm.pattern_trigger_pending_q) begin
+        $display("FAIL tb_loopback_top: Die 1 did not use the received pattern trigger");
+        errors = errors + 1;
+      end
+    end
+
+    if (d0_lreset_n && (d0_ltsm_state == LT_SBINIT)) begin
+      if ((d0_sbinit_order == 0) && (d0_sbinit_phase == 2'd0))
+        d0_sbinit_order = 1;
+      else if ((d0_sbinit_order == 1) && (d0_sbinit_phase == 2'd2))
+        d0_sbinit_order = 2;
+      else if ((d0_sbinit_order == 2) && (d0_sbinit_phase == 2'd3))
+        d0_sbinit_order = 3;
+      else if ((d0_sbinit_order >= 2) && (d0_sbinit_phase < d0_sbinit_order)) begin
+        $display("FAIL tb_loopback_top: Die 0 SBINIT phase regressed");
+        errors = errors + 1;
+        d0_sbinit_order = 4;
+      end
+    end
+    if (d1_lreset_n && (d1_ltsm_state == LT_SBINIT)) begin
+      if ((d1_sbinit_order == 0) && (d1_sbinit_phase == 2'd0))
+        d1_sbinit_order = 1;
+      else if ((d1_sbinit_order == 1) && (d1_sbinit_phase == 2'd2))
+        d1_sbinit_order = 2;
+      else if ((d1_sbinit_order == 2) && (d1_sbinit_phase == 2'd3))
+        d1_sbinit_order = 3;
+      else if ((d1_sbinit_order >= 2) && (d1_sbinit_phase < d1_sbinit_order)) begin
+        $display("FAIL tb_loopback_top: Die 1 SBINIT phase regressed");
+        errors = errors + 1;
+        d1_sbinit_order = 4;
+      end
+    end
+    if ((d0_prev_ltsm_state == LT_SBINIT) &&
+        (d0_ltsm_state == LT_MBINIT_PARAM) && (d0_sbinit_order != 3)) begin
+      $display("FAIL tb_loopback_top: Die 0 skipped SBINIT phase order");
+      errors = errors + 1;
+    end
+    if ((d1_prev_ltsm_state == LT_SBINIT) &&
+        (d1_ltsm_state == LT_MBINIT_PARAM) && (d1_sbinit_order != 3)) begin
+      $display("FAIL tb_loopback_top: Die 1 skipped SBINIT phase order");
+      errors = errors + 1;
+    end
+
+    // Out-of-Reset must be observed before either Done message. The hit masks
+    // also prove that both request and response roles crossed each direction.
+    if (d0_sb_rx_pkt_vld) begin
+      if ((d0_sb_rx_msgcode == MC_SB_OOB_RESET) &&
+          (d0_sb_rx_msgsubcode == MS_SB_OOB_RESET))
+        d0_sbinit_msg_hits[0] = 1'b1;
+      if (((d0_sb_rx_msgcode == MC_SB_DONE_REQ) ||
+           (d0_sb_rx_msgcode == MC_SB_DONE_RSP)) &&
+          (d0_sb_rx_msgsubcode == MS_SB_DONE)) begin
+        if (!d0_sbinit_msg_hits[0]) begin
+          $display("FAIL tb_loopback_top: Die 0 received Done before Out-of-Reset");
+          errors = errors + 1;
+        end
+        if (d0_sb_rx_msgcode == MC_SB_DONE_REQ) d0_sbinit_msg_hits[1] = 1'b1;
+        else                                    d0_sbinit_msg_hits[2] = 1'b1;
+      end
+    end
+    if (d1_sb_rx_pkt_vld) begin
+      if ((d1_sb_rx_msgcode == MC_SB_OOB_RESET) &&
+          (d1_sb_rx_msgsubcode == MS_SB_OOB_RESET))
+        d1_sbinit_msg_hits[0] = 1'b1;
+      if (((d1_sb_rx_msgcode == MC_SB_DONE_REQ) ||
+           (d1_sb_rx_msgcode == MC_SB_DONE_RSP)) &&
+          (d1_sb_rx_msgsubcode == MS_SB_DONE)) begin
+        if (!d1_sbinit_msg_hits[0]) begin
+          $display("FAIL tb_loopback_top: Die 1 received Done before Out-of-Reset");
+          errors = errors + 1;
+        end
+        if (d1_sb_rx_msgcode == MC_SB_DONE_REQ) d1_sbinit_msg_hits[1] = 1'b1;
+        else                                    d1_sbinit_msg_hits[2] = 1'b1;
+      end
+    end
+
+    if (!early_mainband_error_seen &&
+        ((d0_ltsm_state <= LT_SBINIT) || (d1_ltsm_state <= LT_SBINIT)) &&
+        (mb_a2b_valid || mb_b2a_valid)) begin
+      $display("FAIL tb_loopback_top: main-band valid asserted during RESET/SBINIT");
+      errors = errors + 1;
+      early_mainband_error_seen = 1'b1;
+    end
+
+    d0_prev_ltsm_state = d0_ltsm_state;
+    d1_prev_ltsm_state = d1_ltsm_state;
+  end
 
   task push_one;
     input [64*8-1:0] label;
@@ -682,24 +848,57 @@ module tb_loopback_top;
   endtask
 
   initial begin
-    errors = 0;
-    i      = 0;
+    errors                    = 0;
+    d0_sbinit_order           = 0;
+    d1_sbinit_order           = 0;
+    reset_pair_error_seen     = 1'b0;
+    early_mainband_error_seen = 1'b0;
+    d1_pattern_trigger_seen   = 1'b0;
+    d0_sbinit_msg_hits        = 3'b000;
+    d1_sbinit_msg_hits        = 3'b000;
+    d0_prev_ltsm_state        = LT_RESET;
+    d1_prev_ltsm_state        = LT_RESET;
+    d0_sbinit_entry_time      = 0;
+    d1_sbinit_entry_time      = 0;
+    stage0_skew               = 0;
 
-    // ---- wait for link active on both dies
-    wait (lreset_n === 1'b1);
-    while (!(d0_link_active_obs && d1_link_active_obs)) begin
-      @(posedge lclk);
-      i = i + 1;
-      // Must wait for at least 4 ms in RESET (2,000,000 cycles) plus training
-      if (i > 3000000) begin
-        $display("FAIL bring-up timeout: die0 active %b die1 active %b",
-                 d0_link_active_obs, d1_link_active_obs);
-        $display("     die0 LTSM %02h die1 LTSM %02h", d0_ltsm_state, d1_ltsm_state);
+    // Verify the deliberate reset release skew before link completion.
+    wait (d1_lreset_n === 1'b1);
+    if ((d1_reset_release_time - d0_reset_release_time) != 2_500_000) begin
+      $display("FAIL tb_loopback_top: reset skew got %0t expected 2500000 ns",
+               d1_reset_release_time - d0_reset_release_time);
+      errors = errors + 1;
+    end
+
+    // The 20 ms watchdog below is the single integration deadline.
+    while (!(d0_link_active_obs && d1_link_active_obs)) @(posedge lclk);
+
+    if ((d0_sbinit_entry_time == 0) || (d1_sbinit_entry_time == 0)) begin
+      $display("FAIL tb_loopback_top: missing per-die SBINIT entry observation");
+      errors = errors + 1;
+    end else begin
+      stage0_skew = d1_sbinit_entry_time - d0_sbinit_entry_time;
+      if ((stage0_skew < 2_499_990) || (stage0_skew > 2_500_010)) begin
+        $display("FAIL tb_loopback_top: Stage 0 skew got %0t ns", stage0_skew);
         errors = errors + 1;
-        u_cov.export_json(cov_path);
-        $finish;
       end
     end
+    if ((d0_sbinit_order != 3) || (d1_sbinit_order != 3)) begin
+      $display("FAIL tb_loopback_top: SBINIT phase order incomplete (%0d,%0d)",
+               d0_sbinit_order, d1_sbinit_order);
+      errors = errors + 1;
+    end
+    if (!d1_pattern_trigger_seen) begin
+      $display("FAIL tb_loopback_top: Die 1 received-pattern trigger not observed");
+      errors = errors + 1;
+    end
+    if ((d0_sbinit_msg_hits !== 3'b111) ||
+        (d1_sbinit_msg_hits !== 3'b111)) begin
+      $display("FAIL tb_loopback_top: SBINIT messages incomplete (%b,%b)",
+               d0_sbinit_msg_hits, d1_sbinit_msg_hits);
+      errors = errors + 1;
+    end
+
     $display("LINK ACTIVE (die 0)");
     $display("LINK ACTIVE (die 1)");
 
@@ -731,8 +930,8 @@ module tb_loopback_top;
   initial begin
     cov_path = "logs/coverage.json";
     void'($value$plusargs("covfile=%s", cov_path));
-    // True-to-spec physical reset takes at least 4 ms (4,000,000 ns). Watchdog at 10 ms.
-    #(10_000_000);
+    // Delayed reset plus true 4 ms RESET residency fits under this 20 ms gate.
+    #(20_000_000);
     $display("FAIL tb_loopback_top: watchdog at %0t", $time);
     u_cov.export_json(cov_path);
     $finish;

@@ -13,14 +13,14 @@
 //                                and sideband configuration width (8 b).
 //   3. Timer intervals         – Spec-compliant residency timeout (8 ms
 //                                per sub-state), RESET minimum (4 ms),
-//                                sideband message timeout (8 ms), and stall
-//                                interval (4 ms).  These are expressed in both
-//                                nanoseconds and lclk cycle counts.
+//                                sideband message timeout (8 ms), stall
+//                                interval (4 ms), and SBINIT active/idle
+//                                windows (1 ms each).
 //   4. Sideband framing        – Packet width (64 b) and inter-packet gap
 //                                (32 UI).
-//   5. Training pattern sizes  – VALTRAIN iteration count (128) and
-//                                detection threshold (16), plus LFSR
-//                                pattern length in UI (4096).
+//   5. Training pattern sizes  – SBINIT waveform, detection, and tail limits;
+//                                VALTRAIN iteration count and threshold; and
+//                                the LFSR pattern length in UI.
 //   6. Pattern selectors       – 3-bit identifiers for Per-Lane-ID,
 //                                VALTRAIN, Clock Repair, and LFSR patterns.
 //   7. Lane geometry           – Maximum lane counts for x16 and x8
@@ -93,6 +93,8 @@
 //   ----- ----------  ----------  ------------------------------------------
 //   0.0.1 2026-09-22  -           First commit to git.
 //   0.0.2 2026-09-22  -           Re-anchor lclk to 500 MHz, recalibrate timers, and update spec refs.
+//   0.0.3 2026-09-24  -           Add the Section 4.5.3.2 SBINIT waveform,
+//                                timing, message-subcode, and PHY-ID constants.
 //
 // ============================================================================
 `ifndef UciePkg_SV
@@ -155,6 +157,12 @@ package ucie_pkg;
   localparam int unsigned C_SB_MSG    = int'(longint'(T_SB_MSG_NS)    * LCLK_HZ / 32'd1_000_000_000);
   localparam int unsigned C_STALL     = int'(longint'(T_STALL_NS)     * LCLK_HZ / 32'd1_000_000_000);
 
+  // SBINIT alternates a 1 ms pattern-active window with a 1 ms idle window
+  // until the receiver detects two consecutive remote iterations. These
+  // counts are in lclk cycles because the LTSM owns the retry policy.
+  localparam int unsigned SBINIT_ACTIVE_LCLK_CYCLES = LCLK_HZ / 32'd1_000;
+  localparam int unsigned SBINIT_IDLE_LCLK_CYCLES   = LCLK_HZ / 32'd1_000;
+
   // ========================================================================
   // Sideband Framing
   // ========================================================================
@@ -162,6 +170,16 @@ package ucie_pkg;
   // SB_GAP_UI   : 32 – minimum inter-packet gap in UI (spec 6.1.2).
   localparam int unsigned SB_PKT_BITS  = 64;
   localparam int unsigned SB_GAP_UI    = 32;
+
+  // Standard Package SBINIT raw waveform (spec 4.5.3.2). One iteration is
+  // 64 alternating UIs followed by 32 low UIs. Detection needs two
+  // consecutive matching iterations. The transmitter then sends four more
+  // complete iterations before it changes to packet mode.
+  localparam int unsigned SBINIT_PATTERN_UI        = 64;
+  localparam int unsigned SBINIT_LOW_UI            = 32;
+  localparam int unsigned SBINIT_DETECT_ITERS      = 2;
+  localparam int unsigned SBINIT_POST_DETECT_ITERS = 4;
+  localparam logic [7:0] SBINIT_RESULT_PRIMARY     = 8'h01;
 
   // ========================================================================
   // Training Pattern Sizes
@@ -341,11 +359,15 @@ package ucie_pkg;
   // Sideband Source / Destination IDs (spec Table 49)
   // ========================================================================
   // sb_srcid_t – 3-bit source/destination identifier.
-  //   SRCID_STACK0 : Stack 0 (protocol layer).
-  //   SRCID_ADAPT  : D2D adapter layer.
+  //   SRCID_STACK0      : Stack 0 (protocol layer).
+  //   SRCID_ADAPT       : D2D adapter layer.
+  //   SRCID_PHY         : Physical Layer source on the UCIe Link sideband.
+  //   DSTID_REMOTE_PHY  : Remote-die Physical Layer destination.
   typedef logic [2:0] sb_srcid_t;
-  localparam sb_srcid_t SRCID_STACK0 = 3'b000;
-  localparam sb_srcid_t SRCID_ADAPT  = 3'b001;
+  localparam sb_srcid_t SRCID_STACK0      = 3'b000;
+  localparam sb_srcid_t SRCID_ADAPT       = 3'b001;
+  localparam sb_srcid_t SRCID_PHY         = 3'b010;
+  localparam sb_srcid_t DSTID_REMOTE_PHY  = 3'b110;
 
   // ========================================================================
   // LTSM State Encodings (Error Log 0, "State N")
@@ -417,9 +439,13 @@ package ucie_pkg;
   // MC_SB_OOB_RESET : Out-of-band reset detection.
   // MC_SB_DONE_REQ  : SBINIT completion request.
   // MC_SB_DONE_RSP  : SBINIT completion response.
+  // MS_SB_OOB_RESET : Out-of-Reset message subcode.
+  // MS_SB_DONE      : Done request and response subcode.
   localparam logic [7:0] MC_SB_OOB_RESET   = 8'h91;
   localparam logic [7:0] MC_SB_DONE_REQ    = 8'h95;
   localparam logic [7:0] MC_SB_DONE_RSP    = 8'h9A;
+  localparam logic [7:0] MS_SB_OOB_RESET   = 8'h00;
+  localparam logic [7:0] MS_SB_DONE        = 8'h01;
 
   // --- MBINIT Phase (main-band initialisation): req A5h / resp AAh -------
   // MC_MBINIT_REQ/RSP are the code bytes; subcodes below identify the

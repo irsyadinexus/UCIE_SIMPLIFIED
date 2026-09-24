@@ -35,7 +35,7 @@
 //
 //   Spec ref: Section 6.1.3 – Flow Control and Data Integrity
 //             (defines the CP / DP parity check that must flag corrupted
-//              packets; test 4 below validates this requirement)
+//              packets; test 7 below validates this requirement)
 //
 //
 // BLOCK DIAGRAM
@@ -81,7 +81,7 @@
 //
 // STIMULUS (DIRECTED TESTS)
 // -------------------------
-// Four directed tests exercise increasing complexity:
+// Seven directed tests exercise packet framing and exact training encodings:
 //
 //   Test 1 – Header-only message
 //            A LinkMgmt no-data request (SB_OP_MSG_NODATA) is sent with
@@ -101,27 +101,29 @@
 //            deasserts after the first).  This verifies that the mandatory
 //            inter-packet gap does not corrupt the following header.
 //
-//   Test 4 – Parity error injection via corrupt_en mux
+//   Tests 4-6 – SBINIT encodings
+//            Out-of-Reset (91h/00h), Done request (95h/01h), and Done
+//            response (9Ah/01h) use the PHY source and remote-PHY destination.
+//
+//   Test 7 – Parity error injection via corrupt_en mux
 //            A header-only packet is transmitted, but the corruption mux
 //            is enabled for exactly one header UI (UI 10) during
-//            serialisation.  The receiver must still deliver the packet
-//            (rx_pkt_vld asserted) but with cp_err flagged HIGH, proving
-//            that the parity checker detects the injected bit-flip.
+//            serialisation. The receiver must still deliver the packet with
+//            cp_err high, proving that it detects the injected bit flip.
 //
 //   Spec ref: Section 6.1.2 – Packet Formats
 //             (header and data field layout exercised by tests 1-3)
 //   Spec ref: Section 6.1.3 – Flow Control and Data Integrity
-//             (parity error detection exercised by test 4)
+//             (parity error detection exercised by test 7)
 //
 //
 // PASS CRITERIA
 // -------------
 // The test passes if and only if:
-//   - All transmitted header / data fields match after round-trip
-//     deserialisation (tests 1-3).
-//   - cp_err is NOT asserted for clean transmissions (tests 1-3).
-//   - cp_err IS asserted when the corruption mux flips a header bit
-//     (test 4).
+//   - All transmitted header and data fields match after round-trip
+//     deserialization in tests 1-6.
+//   - The three SBINIT code/subcode pairs and PHY IDs match exactly.
+//   - cp_err stays low for clean packets and asserts for the test 7 bit flip.
 //   - The test completes before the 2 ms watchdog timeout.
 //
 //
@@ -132,6 +134,8 @@
 //                        comments throughout the testbench.
 //   v0.0.3  2026-09-23  Req.3: run the codec test at the 800 MHz production
 //                        sideband rate.
+//   v0.0.4  2026-09-24  Add exact Out-of-Reset, Done request, and Done
+//                        response SBINIT encoding vectors.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -476,7 +480,30 @@ module ut_sb_codec;
                  8'h00, MC_MBTRAIN_RSP, 8'h06, 1'b1,
                  12'h7FF, 8'hFF, 5'h1F, 1'b1, 64'b0, 1'b0);
 
-    // 4. CP error injection: hold the serial line high for one header UI,
+    // 4-6. Standard Package SBINIT packet encodings. These vectors check the
+    // PHY IDs and the exact code/subcode pairs used by the LTSM.
+    send_one(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
+             SBINIT_RESULT_PRIMARY, MC_SB_OOB_RESET, MS_SB_OOB_RESET, 1'b0,
+             12'h000, 8'h00, 5'h00, 1'b0, 64'b0, 1'b0);
+    check_fields(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
+                 SBINIT_RESULT_PRIMARY, MC_SB_OOB_RESET, MS_SB_OOB_RESET,
+                 1'b0, 12'h000, 8'h00, 5'h00, 1'b0, 64'b0, 1'b0);
+
+    send_one(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
+             8'h00, MC_SB_DONE_REQ, MS_SB_DONE, 1'b0,
+             12'h000, 8'h00, 5'h00, 1'b0, 64'b0, 1'b0);
+    check_fields(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
+                 8'h00, MC_SB_DONE_REQ, MS_SB_DONE, 1'b0,
+                 12'h000, 8'h00, 5'h00, 1'b0, 64'b0, 1'b0);
+
+    send_one(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
+             8'h00, MC_SB_DONE_RSP, MS_SB_DONE, 1'b0,
+             12'h000, 8'h00, 5'h00, 1'b0, 64'b0, 1'b0);
+    check_fields(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
+                 8'h00, MC_SB_DONE_RSP, MS_SB_DONE, 1'b0,
+                 12'h000, 8'h00, 5'h00, 1'b0, 64'b0, 1'b0);
+
+    // 7. CP error injection: hold the serial line high for one header UI,
     // flipping exactly one received bit.
     @(negedge sbclk);
     tx_opcode    = SB_OP_MSG_NODATA;
@@ -484,7 +511,7 @@ module ut_sb_codec;
     tx_dstid     = SRCID_STACK0;
     tx_msginfo   = 8'h00;
     tx_msgcode   = MC_SB_DONE_REQ;
-    tx_msgsubcode= 8'h00;
+    tx_msgsubcode= MS_SB_DONE;
     tx_cr        = 1'b0;
     tx_addr      = 12'h000;
     tx_be        = 8'h00;

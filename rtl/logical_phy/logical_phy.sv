@@ -59,9 +59,9 @@
 //   Sideband: ltsm (lclk) -> async mailbox -> sb_codec (sbclk) -> sideband
 //             pins. During RESET and SBINIT pattern phases, a raw sbclk
 //             waveform/CDC primitive owns the pins and keeps the codec reset.
-//             A complete decoded RX packet is held in sbclk until the
-//             sbclk-to-lclk mailbox accepts it. The payload remains private
-//             until the Phase B LTSM transaction-engine cutover.
+//             A complete decoded RX packet remains held in sbclk until the
+//             sbclk-to-lclk mailbox accepts it. Phase B passes its DATA64
+//             payload to the LTSM, where role and fixed-profile policy apply.
 //
 // --------------------------------------------------------------------------
 // Parameters
@@ -140,6 +140,8 @@
 //   v0.0.12 2026-09-24  Phase A: force low mainband data and framing through
 //                        every immediate-success MBINIT and MBTRAIN state.
 //   v0.0.13 2026-09-24  Clarify the private Phase A DATA64 payload boundary.
+//   v0.0.14 2026-09-24  Phase B: expose private mailbox source acceptance and
+//                        the retained DATA64 payload to the LTSM.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -206,7 +208,10 @@ module logical_phy #(
   localparam int unsigned SB_TX_W = 126;
   localparam int unsigned SB_RX_W = 101;
 
-  // LTSM-facing TX request and codec-facing busy indication.
+  // LTSM-facing TX request, mailbox acceptance, and codec-facing backpressure.
+  // sb_tx_accepted pulses only when the source mailbox captures the LTSM
+  // bundle. It is not serializer completion. The LTSM uses this pulse to
+  // distinguish accepted local transactions from blocked presentation.
   logic        sb_tx_load;
   logic [4:0]  sb_tx_opcode;
   logic [2:0]  sb_tx_srcid;
@@ -220,8 +225,8 @@ module logical_phy #(
   logic [11:0] sb_tx_addr;
   logic [63:0] sb_tx_data_in;
   logic        sb_tx_has_data;
+  logic        sb_tx_accepted;
   logic        sb_tx_busy;
-
   // Codec-facing TX request produced by the lclk-to-sbclk mailbox.
   logic [SB_TX_W-1:0] sb_tx_cdc_data;
   logic               sb_tx_cdc_busy;
@@ -467,6 +472,17 @@ module logical_phy #(
     .dst_data   (sb_tx_cdc_data),
     .dst_valid  (codec_tx_load)
   );
+  // ---------------------------------------------------------------------------
+  // TX Mailbox Source-Acceptance Event
+  // ---------------------------------------------------------------------------
+  // The mailbox samples a source bundle only when src_send is high and its
+  // source-side busy output is low. This lclk pulse exposes that exact event
+  // to the LTSM. It does not report sbclk delivery or serializer completion.
+  // The combined sb_tx_busy signal continues to prevent a second transaction.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.2; PLAN.md §15.3 transaction acceptance.
+  // ---------------------------------------------------------------------------
+  assign sb_tx_accepted = sb_tx_load && !sb_tx_cdc_busy;
 
   assign {codec_tx_opcode, codec_tx_srcid, codec_tx_dstid, codec_tx_msginfo,
           codec_tx_msgcode, codec_tx_msgsubcode, codec_tx_be, codec_tx_tag,
@@ -489,10 +505,13 @@ module logical_phy #(
     end
   end
 
-  // A mailbox acknowledgement means that sbclk received the bundle, not that
-  // the packet finished. Hold the lclk busy contract until codec busy has been
-  // observed high and then low. This closes the acknowledgement/busy CDC gap
-  // for repeated Out-of-Reset packets and queued Done responses.
+  // A mailbox acknowledgement means that sbclk captured the bundle, not that
+  // the serializer completed the packet. Hold the lclk busy contract until
+  // codec busy has been observed high and then low. Source acceptance starts
+  // the in-flight interval, which closes the acknowledgement/busy CDC gap.
+  // This protects repeated Out-of-Reset and queued peer-response packets.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.2; PLAN.md §15.3 transaction acceptance.
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_inflight_q  <= 1'b0;
@@ -500,7 +519,7 @@ module logical_phy #(
     end else if (sbinit_raw_mode) begin
       codec_tx_inflight_q  <= 1'b0;
       codec_tx_busy_seen_q <= 1'b0;
-    end else if (sb_tx_load && !sb_tx_busy) begin
+    end else if (sb_tx_accepted) begin
       codec_tx_inflight_q  <= 1'b1;
       codec_tx_busy_seen_q <= 1'b0;
     end else if (codec_tx_inflight_q) begin
@@ -660,6 +679,7 @@ module logical_phy #(
     .sb_tx_data_in   (sb_tx_data_in),
     .sb_tx_has_data  (sb_tx_has_data),
     .sb_tx_busy      (sb_tx_busy),
+    .sb_tx_accepted  (sb_tx_accepted),
     .sb_rx_pkt_vld   (sb_rx_pkt_vld),
     .sb_rx_opcode    (sb_rx_opcode),
     .sb_rx_srcid     (sb_rx_srcid),
@@ -667,6 +687,7 @@ module logical_phy #(
     .sb_rx_msginfo   (sb_rx_msginfo),
     .sb_rx_msgcode   (sb_rx_msgcode),
     .sb_rx_msgsubcode(sb_rx_msgsubcode),
+    .sb_rx_payload   (sb_rx_payload),
     .sb_rx_cp_err    (sb_rx_cp_err),
     .sb_rx_dp_err    (sb_rx_dp_err),
     .sb_msg_timeout  (sb_msg_timeout),
@@ -1058,7 +1079,7 @@ module logical_phy #(
   assign unused = local_active_req | adapter_active_req | csr_rdata_vld |
                   csr_rdata[0] | phy_retrain_done | sb_msg_timeout |
                   sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |
-                  sb_rx_payload[0] | raw_rx_result_busy | raw_tx_done_busy |
+                  raw_rx_result_busy | raw_tx_done_busy |
                   lp_cfg[0] | lp_cfg_vld | lp_cfg_crd;
 
 endmodule

@@ -9,7 +9,7 @@
 // -----------
 // This unit test exercises the Link Training State Machine (LTSM) through
 // every defined training sub-state from power-on RESET to ACTIVE, verifying
-// the full ordered sequence of 21+ state transitions that constitute a
+// the full ordered sequence of 20 state visits that constitute a
 // successful link training.  It additionally verifies the sideband-timeout
 // path:  when the remote partner is silenced, the 8 ms residency timer
 // (C_RESIDENCY) expires cycle-exactly, and the LTSM escalates to
@@ -20,22 +20,32 @@
 //   1.  Pattern-Triggered Training Walk
 //       After the true 4 ms RESET minimum, atomic match/mismatch results drive
 //       remote-pattern entry. Four tail events and explicit SBINIT packets
-//       then lead into the complete later training flow:
-//         RESET → SBINIT → MBINIT_PARAM → MBINIT_CAL → MBINIT_RPCLK →
-//         MBINIT_RPVAL → MBINIT_REVMB → MBINIT_RPMB → MB_VALVREF →
-//         MB_DATAVREF → MB_SPEEDIDLE → MB_TXSELFCAL → MB_RXCLKCAL →
-//         MB_VTCENTER → MB_DTVREF1 → MB_RXDESKEW → MB_DTCENTER2 →
-//         MB_LINKSPEED → MB_REPAIR → LINKINIT → ACTIVE
+//       then lead into the complete later training flow. Each Phase B state
+//       runs its full fixed-profile sequence of local request and matching
+//       peer response transactions, one transaction per sequence subcode:
+//         RESET → SBINIT → MBINIT.PARAM [00] → MBINIT.CAL [02] →
+//         MBINIT.REPAIRCLK [03..08] → MBINIT.REPAIRVAL [09..0C] →
+//         MBINIT.REVERSALMB [0D..10] → MBINIT.REPAIRMB [11..14] →
+//         MBTRAIN.VALVREF [00,01] → MBTRAIN.DATAVREF [02,03] →
+//         MBTRAIN.SPEEDIDLE [04] → MBTRAIN.TXSELFCAL [05] →
+//         MBTRAIN.RXCLKCAL [06,07] → MBTRAIN.VTCENTER [08,09] →
+//         MBTRAIN.DATAVREF1 [0E,0F,10] → MBTRAIN.RXDESKEW [11,12] →
+//         MBTRAIN.DATACENTER2 [13,14] → MBTRAIN.LINKSPEED [15,19] →
+//         LINKINIT → ACTIVE
+//       MBTRAIN.REPAIR is unsupported and is never visited. LINKSPEED exits
+//       to LINKINIT only after the 15h start and 19h done transactions.
 //       After reaching ACTIVE the walk_check block confirms every state
 //       was visited in order.
 //
 //   2.  Sideband Timeout → TRAINERROR Path
 //       The partner responder is disabled, the LTSM is reset and
 //       re-started.  It enters SBINIT and waits for a sideband response
-//       that never arrives.  The test then verifies:
-//         • tmr_expired remains 0 for exactly C_RESIDENCY-1 running edges.
-//         • tmr_expired pulses high for exactly one cycle on edge
-//           C_RESIDENCY (the 8 ms boundary).
+// Direct lclk packet injection controls the SBINIT response ordering. After
+// SBINIT, a partner sb_codec deserializes local messages and the responder
+// answers each request with its matching response: the same sequence
+// subcode, the paired response message code, zero MsgInfo, and the immutable
+// PARAM_RSP_DATA payload for the DATA64 MBINIT.PARAM exchange. Both packet
+// codecs remain behind the asynchronous mailboxes.
 //         • The LTSM transitions to TRAINERROR on the very next posedge.
 //
 // STIMULUS
@@ -49,8 +59,7 @@
 // When the counter reaches LFSR_PATTERN_UI-1, the pat_done flag is
 // asserted, signalling the LTSM that the pattern phase has completed
 // (used during the LINKINIT sub-state).
-//
-// Two ucie_timer instances enforce spec-compliant timing:
+//     seen[] array contains all 20 expected states in strict order.
 //   • u_tmr  — C_RESIDENCY (4,000,000 cycles = 8 ms) general residency.
 //   • u_rst_tmr — C_RESET_MIN (2,000,000 cycles = 4 ms) reset minimum.
 //
@@ -59,8 +68,7 @@
 //   • expect_state(S)  — blocks until the LTSM leaves state S, or a
 //     deadline expires (200,000 cycles for most states, 2,500,000 for
 //     LT_RESET).  A stuck LTSM is flagged as a FAIL.
-//   • walk_check       — after ACTIVE is reached, verifies that the
-//     seen[] array contains all 21 expected states in strict order.
+//     seen[] array contains all 20 expected states in strict order.
 //   • Timeout test     — after disabling the partner responder and
 //     re-triggering training, the test counts exactly C_RESIDENCY
 //     posedge-lclk cycles and asserts that tmr_expired pulses on
@@ -155,10 +163,24 @@
 //   v0.0.5  2026-09-23  Req.3: run sbclk at 800 MHz with a phase offset from
 //                        lclk. The test now exercises the LTSM CDC boundary.
 //   v0.0.6  2026-09-23  Req.3: remove the obsolete single-clock-domain
+//   v0.0.9  2026-09-25  Phase B final contract: the partner responder now
+//                        answers every request with its matching response
+//                        using the exact current sequence subcode, so each
+//                        multi-step MBINIT and MBTRAIN state completes its
+//                        full fixed-profile transaction sequence. The PARAM
+//                        reply is a DATA64 packet that carries the immutable
+//                        PARAM_RSP_DATA payload. MBTRAIN.REPAIR is removed
+//                        from the expected walk because the fixed profile
+//                        never visits it, and LINKSPEED now exits only after
+//                        the 15h start and 19h done transactions.
 //                        description from the test header.
 //   v0.0.7  2026-09-24  Verify pattern-triggered RESET exit, mismatch streak
 //                        reset, four tail events, explicit SBINIT Done order,
 //                        invalid packets, and the true 8 ms timeout.
+//   v0.0.8  2026-09-24  Phase B: add sb_tx_accepted and sb_rx_payload
+//                        private ports. Transport complete DATA64 RX
+//                        packets through the CDC. Model a valid DATA64
+//                        PARAM peer request in the responder.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -183,7 +205,7 @@ module ut_ltsm;
   int          errors;
 
   // LTSM <-> local codec
-  logic        sb_tx_load, sb_tx_busy;
+  logic        sb_tx_load, sb_tx_busy, sb_tx_accepted;
   logic [4:0]  sb_tx_opcode;
   logic [2:0]  sb_tx_srcid, sb_tx_dstid;
   logic [7:0]  sb_tx_msginfo, sb_tx_msgcode, sb_tx_msgsubcode;
@@ -201,6 +223,7 @@ module ut_ltsm;
   logic [4:0]  sb_rx_opcode;
   logic [2:0]  sb_rx_srcid, sb_rx_dstid;
   logic [7:0]  sb_rx_msginfo, sb_rx_msgcode, sb_rx_msgsubcode;
+  logic [63:0] sb_rx_payload;
   logic        sb_rx_cp_err, sb_rx_dp_err;
 
   // Direct packet injection is used only for deterministic SBINIT ordering
@@ -221,7 +244,7 @@ module ut_ltsm;
   // sbclk, so complete sideband packets cross through the same mailboxes used
   // by logical_phy.
   localparam int unsigned SB_TX_W = 126;
-  localparam int unsigned SB_RX_W = 37;
+  localparam int unsigned SB_RX_W = 101;
   logic [SB_TX_W-1:0] tx_cdc_data;
   logic               tx_cdc_busy;
   logic               loc_tx_load;
@@ -239,9 +262,11 @@ module ut_ltsm;
   logic [4:0]         loc_rx_opcode;
   logic [2:0]         loc_rx_srcid, loc_rx_dstid;
   logic [7:0]         loc_rx_msginfo, loc_rx_msgcode, loc_rx_msgsubcode;
+  logic [63:0]        loc_rx_data;
   logic               loc_rx_cp_err, loc_rx_dp_err;
   logic [SB_RX_W-1:0] rx_cdc_data;
   logic               rx_cdc_busy;
+  logic [63:0]        cdc_rx_data;
 
   // Partner codec transmit controls
   logic        par_tx_load, par_tx_busy;
@@ -289,11 +314,12 @@ module ut_ltsm;
     .sb_tx_msgsubcode(sb_tx_msgsubcode), .sb_tx_be(sb_tx_be),
     .sb_tx_tag(sb_tx_tag), .sb_tx_ep(sb_tx_ep), .sb_tx_addr(sb_tx_addr),
     .sb_tx_data_in(sb_tx_data_in), .sb_tx_has_data(sb_tx_has_data),
-    .sb_tx_busy(sb_tx_busy),
+    .sb_tx_busy(sb_tx_busy), .sb_tx_accepted(sb_tx_accepted),
     .sb_rx_pkt_vld(sb_rx_pkt_vld), .sb_rx_opcode(sb_rx_opcode),
     .sb_rx_srcid(sb_rx_srcid), .sb_rx_dstid(sb_rx_dstid),
     .sb_rx_msginfo(sb_rx_msginfo), .sb_rx_msgcode(sb_rx_msgcode),
     .sb_rx_msgsubcode(sb_rx_msgsubcode),
+    .sb_rx_payload(sb_rx_payload),
     .sb_rx_cp_err(sb_rx_cp_err), .sb_rx_dp_err(sb_rx_dp_err),
     .sb_msg_timeout(sb_msg_timeout), .sb_stall_sent(sb_stall_sent),
     .pattern_run_enable(pattern_run_enable),
@@ -340,6 +366,7 @@ module ut_ltsm;
     end
   end
   assign sb_tx_busy = tx_cdc_busy | loc_tx_busy_sync_q;
+  assign sb_tx_accepted = sb_tx_load && !tx_cdc_busy;
 
   sb_codec u_loc (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
@@ -356,24 +383,27 @@ module ut_ltsm;
     .rx_srcid(loc_rx_srcid), .rx_dstid(loc_rx_dstid),
     .rx_msginfo(loc_rx_msginfo), .rx_msgcode(loc_rx_msgcode),
     .rx_msgsubcode(loc_rx_msgsubcode), .rx_cr(),
-    .rx_be(), .rx_tag(), .rx_ep(), .rx_addr(), .rx_data(),
+    .rx_be(), .rx_tag(), .rx_ep(), .rx_addr(),
+    .rx_data(loc_rx_data),
     .rx_cp_err(loc_rx_cp_err), .rx_dp_err(loc_rx_dp_err)
   );
 
   sb_cdc_mailbox #(.WIDTH(SB_RX_W)) u_rx_cdc (
     .src_clk(sbclk), .src_reset_n(sbreset_n),
     .src_data({loc_rx_opcode, loc_rx_srcid, loc_rx_dstid, loc_rx_msginfo,
-               loc_rx_msgcode, loc_rx_msgsubcode, loc_rx_cp_err, loc_rx_dp_err}),
+               loc_rx_msgcode, loc_rx_msgsubcode, loc_rx_cp_err, loc_rx_dp_err,
+               loc_rx_data}),
     .src_send(loc_rx_pkt_vld), .src_busy(rx_cdc_busy),
     .dst_clk(lclk), .dst_reset_n(lreset_n),
     .dst_data(rx_cdc_data), .dst_valid(cdc_rx_pkt_vld)
   );
   assign {cdc_rx_opcode, cdc_rx_srcid, cdc_rx_dstid, cdc_rx_msginfo,
           cdc_rx_msgcode, cdc_rx_msgsubcode, cdc_rx_cp_err,
-          cdc_rx_dp_err} = rx_cdc_data;
+          cdc_rx_dp_err, cdc_rx_data} = rx_cdc_data;
 
   // Select a direct lclk packet only while its one-cycle valid pulse is high.
   // This isolates SBINIT request/response ordering from codec serialization.
+  // Injected SBINIT packets carry no data payload.
   always_comb begin
     sb_rx_pkt_vld    = inject_rx_pkt_vld || cdc_rx_pkt_vld;
     sb_rx_opcode     = inject_rx_pkt_vld ? inject_rx_opcode : cdc_rx_opcode;
@@ -383,6 +413,7 @@ module ut_ltsm;
     sb_rx_msgcode    = inject_rx_pkt_vld ? inject_rx_msgcode : cdc_rx_msgcode;
     sb_rx_msgsubcode = inject_rx_pkt_vld ? inject_rx_msgsubcode :
                                             cdc_rx_msgsubcode;
+    sb_rx_payload    = inject_rx_pkt_vld ? 64'h0 : cdc_rx_data;
     sb_rx_cp_err     = inject_rx_pkt_vld ? inject_rx_cp_err : cdc_rx_cp_err;
     sb_rx_dp_err     = inject_rx_pkt_vld ? inject_rx_dp_err : cdc_rx_dp_err;
   end
@@ -455,8 +486,10 @@ module ut_ltsm;
 // the partner and verify the TRAINERROR path.
 //
 // The responder stays disabled during the directed SBINIT checks. It then
-// sends the paired response for each later training request with the same
-// subcode, preserving the established post-SBINIT handshake behavior.
+// answers each later training request with its matching response, using the
+// exact sequence subcode of the request, so every multi-step MBINIT and
+// MBTRAIN state completes its full fixed-profile transaction sequence.
+// MsgInfo is always zero and the message code maps through rsp_for().
   always @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       par_tx_load  <= 1'b0;
@@ -476,19 +509,31 @@ module ut_ltsm;
       par_tx_load  <= 1'b0;
       if (par_enable_resp && par_rx_pkt_vld && !par_tx_busy && !par_tx_load) begin
         par_tx_load    <= 1'b1;
-        par_tx_opcode  <= par_rx_opcode;
         par_tx_srcid   <= SRCID_PHY;
         par_tx_dstid   <= DSTID_REMOTE_PHY;
-        par_tx_msginfo <= (par_rx_msgsubcode == MS_REPAIR_INIT)
-                          ? MS_LKS_DONE : par_rx_msginfo;
-        par_tx_msgcode <= rsp_for(par_rx_msgcode);
-        par_tx_msgsubcode <= par_rx_msgsubcode;
         par_tx_be      <= 8'b0;
         par_tx_tag     <= 5'b0;
         par_tx_ep      <= 1'b0;
         par_tx_addr    <= 12'b0;
-        par_tx_data_in <= 64'b0;
-        par_tx_has_data<= 1'b0;
+        // MBINIT.PARAM is the only DATA64 exchange of the training walk.
+        // The peer's response carries the immutable PARAM_RSP_DATA payload.
+        // Every other state exchanges a no-data packet with a zero payload.
+        if ((par_rx_msgcode == MC_MBINIT_REQ) &&
+            (par_rx_msgsubcode == MS_PARAM_CFG)) begin
+          par_tx_opcode    <= SB_OP_MSG_DATA64;
+          par_tx_msginfo   <= 8'h00;
+          par_tx_msgcode   <= MC_MBINIT_RSP;
+          par_tx_msgsubcode <= MS_PARAM_CFG;
+          par_tx_data_in   <= PARAM_RSP_DATA;
+          par_tx_has_data  <= 1'b1;
+        end else begin
+          par_tx_opcode    <= par_rx_opcode;
+          par_tx_msginfo   <= 8'h00;
+          par_tx_msgcode   <= rsp_for(par_rx_msgcode);
+          par_tx_msgsubcode <= par_rx_msgsubcode;
+          par_tx_data_in   <= 64'b0;
+          par_tx_has_data  <= 1'b0;
+        end
       end
     end
   end
@@ -601,12 +646,15 @@ module ut_ltsm;
   // appends a new entry to the seen[] array whenever the state differs
   // from the last recorded value.  After training completes, the
   // walk_check block iterates through seen[] to verify the complete
-  // ordered sequence of 21 expected states was traversed.
+  // ordered sequence of 20 expected states was traversed.
   //
   // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
   // ---------------------------------------------------------------------------
   ltsm_state_t seen [0:63];
   int          seen_n;
+  ltsm_state_t expected_state_walk [0:19];
+  integer      expected_state_index;
+  integer      observed_state_index;
 
   always @(posedge lclk) begin
     if (lreset_n) begin
@@ -856,17 +904,10 @@ module ut_ltsm;
     expect_state(LT_MB_RXDESKEW);
     expect_state(LT_MB_DTCENTER2);
     expect_state(LT_MB_LINKSPEED);
-    // REPAIR exits to LINKINIT when the partner signals done.
-    fork
-      begin
-        wait (ltsm_state == LT_MB_REPAIR);
-        // The response carries MS_LKS_DONE to accept the link.
-        @(posedge sbclk);
-      end
-      begin
-        repeat (200000) @(posedge lclk);
-      end
-    join_any
+    // MBTRAIN.REPAIR is unsupported by the fixed profile and is never
+    // visited. LINKSPEED exits to LINKINIT only after the 15h start and
+    // 19h done transactions, both answered by the responder above.
+    expect_state(LT_LINKINIT);
 
     // Reach ACTIVE.
     fork
@@ -889,41 +930,38 @@ module ut_ltsm;
       $display("FAIL ut_ltsm: unexpected TRAINERROR");
       errors = errors + 1;
     end
-
-    // The recorded walk must include every expected state in order.
-    begin : walk_check
-      ltsm_state_t exp_seq [0:20];
-      int idx;
-      exp_seq[0]  = LT_RESET;
-      exp_seq[1]  = LT_SBINIT;
-      exp_seq[2]  = LT_MBINIT_PARAM;
-      exp_seq[3]  = LT_MBINIT_CAL;
-      exp_seq[4]  = LT_MBINIT_RPCLK;
-      exp_seq[5]  = LT_MBINIT_RPVAL;
-      exp_seq[6]  = LT_MBINIT_REVMB;
-      exp_seq[7]  = LT_MBINIT_RPMB;
-      exp_seq[8]  = LT_MB_VALVREF;
-      exp_seq[9]  = LT_MB_DATAVREF;
-      exp_seq[10] = LT_MB_SPEEDIDLE;
-      exp_seq[11] = LT_MB_TXSELFCAL;
-      exp_seq[12] = LT_MB_RXCLKCAL;
-      exp_seq[13] = LT_MB_VTCENTER;
-      exp_seq[14] = LT_MB_DTVREF1;
-      exp_seq[15] = LT_MB_RXDESKEW;
-      exp_seq[16] = LT_MB_DTCENTER2;
-      exp_seq[17] = LT_MB_LINKSPEED;
-      exp_seq[18] = LT_MB_REPAIR;
-      exp_seq[19] = LT_LINKINIT;
-      exp_seq[20] = LT_ACTIVE;
-      idx = 0;
-      for (int i = 0; i < seen_n; i = i + 1) begin
-        if (seen[i] == exp_seq[idx]) idx = idx + 1;
-        if (idx == 21) i = seen_n;
-      end
-      if (idx != 21) begin
-        $display("FAIL ut_ltsm: state walk incomplete, matched %0d of 21", idx);
-        errors = errors + 1;
-      end
+    expected_state_walk[0]  = LT_RESET;
+    expected_state_walk[1]  = LT_SBINIT;
+    expected_state_walk[2]  = LT_MBINIT_PARAM;
+    expected_state_walk[3]  = LT_MBINIT_CAL;
+    expected_state_walk[4]  = LT_MBINIT_RPCLK;
+    expected_state_walk[5]  = LT_MBINIT_RPVAL;
+    expected_state_walk[6]  = LT_MBINIT_REVMB;
+    expected_state_walk[7]  = LT_MBINIT_RPMB;
+    expected_state_walk[8]  = LT_MB_VALVREF;
+    expected_state_walk[9]  = LT_MB_DATAVREF;
+    expected_state_walk[10] = LT_MB_SPEEDIDLE;
+    expected_state_walk[11] = LT_MB_TXSELFCAL;
+    expected_state_walk[12] = LT_MB_RXCLKCAL;
+    expected_state_walk[13] = LT_MB_VTCENTER;
+    expected_state_walk[14] = LT_MB_DTVREF1;
+    expected_state_walk[15] = LT_MB_RXDESKEW;
+    expected_state_walk[16] = LT_MB_DTCENTER2;
+    expected_state_walk[17] = LT_MB_LINKSPEED;
+    expected_state_walk[18] = LT_LINKINIT;
+    expected_state_walk[19] = LT_ACTIVE;
+    expected_state_index = 0;
+    for (observed_state_index = 0; observed_state_index < seen_n;
+         observed_state_index = observed_state_index + 1) begin
+      if (seen[observed_state_index] ==
+          expected_state_walk[expected_state_index])
+        expected_state_index = expected_state_index + 1;
+      if (expected_state_index == 20) observed_state_index = seen_n;
+    end
+    if (expected_state_index != 20) begin
+      $display("FAIL ut_ltsm: state walk incomplete, matched %0d of 20",
+               expected_state_index);
+      errors = errors + 1;
     end
 
     // -----------------------------------------------------------------------

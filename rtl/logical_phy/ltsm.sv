@@ -8,6 +8,14 @@
 //               main-band training, link initialisation, and finally the
 //               ACTIVE state where data may flow.
 //
+//               Phase B uses a role-aware transaction engine for every
+//               fixed-profile MBINIT and MBTRAIN subcode. Each logical
+//               transaction waits for local mailbox acceptance and its
+//               matching response. Peer responses and exact duplicate
+//               replays remain separate obligations. TX priority is queued
+//               peer response, local request, then duplicate replay.
+//               PARAM uses DATA64 with immutable 64-bit payload values.
+//
 // Spec refs   : UCIe 1.0 spec section 4.5.3 (LTSM), with per-state
 //               references to 4.5.3.1 through 4.5.3.9.
 //
@@ -65,39 +73,35 @@
 //  | +--------+----------+             |
 //  |          |                        |
 //  | +--------v----------+             |
-//  | | TXSELFCAL  (0Bh)  |<-----+     |
-//  | +--------+----------+      |     |
-//  |          |                  |     |
-//  | +--------v----------+      |     |
-//  | | RXCLKCAL   (0Ch)  |      |     |
-//  | +--------+----------+      |     |
-//  |          |                  |     |
-//  | +--------v----------+      |     |
-//  | | VTCENTER   (0Dh)  |      |     |
-//  | +--------+----------+      |     |
-//  |          |                  |     |
-//  | +--------v----------+      |     |
-//  | | DTVREF1    (0Eh)  |      |     |
-//  | +--------+----------+      |     |
-//  |          |                  |     |
-//  | +--------v----------+      |     |
-//  | | RXDESKEW   (0Fh)  |      |     |
-//  | +--------+----------+      |     |
-//  |          |                  |     |
-//  | +--------v----------+      |     |
-//  | | DTCENTER2  (10h)  |      |     |
-//  | +--------+----------+      |     |
-//  |          |                  |     |
-//  | +--------v----------+      |     |
-//  | | LINKSPEED  (11h)  |      |     |
-//  | +--------+----------+      |     |
-//  |          |                  |     |
-//  | +--------v----------+      |     |
-//  | | REPAIR     (12h)  +------+     |
-//  | |  EXIT_REP/EXIT_DEG|  (retry)   |
+//  | | TXSELFCAL  (0Bh)  |             |
 //  | +--------+----------+             |
+//  |          |                        |
+//  | +--------v----------+             |
+//  | | RXCLKCAL   (0Ch)  |             |
+//  | +--------+----------+             |
+//  |          |                        |
+//  | +--------v----------+             |
+//  | | VTCENTER   (0Dh)  |             |
+//  | +--------+----------+             |
+//  |          |                        |
+//  | +--------v----------+             |
+//  | | DTVREF1    (0Eh)  |             |
+//  | +--------+----------+             |
+//  |          |                        |
+//  | +--------v----------+             |
+//  | | RXDESKEW   (0Fh)  |             |
+//  | +--------+----------+             |
+//  |          |                        |
+//  | +--------v----------+             |
+//  | | DTCENTER2  (10h)  |             |
+//  | +--------+----------+             |
+//  |          |                        |
+//  | +--------v----------+             |
+//  | | LINKSPEED  (11h)  |             |
+//  | +--------+----------+             |
+//  | REPAIR (12h) is unsupported.      |
 //  +===================================+
-//             | LKS_DONE
+//             | 15h then 19h done
 //             v
 //  +-----------+
 //  | LINKINIT  |  4.5.3.5  Reseed per-lane LFSRs; LFSR pattern 4096 UI.
@@ -107,10 +111,10 @@
 //        v
 //  +-----------+                 +--------------+
 //  |  ACTIVE   |  4.5.3.6       | PHYRETRAIN   | 4.5.3.7
-//  |  (15h)    |<--------------->|  (13h)       | Re-run training subset.
+//  |  (15h)    |                 |  (13h)       | Unsupported in Phase B.
 //  +-----+-----+                 +--------------+
 //        |
-//        | (retrain_req or error)
+//        | (fatal packet or timeout)
 //        v
 //  +-----------+                 +-----------+
 //  | TRAINERROR|  4.5.3.8        |   L1L2    | 4.5.3.9
@@ -119,23 +123,24 @@
 //  (only LINKRESET clears)       (start_link_train -> RESET)
 //
 // --------------------------------------------------------------------------
-// Sub-state exit rule  (spec 4.5.3.4)
+// Sub-state exit rule  (spec 4.5.3.3 and 4.5.3.4)
 // --------------------------------------------------------------------------
-//   Outside SBINIT, a sub-state exits when the local side has sent its
-//   request and received the partner handshake message. The existing later
-//   MBINIT/MBTRAIN symmetric-request behavior remains unchanged. SBINIT uses
-//   explicit message roles: a Done request never satisfies a Done response.
+//   Each listed sequence step completes only after the TX mailbox accepts
+//   the local request and the matching response arrives. The step also waits
+//   for its queued peer response and any exact duplicate replay. A peer
+//   request never satisfies the local response obligation. SBINIT retains
+//   its separate raw and packet-phase rules.
 //
-//   Every sub-state is bounded by an 8 ms residency timer. A sub-state
-//   that exceeds 8 ms without completing escalates to TRAINERROR.
+//   Each public sub-state has one 8 ms residency timer. A state that exceeds
+//   8 ms before all sequence steps complete escalates to TRAINERROR.
 //
 // --------------------------------------------------------------------------
 // Sideband message coding  (Tables 53, 54, 56)
 // --------------------------------------------------------------------------
 //   SBINIT selects explicit Out-of-Reset, Done request, and Done response
-//   pairs. Later states map through msg_req_code(), msg_rsp_code(), and
-//   msg_subcode(). MsgInfo carries the SBINIT primary-pair result and the
-//   later REPAIR qualifier.
+//   pairs. Phase B maps through msg_req_code(), msg_rsp_code(), and the
+//   state-and-step msg_subcode() lookup. Every Phase B MsgInfo is zero.
+//   LINKSPEED outcomes use subcodes, and MBTRAIN.REPAIR is unsupported.
 //
 // --------------------------------------------------------------------------
 // Raw SBINIT control  (spec 4.5.3.2)
@@ -227,6 +232,24 @@
 //                        Active Entry with the LinkMgmt exchange.
 //   v0.0.11 2026-09-24  Align Phase A comments with logical_phy's low
 //                        mainband-data and framing gate.
+//   v0.0.12 2026-09-24  Phase B: replace generic post-SBINIT request/response
+//                        with role-aware transaction engine. Track five
+//                        independent obligations per sub-state. Validate
+//                        post-SBINIT packets for role, IDs, opcode, code,
+//                        subcode, and PARAM payload. TX priority: peer
+//                        response, local request, duplicate replay. PARAM
+//                        uses DATA64 with 64-bit payloads. LINKSPEED success
+//                        exits to LINKINIT; error/re/degrade enters
+//                        TRAINERROR. Add private sb_tx_accepted and
+//                        sb_rx_payload input ports. Validate peer PARAM
+//                        DATA64 Vswing range; invalid Vswing escalates
+//                        to TRAINERROR.
+//   v0.0.13 2026-09-24  Complete Phase B fixed-profile transaction sequences.
+//                        Enforce full packet contracts and early-response
+//                        failure. Store exact peer request identities and
+//                        coalesce current duplicates into one response.
+//                        Replay completed duplicates after local requests.
+//                        Require LINKSPEED 15h then 19h and disable REPAIR.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -266,6 +289,7 @@ module ltsm #(
   output logic [63:0] sb_tx_data_in,
   output logic        sb_tx_has_data,
   input  logic        sb_tx_busy,
+  input  logic        sb_tx_accepted,
   input  logic        sb_rx_pkt_vld,
   input  logic [4:0]  sb_rx_opcode,
   input  logic [2:0]  sb_rx_srcid,
@@ -273,6 +297,7 @@ module ltsm #(
   input  logic [7:0]  sb_rx_msginfo,
   input  logic [7:0]  sb_rx_msgcode,
   input  logic [7:0]  sb_rx_msgsubcode,
+  input  logic [63:0] sb_rx_payload,
   input  logic        sb_rx_cp_err,
   input  logic        sb_rx_dp_err,
   output logic        sb_msg_timeout,
@@ -319,8 +344,6 @@ module ltsm #(
   ltsm_state_t state_q, state_d;
   sbinit_phase_t sbinit_phase_q, sbinit_phase_d;
 
-  logic        req_sent_q, req_sent_d;
-  logic        resp_rcvd_q, resp_rcvd_d;
   logic        timer_start_q, timer_start_d;
   logic        reset_min_done_q, reset_min_done_d;
   logic        retrain_req_q, retrain_req_d;
@@ -336,18 +359,32 @@ module ltsm #(
   logic        sbinit_done_rsp_received_q, sbinit_done_rsp_received_d;
   logic [7:0]  sbinit_done_rsp_pending_q, sbinit_done_rsp_pending_d;
 
+  // ---- Phase B logical-transaction state
+  // Each sequence step owns one local request and one matching response.
+  // A peer request owns either one current response or one duplicate replay.
+  // The identity contains every RX field visible here, including DATA64.
+  logic [2:0]  txn_step_q, txn_step_d;
+  logic        local_req_accepted_q, local_req_accepted_d;
+  logic        local_resp_rcvd_q, local_resp_rcvd_d;
+  logic        peer_req_valid_q, peer_req_valid_d;
+  logic        peer_resp_pending_q, peer_resp_pending_d;
+  logic        peer_replay_pending_q, peer_replay_pending_d;
+  logic [98:0] peer_req_identity_q, peer_req_identity_d;
+  logic        phase_b_state_complete;
+
   // -------------------------------------------------------------------------
   // State and policy register bank
   // -------------------------------------------------------------------------
-  // The match streak saturates at two. The trigger remains sticky until a new
-  // RESET epoch. SBINIT packet flags remain independent so a received request
-  // can never satisfy the local response requirement.
+  // This bank stores raw SBINIT policy and Phase B transaction obligations.
+  // Sequence steps reset on each public state entry and after the last step.
+  // Peer request identity remains stable until the current step completes.
+  // The raw SBINIT fields keep their existing reset and update behavior.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.2, 4.5.3.3, and 4.5.3.4.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       state_q                       <= LT_RESET;
       sbinit_phase_q                <= SBI_PATTERN_ACTIVE;
-      req_sent_q                    <= 1'b0;
-      resp_rcvd_q                   <= 1'b0;
       timer_start_q                 <= 1'b0;
       reset_min_done_q              <= 1'b0;
       retrain_req_q                 <= 1'b0;
@@ -361,11 +398,16 @@ module ltsm #(
       sbinit_done_rsp_sent_q        <= 1'b0;
       sbinit_done_rsp_received_q    <= 1'b0;
       sbinit_done_rsp_pending_q     <= 8'd0;
+      txn_step_q                    <= 3'd0;
+      local_req_accepted_q          <= 1'b0;
+      local_resp_rcvd_q             <= 1'b0;
+      peer_req_valid_q              <= 1'b0;
+      peer_resp_pending_q           <= 1'b0;
+      peer_replay_pending_q         <= 1'b0;
+      peer_req_identity_q           <= 99'd0;
     end else begin
       state_q                       <= state_d;
       sbinit_phase_q                <= sbinit_phase_d;
-      req_sent_q                    <= req_sent_d;
-      resp_rcvd_q                   <= resp_rcvd_d;
       timer_start_q                 <= timer_start_d;
       reset_min_done_q              <= reset_min_done_d;
       retrain_req_q                 <= retrain_req_d;
@@ -379,6 +421,13 @@ module ltsm #(
       sbinit_done_rsp_sent_q        <= sbinit_done_rsp_sent_d;
       sbinit_done_rsp_received_q    <= sbinit_done_rsp_received_d;
       sbinit_done_rsp_pending_q     <= sbinit_done_rsp_pending_d;
+      txn_step_q                    <= txn_step_d;
+      local_req_accepted_q          <= local_req_accepted_d;
+      local_resp_rcvd_q             <= local_resp_rcvd_d;
+      peer_req_valid_q              <= peer_req_valid_d;
+      peer_resp_pending_q           <= peer_resp_pending_d;
+      peer_replay_pending_q         <= peer_replay_pending_d;
+      peer_req_identity_q           <= peer_req_identity_d;
     end
   end
 
@@ -399,18 +448,23 @@ module ltsm #(
   wire reset_entry = state_entry && (state_q == LT_RESET);
 
   // =========================================================================
-  // Message lookup tables for post-SBINIT training
+  // Fixed-profile Phase B message and sequence lookup
   // =========================================================================
-  // SBINIT uses explicit phase-dependent codes below. These lookup functions
-  // retain the existing MBINIT, MBTRAIN, PHYRETRAIN, and TRAINERROR behavior.
-  function automatic logic [7:0] msg_req_code(input ltsm_state_t s);
+  // Only MBINIT and MBTRAIN through LINKSPEED participate in Phase B.
+  // Every sequence entry is one complete request and response transaction.
+  // The step index never changes until the current transaction completes.
+  // MBTRAIN.REPAIR, PHYRETRAIN, and TRAINERROR have no Phase B exchange.
+  // Spec refs: UCIe 1.0 Tables 53, 54, and 56;
+  //            Sections 4.5.3.3 and 4.5.3.4.
+  // =========================================================================
+  function automatic logic phase_b_state_supported(input ltsm_state_t s);
     case (s)
       LT_MBINIT_PARAM,
       LT_MBINIT_CAL,
       LT_MBINIT_RPCLK,
       LT_MBINIT_RPVAL,
       LT_MBINIT_REVMB,
-      LT_MBINIT_RPMB:   msg_req_code = MC_MBINIT_REQ;
+      LT_MBINIT_RPMB,
       LT_MB_VALVREF,
       LT_MB_DATAVREF,
       LT_MB_SPEEDIDLE,
@@ -420,11 +474,30 @@ module ltsm #(
       LT_MB_DTVREF1,
       LT_MB_RXDESKEW,
       LT_MB_DTCENTER2,
-      LT_MB_LINKSPEED,
-      LT_MB_REPAIR:     msg_req_code = MC_MBTRAIN_REQ;
-      LT_PHYRETRAIN:    msg_req_code = MC_PHYR_REQ;
-      LT_TRAINERROR:    msg_req_code = MC_TE_REQ;
-      default:          msg_req_code = MC_NOP_CRD;
+      LT_MB_LINKSPEED: phase_b_state_supported = 1'b1;
+      default:         phase_b_state_supported = 1'b0;
+    endcase
+  endfunction
+
+  function automatic logic [7:0] msg_req_code(input ltsm_state_t s);
+    case (s)
+      LT_MBINIT_PARAM,
+      LT_MBINIT_CAL,
+      LT_MBINIT_RPCLK,
+      LT_MBINIT_RPVAL,
+      LT_MBINIT_REVMB,
+      LT_MBINIT_RPMB: msg_req_code = MC_MBINIT_REQ;
+      LT_MB_VALVREF,
+      LT_MB_DATAVREF,
+      LT_MB_SPEEDIDLE,
+      LT_MB_TXSELFCAL,
+      LT_MB_RXCLKCAL,
+      LT_MB_VTCENTER,
+      LT_MB_DTVREF1,
+      LT_MB_RXDESKEW,
+      LT_MB_DTCENTER2,
+      LT_MB_LINKSPEED: msg_req_code = MC_MBTRAIN_REQ;
+      default:         msg_req_code = MC_NOP_CRD;
     endcase
   endfunction
 
@@ -435,7 +508,7 @@ module ltsm #(
       LT_MBINIT_RPCLK,
       LT_MBINIT_RPVAL,
       LT_MBINIT_REVMB,
-      LT_MBINIT_RPMB:   msg_rsp_code = MC_MBINIT_RSP;
+      LT_MBINIT_RPMB: msg_rsp_code = MC_MBINIT_RSP;
       LT_MB_VALVREF,
       LT_MB_DATAVREF,
       LT_MB_SPEEDIDLE,
@@ -445,52 +518,168 @@ module ltsm #(
       LT_MB_DTVREF1,
       LT_MB_RXDESKEW,
       LT_MB_DTCENTER2,
-      LT_MB_LINKSPEED,
-      LT_MB_REPAIR:     msg_rsp_code = MC_MBTRAIN_RSP;
-      LT_PHYRETRAIN:    msg_rsp_code = MC_PHYR_RSP;
-      LT_TRAINERROR:    msg_rsp_code = MC_TE_RSP;
-      default:          msg_rsp_code = MC_NOP_CRD;
+      LT_MB_LINKSPEED: msg_rsp_code = MC_MBTRAIN_RSP;
+      default:         msg_rsp_code = MC_NOP_CRD;
     endcase
   endfunction
 
-  function automatic logic [7:0] msg_subcode(input ltsm_state_t s);
+  function automatic logic [2:0] sequence_last_step(input ltsm_state_t s);
     case (s)
-      LT_MBINIT_PARAM:  msg_subcode = MS_PARAM_CFG;
-      LT_MBINIT_CAL:    msg_subcode = MS_CAL_DONE;
-      LT_MBINIT_RPCLK:  msg_subcode = MS_RPCLK_INIT;
-      LT_MBINIT_RPVAL:  msg_subcode = MS_RPVAL_INIT;
-      LT_MBINIT_REVMB:  msg_subcode = MS_REVMB_INIT;
-      LT_MBINIT_RPMB:   msg_subcode = MS_RPMB_START;
-      LT_MB_VALVREF:    msg_subcode = MS_VALVREF_START;
-      LT_MB_DATAVREF:   msg_subcode = MS_DATAVREF_START;
-      LT_MB_SPEEDIDLE:  msg_subcode = MS_SPEEDIDLE_DONE;
-      LT_MB_TXSELFCAL:  msg_subcode = MS_TXSELFCAL_DONE;
-      LT_MB_RXCLKCAL:   msg_subcode = MS_RXCLKCAL_START;
-      LT_MB_VTCENTER:   msg_subcode = MS_VTC_START;
-      LT_MB_DTVREF1:    msg_subcode = MS_DTV_START;
-      LT_MB_RXDESKEW:   msg_subcode = MS_DESKEW_START;
-      LT_MB_DTCENTER2:  msg_subcode = MS_DTC2_START;
-      LT_MB_LINKSPEED:  msg_subcode = MS_LKS_START;
-      LT_MB_REPAIR:     msg_subcode = MS_REPAIR_INIT;
-      LT_PHYRETRAIN:    msg_subcode = MS_PHYR_INIT;
-      LT_TRAINERROR:    msg_subcode = MS_TE_ENTRY;
-      default:          msg_subcode = 8'h00;
+      LT_MBINIT_RPCLK: sequence_last_step = 3'd5;
+      LT_MBINIT_RPVAL,
+      LT_MBINIT_REVMB,
+      LT_MBINIT_RPMB:  sequence_last_step = 3'd3;
+      LT_MB_DTVREF1:   sequence_last_step = 3'd2;
+      LT_MB_VALVREF,
+      LT_MB_DATAVREF,
+      LT_MB_RXCLKCAL,
+      LT_MB_VTCENTER,
+      LT_MB_RXDESKEW,
+      LT_MB_DTCENTER2,
+      LT_MB_LINKSPEED: sequence_last_step = 3'd1;
+      default:         sequence_last_step = 3'd0;
     endcase
   endfunction
 
-  function automatic logic [7:0] msg_info(input ltsm_state_t s);
+  function automatic logic [7:0] msg_subcode(
+    input ltsm_state_t s,
+    input logic [2:0] step
+  );
     case (s)
-      LT_MB_REPAIR: msg_info = MS_LKS_DONE;
-      default:      msg_info = 8'h00;
+      LT_MBINIT_PARAM: msg_subcode = MS_PARAM_CFG;
+      LT_MBINIT_CAL:   msg_subcode = MS_CAL_DONE;
+
+      LT_MBINIT_RPCLK: begin
+        case (step)
+          3'd0: msg_subcode = MS_RPCLK_INIT;
+          3'd1: msg_subcode = MS_RPCLK_RESULT;
+          3'd2: msg_subcode = MS_RPCLK_APPLY;
+          3'd3: msg_subcode = MS_RPCLK_CHKINI;
+          3'd4: msg_subcode = MS_RPCLK_CHKRES;
+          3'd5: msg_subcode = MS_RPCLK_DONE;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MBINIT_RPVAL: begin
+        case (step)
+          3'd0: msg_subcode = MS_RPVAL_INIT;
+          3'd1: msg_subcode = MS_RPVAL_RESULT;
+          3'd2: msg_subcode = MS_RPVAL_APPLY;
+          3'd3: msg_subcode = MS_RPVAL_DONE;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MBINIT_REVMB: begin
+        case (step)
+          3'd0: msg_subcode = MS_REVMB_INIT;
+          3'd1: msg_subcode = MS_REVMB_CLRERR;
+          3'd2: msg_subcode = MS_REVMB_RESULT;
+          3'd3: msg_subcode = MS_REVMB_DONE;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MBINIT_RPMB: begin
+        case (step)
+          3'd0: msg_subcode = MS_RPMB_START;
+          3'd1: msg_subcode = MS_RPMB_APPLY;
+          3'd2: msg_subcode = MS_RPMB_END;
+          3'd3: msg_subcode = MS_RPMB_END2;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_VALVREF: begin
+        case (step)
+          3'd0: msg_subcode = MS_VALVREF_START;
+          3'd1: msg_subcode = MS_VALVREF_END;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_DATAVREF: begin
+        case (step)
+          3'd0: msg_subcode = MS_DATAVREF_START;
+          3'd1: msg_subcode = MS_DATAVREF_END;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_SPEEDIDLE: msg_subcode = MS_SPEEDIDLE_DONE;
+      LT_MB_TXSELFCAL: msg_subcode = MS_TXSELFCAL_DONE;
+
+      LT_MB_RXCLKCAL: begin
+        case (step)
+          3'd0: msg_subcode = MS_RXCLKCAL_START;
+          3'd1: msg_subcode = MS_RXCLKCAL_DONE;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_VTCENTER: begin
+        case (step)
+          3'd0: msg_subcode = MS_VTC_START;
+          3'd1: msg_subcode = MS_VTC_DONE;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_DTVREF1: begin
+        case (step)
+          3'd0: msg_subcode = MS_DTV_START;
+          3'd1: msg_subcode = 8'h0F;
+          3'd2: msg_subcode = MS_DTV_END;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_RXDESKEW: begin
+        case (step)
+          3'd0: msg_subcode = MS_DESKEW_START;
+          3'd1: msg_subcode = MS_DESKEW_END;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_DTCENTER2: begin
+        case (step)
+          3'd0: msg_subcode = MS_DTC2_START;
+          3'd1: msg_subcode = MS_DTC2_END;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      LT_MB_LINKSPEED: begin
+        case (step)
+          3'd0: msg_subcode = MS_LKS_START;
+          3'd1: msg_subcode = MS_LKS_DONE;
+          default: msg_subcode = 8'hFF;
+        endcase
+      end
+
+      default: msg_subcode = 8'hFF;
     endcase
   endfunction
+
+  // The public state selects the message code. The private step selects the
+  // exact subcode. A state-entry cycle always addresses step zero so stale
+  // state from the prior public state cannot classify an inbound packet.
+  // These values implement PLAN.md Section 15.9 Phase B and UCIe 1.0
+  // Tables 53, 54, and 56.
+  wire       phase_b_active  = phase_b_state_supported(state_q);
+  wire [2:0] active_txn_step = state_entry ? 3'd0 : txn_step_q;
+  wire [7:0] current_subcode = msg_subcode(state_q, active_txn_step);
 
   // =========================================================================
   // Sideband receive classification
   // =========================================================================
-  // Every training packet must be a parity-clean no-data PHY-to-PHY message.
-  // SBINIT compares explicit code/subcode pairs. Later training retains its
-  // existing symmetric request/response acceptance rule.
+  // SBINIT retains its original no-data PHY-to-PHY packet classifier.
+  // Phase B has a separate complete packet contract below. This split keeps
+  // raw SBINIT behavior unchanged while post-SBINIT errors become fatal.
+  // Spec refs: UCIe 1.0 Section 4.5.3.2 and Table 47.
+  // =========================================================================
   wire rx_phy_msg_valid = sb_rx_pkt_vld &&
                           !sb_rx_cp_err && !sb_rx_dp_err &&
                           (sb_rx_opcode == SB_OP_MSG_NODATA) &&
@@ -507,12 +696,91 @@ module ltsm #(
                             (sb_rx_msgcode == MC_SB_DONE_RSP) &&
                             (sb_rx_msgsubcode == MS_SB_DONE);
 
-  wire msg_is_req = rx_phy_msg_valid &&
-                    (sb_rx_msgcode == msg_req_code(state_q)) &&
-                    (sb_rx_msgsubcode == msg_subcode(state_q));
-  wire msg_is_rsp = rx_phy_msg_valid &&
-                    (sb_rx_msgcode == msg_rsp_code(state_q)) &&
-                    (sb_rx_msgsubcode == msg_subcode(state_q));
+  // =========================================================================
+  // Phase B PARAM payload rules
+  // =========================================================================
+  // A request accepts module zero, differential and continuous clocks,
+  // Vswing 01h through 10h, and the fixed or a higher speed advertisement.
+  // The response must select differential and continuous clocks at exactly
+  // the fixed 4 GT/s encoding. Every response reserved bit is ignored.
+  // The transmitted response always uses immutable PARAM_RSP_DATA.
+  // Spec refs: UCIe 1.0 Table 56 and Section 4.5.3.3.1.
+  // =========================================================================
+  localparam logic [63:0] PARAM_RSP_REQUIRED_MASK =
+    PARAM_MASK_CLOCK_PHASE | PARAM_MASK_CLOCK_MODE | PARAM_MASK_MAX_SPEED;
+
+  wire param_req_valid =
+    ((sb_rx_payload & PARAM_MASK_MODULE_ID) == 64'h0) &&
+    ((sb_rx_payload & PARAM_MASK_CLOCK_PHASE) == 64'h0) &&
+    ((sb_rx_payload & PARAM_MASK_CLOCK_MODE) != 64'h0) &&
+    (sb_rx_payload[8:4] >= PARAM_VSWING_MIN) &&
+    (sb_rx_payload[8:4] <= PARAM_VSWING_MAX) &&
+    (sb_rx_payload[3:0] >= PARAM_REQ_DATA[3:0]);
+
+  wire param_rsp_valid =
+    ((sb_rx_payload & PARAM_RSP_REQUIRED_MASK) ==
+     (PARAM_RSP_DATA & PARAM_RSP_REQUIRED_MASK));
+
+  // =========================================================================
+  // Phase B complete packet validation and role separation
+  // =========================================================================
+  // Every packet must be parity-clean and use the exact opcode, IDs,
+  // zero MsgInfo, current code, current subcode, role, and payload rule.
+  // A request creates a peer response obligation. Only a response can
+  // complete the local request, and a response before acceptance is fatal.
+  // Any packet outside a supported Phase B exchange is unexpected.
+  // Spec refs: UCIe 1.0 Tables 47, 49, 53, 54, and 56;
+  //            Sections 4.5.3.3 and 4.5.3.4.
+  // =========================================================================
+  wire [4:0] phase_b_expected_opcode =
+    (state_q == LT_MBINIT_PARAM) ? SB_OP_MSG_DATA64 : SB_OP_MSG_NODATA;
+
+  wire phase_b_common_valid = phase_b_active && sb_rx_pkt_vld &&
+                              !sb_rx_cp_err && !sb_rx_dp_err &&
+                              (sb_rx_opcode == phase_b_expected_opcode) &&
+                              (sb_rx_srcid == SRCID_PHY) &&
+                              (sb_rx_dstid == DSTID_REMOTE_PHY) &&
+                              (sb_rx_msginfo == 8'h00) &&
+                              (sb_rx_msgsubcode == current_subcode);
+
+  wire phase_b_req_payload_valid =
+    (state_q != LT_MBINIT_PARAM) || param_req_valid;
+  wire phase_b_rsp_payload_valid =
+    (state_q != LT_MBINIT_PARAM) || param_rsp_valid;
+
+  wire phase_b_peer_req = phase_b_common_valid &&
+                          (sb_rx_msgcode == msg_req_code(state_q)) &&
+                          phase_b_req_payload_valid;
+  wire phase_b_peer_rsp = phase_b_common_valid &&
+                          (sb_rx_msgcode == msg_rsp_code(state_q)) &&
+                          phase_b_rsp_payload_valid;
+  wire phase_b_packet_valid = phase_b_peer_req || phase_b_peer_rsp;
+
+  // A no-data packet has no logical payload. Normalize it to zero before
+  // identity comparison so stale codec payload storage cannot change an
+  // otherwise identical request. DATA64 preserves all 64 payload bits.
+  // Identity also preserves opcode, IDs, MsgInfo, code, and subcode.
+  // Spec refs: UCIe 1.0 Section 6.1.2 and Table 56.
+  wire [63:0] peer_req_identity_payload =
+    (sb_rx_opcode == SB_OP_MSG_DATA64) ? sb_rx_payload : 64'h0;
+  wire [98:0] rx_peer_req_identity = {
+    sb_rx_opcode, sb_rx_srcid, sb_rx_dstid, sb_rx_msginfo,
+    sb_rx_msgcode, sb_rx_msgsubcode, peer_req_identity_payload
+  };
+  wire peer_req_identity_match =
+    (rx_peer_req_identity == peer_req_identity_q);
+
+  wire phase_b_early_rsp = phase_b_peer_rsp &&
+                           (state_entry || !local_req_accepted_q);
+  wire phase_b_peer_req_conflict = phase_b_peer_req && !state_entry &&
+                                   peer_req_valid_q &&
+                                   !peer_req_identity_match;
+  wire post_sbinit_rx_event = sb_rx_pkt_vld &&
+                              (state_q != LT_RESET) &&
+                              (state_q != LT_SBINIT);
+  wire phase_b_rx_fatal = post_sbinit_rx_event &&
+                          (!phase_b_packet_valid || phase_b_early_rsp ||
+                           phase_b_peer_req_conflict);
 
   // =========================================================================
   // Sideband transmit scheduling
@@ -520,9 +788,6 @@ module ltsm #(
   // Out-of-Reset repeats until a valid peer copy arrives. Done responses have
   // priority over the one local Done request. The pending counter preserves a
   // separate response obligation for every valid peer Done request.
-  wire generic_send = !state_entry && (state_q != LT_SBINIT) &&
-                      !sb_tx_busy && !req_sent_q &&
-                      (msg_req_code(state_q) != MC_NOP_CRD);
   wire sbinit_oor_send = (state_q == LT_SBINIT) &&
                          (sbinit_phase_q == SBI_OUT_OF_RESET) &&
                          !sbinit_oor_received_q && !sb_tx_busy;
@@ -534,6 +799,68 @@ module ltsm #(
                               (sbinit_phase_q == SBI_DONE) &&
                               (sbinit_done_rsp_pending_q == 8'd0) &&
                               !sbinit_done_req_sent_q && !sb_tx_busy;
+
+  // =========================================================================
+  // Phase B transmit scheduling and arbitration
+  // =========================================================================
+  // Arbitration is strict: queued current peer response, local request,
+  // then duplicate replay. A pending bit survives mailbox busy cycles and
+  // clears only when sb_tx_accepted identifies the selected transmission.
+  // State-entry and fatal-packet cycles suppress every Phase B transmission.
+  // PARAM uses DATA64. Every other sequence entry uses MSG_NODATA.
+  // Spec refs: UCIe 1.0 Tables 47 and 56;
+  //            PLAN.md Section 15.9 Phase B.
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // Wire: queued current peer response
+  // -------------------------------------------------------------------------
+  // This response has first priority and remains selected until acceptance.
+  // TX busy cannot discard the stored obligation or its request identity.
+  // The response role uses the current response code and current subcode.
+  // PARAM returns the immutable fixed response, not the peer request data.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
+  // -------------------------------------------------------------------------
+  wire tx_peer_resp = phase_b_active && !state_entry &&
+                      !phase_b_rx_fatal && peer_resp_pending_q &&
+                      !sb_tx_busy;
+
+  // -------------------------------------------------------------------------
+  // Wire: current local request
+  // -------------------------------------------------------------------------
+  // This request has second priority after the queued peer response.
+  // One request remains outstanding until the mailbox accepts this send.
+  // A matching response cannot complete it before that acceptance event.
+  // Each sequence step resets local_req_accepted_q before the next request.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
+  // -------------------------------------------------------------------------
+  wire tx_local_req = phase_b_active && !state_entry &&
+                      !phase_b_rx_fatal && !sb_tx_busy &&
+                      !local_req_accepted_q && !tx_peer_resp;
+
+  // -------------------------------------------------------------------------
+  // Wire: exact duplicate peer-request replay
+  // -------------------------------------------------------------------------
+  // This replay has third priority after the normal local request.
+  // One pending bit coalesces identical duplicates into one obligation.
+  // The response reproduces the current response code, subcode, and payload.
+  // A different request identity is fatal and never reaches this scheduler.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
+  // -------------------------------------------------------------------------
+  wire tx_dup_peer = phase_b_active && !state_entry &&
+                     !phase_b_rx_fatal && peer_replay_pending_q &&
+                     !sb_tx_busy && !tx_peer_resp && !tx_local_req;
+
+  // -------------------------------------------------------------------------
+  // Wire: PARAM DATA64 selection
+  // -------------------------------------------------------------------------
+  // PARAM is the only Phase B state with a data payload.
+  // Local requests use PARAM_REQ_DATA. Both response paths use
+  // PARAM_RSP_DATA. All non-PARAM sends retain a zero data input.
+  // Spec refs: UCIe 1.0 Table 47 and Table 56.
+  // -------------------------------------------------------------------------
+  wire tx_param_send = (state_q == LT_MBINIT_PARAM) &&
+                       (tx_peer_resp || tx_local_req || tx_dup_peer);
 
   // =========================================================================
   // Timer interfaces
@@ -548,13 +875,19 @@ module ltsm #(
   assign tmr_run       = timer_start_q;
 
   // =========================================================================
-  // Next-state and SBINIT policy
+  // Next-state, raw SBINIT policy, and Phase B transaction policy
+  // =========================================================================
+  // Defaults retain every registered obligation until an explicit event.
+  // State entry clears only state-scoped Phase B data and preserves SBINIT.
+  // A sequence step advances after local acceptance, its matching response,
+  // and all peer response or replay obligations complete.
+  // Invalid post-SBINIT packets override normal state progress below.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.2, 4.5.3.3, and 4.5.3.4;
+  //            PLAN.md Section 15.9 Phase B.
   // =========================================================================
   always_comb begin
     state_d                    = state_q;
     sbinit_phase_d             = sbinit_phase_q;
-    req_sent_d                 = req_sent_q;
-    resp_rcvd_d                = resp_rcvd_q;
     timer_start_d              = timer_start_q;
     reset_min_done_d           = reset_min_done_q;
     retrain_req_d              = retrain_req_q;
@@ -568,12 +901,25 @@ module ltsm #(
     sbinit_done_rsp_sent_d     = sbinit_done_rsp_sent_q;
     sbinit_done_rsp_received_d = sbinit_done_rsp_received_q;
     sbinit_done_rsp_pending_d  = sbinit_done_rsp_pending_q;
+    txn_step_d                 = txn_step_q;
+    local_req_accepted_d       = local_req_accepted_q;
+    local_resp_rcvd_d          = local_resp_rcvd_q;
+    peer_req_valid_d           = peer_req_valid_q;
+    peer_resp_pending_d        = peer_resp_pending_q;
+    peer_replay_pending_d      = peer_replay_pending_q;
+    peer_req_identity_d        = peer_req_identity_q;
+    phase_b_state_complete     = 1'b0;
 
-    // State entry resets only state-scoped handshakes. A new RESET epoch also
-    // clears every sticky pattern and SBINIT policy register.
+    // State entry resets state-scoped transaction data. A new RESET epoch
+    // also clears every sticky pattern and raw SBINIT policy register.
     if (state_entry) begin
-      req_sent_d    = 1'b0;
-      resp_rcvd_d   = 1'b0;
+      txn_step_d                 = 3'd0;
+      local_req_accepted_d       = 1'b0;
+      local_resp_rcvd_d          = 1'b0;
+      peer_req_valid_d           = 1'b0;
+      peer_resp_pending_d        = 1'b0;
+      peer_replay_pending_d      = 1'b0;
+      peer_req_identity_d        = 99'd0;
       timer_start_d = (state_q != LT_RESET) &&
                       (state_q != LT_ACTIVE) &&
                       (state_q != LT_L1L2) &&
@@ -603,11 +949,58 @@ module ltsm #(
         sbinit_done_rsp_received_d = 1'b0;
         sbinit_done_rsp_pending_d  = 8'd0;
       end
-    end else if (state_q != LT_SBINIT) begin
-      // Preserve the established one-request handshake for later training.
-      if (sb_tx_load) req_sent_d = 1'b1;
-      if (rx_phy_msg_valid && (msg_is_rsp || msg_is_req)) resp_rcvd_d = 1'b1;
-      if (resp_rcvd_d || tmr_expired) timer_start_d = 1'b0;
+    end
+
+    // Phase B accepts only the transmission selected by the strict arbiter.
+    // A response updates the local flag only after the request was accepted.
+    // The fatal wire removes early responses before this block can use them.
+    if (phase_b_active && !phase_b_rx_fatal) begin
+      if (sb_tx_accepted && tx_peer_resp)
+        peer_resp_pending_d = 1'b0;
+      if (sb_tx_accepted && tx_local_req)
+        local_req_accepted_d = 1'b1;
+      if (sb_tx_accepted && tx_dup_peer)
+        peer_replay_pending_d = 1'b0;
+
+      if (phase_b_peer_rsp)
+        local_resp_rcvd_d = 1'b1;
+
+      // The first peer request stores one exact identity and one response.
+      // An identical request while that response is queued adds nothing.
+      // After completion, one identical request creates one replay obligation.
+      if (phase_b_peer_req) begin
+        if (state_entry || !peer_req_valid_q) begin
+          peer_req_valid_d      = 1'b1;
+          peer_resp_pending_d   = 1'b1;
+          peer_req_identity_d   = rx_peer_req_identity;
+        end else if (peer_req_identity_match) begin
+          if (!peer_resp_pending_q && !peer_replay_pending_q)
+            peer_replay_pending_d = 1'b1;
+        end
+      end
+
+      // Complete one logical transaction only after every current obligation.
+      // Wait one cycle after peer-service acceptance. The retained identity
+      // then recognizes a duplicate that arrives after the completed response.
+      // Clearing all step-local data makes the next subcode a new transaction.
+      if (local_req_accepted_d && local_resp_rcvd_d &&
+          !peer_resp_pending_d && !peer_replay_pending_d &&
+          !(sb_tx_accepted && (tx_peer_resp || tx_dup_peer))) begin
+        local_req_accepted_d  = 1'b0;
+        local_resp_rcvd_d     = 1'b0;
+        peer_req_valid_d      = 1'b0;
+        peer_resp_pending_d   = 1'b0;
+        peer_replay_pending_d = 1'b0;
+        peer_req_identity_d   = 99'd0;
+
+        if (active_txn_step == sequence_last_step(state_q)) begin
+          txn_step_d             = 3'd0;
+          phase_b_state_complete = 1'b1;
+          timer_start_d          = 1'b0;
+        end else begin
+          txn_step_d = active_txn_step + 1'b1;
+        end
+      end
     end
 
     // Consume each atomic remote iteration result in lclk. A mismatch clears
@@ -741,40 +1134,58 @@ module ltsm #(
       end
 
       // -----------------------------------------------------------------
-      // 4.5.3.3 MBINIT sub-states
+      // 4.5.3.3 MBINIT fixed-profile sequences
       // -----------------------------------------------------------------
-      LT_MBINIT_PARAM: if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_CAL;
-      LT_MBINIT_CAL:   if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_RPCLK;
-      LT_MBINIT_RPCLK: if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_RPVAL;
-      LT_MBINIT_RPVAL: if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_REVMB;
-      LT_MBINIT_REVMB: if (req_sent_q && resp_rcvd_q) state_d = LT_MBINIT_RPMB;
-      LT_MBINIT_RPMB:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_VALVREF;
+      // PARAM [00], CAL [02], REPAIRCLK [03..08], REPAIRVAL [09..0C],
+      // REVERSALMB [0D..10], and REPAIRMB [11..14] complete in order.
+      // phase_b_state_complete asserts only after the final transaction.
+      // Spec ref: UCIe 1.0 Section 4.5.3.3 and Table 56.
+      LT_MBINIT_PARAM:
+        if (phase_b_state_complete) state_d = LT_MBINIT_CAL;
+      LT_MBINIT_CAL:
+        if (phase_b_state_complete) state_d = LT_MBINIT_RPCLK;
+      LT_MBINIT_RPCLK:
+        if (phase_b_state_complete) state_d = LT_MBINIT_RPVAL;
+      LT_MBINIT_RPVAL:
+        if (phase_b_state_complete) state_d = LT_MBINIT_REVMB;
+      LT_MBINIT_REVMB:
+        if (phase_b_state_complete) state_d = LT_MBINIT_RPMB;
+      LT_MBINIT_RPMB:
+        if (phase_b_state_complete) state_d = LT_MB_VALVREF;
 
       // -----------------------------------------------------------------
-      // 4.5.3.4 MBTRAIN sub-states
+      // 4.5.3.4 MBTRAIN fixed-profile sequences
       // -----------------------------------------------------------------
-      LT_MB_VALVREF:   if (req_sent_q && resp_rcvd_q) state_d = LT_MB_DATAVREF;
-      LT_MB_DATAVREF:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_SPEEDIDLE;
-      LT_MB_SPEEDIDLE: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_TXSELFCAL;
-      LT_MB_TXSELFCAL: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_RXCLKCAL;
-      LT_MB_RXCLKCAL:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_VTCENTER;
-      LT_MB_VTCENTER:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_DTVREF1;
-      LT_MB_DTVREF1:   if (req_sent_q && resp_rcvd_q) state_d = LT_MB_RXDESKEW;
-      LT_MB_RXDESKEW:  if (req_sent_q && resp_rcvd_q) state_d = LT_MB_DTCENTER2;
-      LT_MB_DTCENTER2: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_LINKSPEED;
-      LT_MB_LINKSPEED: if (req_sent_q && resp_rcvd_q) state_d = LT_MB_REPAIR;
+      // Each state consumes every listed subcode from the sequence lookup.
+      // LINKSPEED requires both 15h and 19h transactions before LINKINIT.
+      // Any other LINKSPEED result fails complete-packet validation.
+      // Spec ref: UCIe 1.0 Section 4.5.3.4 and Tables 53 and 54.
+      LT_MB_VALVREF:
+        if (phase_b_state_complete) state_d = LT_MB_DATAVREF;
+      LT_MB_DATAVREF:
+        if (phase_b_state_complete) state_d = LT_MB_SPEEDIDLE;
+      LT_MB_SPEEDIDLE:
+        if (phase_b_state_complete) state_d = LT_MB_TXSELFCAL;
+      LT_MB_TXSELFCAL:
+        if (phase_b_state_complete) state_d = LT_MB_RXCLKCAL;
+      LT_MB_RXCLKCAL:
+        if (phase_b_state_complete) state_d = LT_MB_VTCENTER;
+      LT_MB_VTCENTER:
+        if (phase_b_state_complete) state_d = LT_MB_DTVREF1;
+      LT_MB_DTVREF1:
+        if (phase_b_state_complete) state_d = LT_MB_RXDESKEW;
+      LT_MB_RXDESKEW:
+        if (phase_b_state_complete) state_d = LT_MB_DTCENTER2;
+      LT_MB_DTCENTER2:
+        if (phase_b_state_complete) state_d = LT_MB_LINKSPEED;
+      LT_MB_LINKSPEED:
+        if (phase_b_state_complete) state_d = LT_LINKINIT;
 
-      LT_MB_REPAIR: begin
-        if (req_sent_q && resp_rcvd_q) begin
-          if (sb_rx_msginfo == MS_LKS_EXIT_REP) begin
-            state_d = LT_MB_TXSELFCAL;
-          end else if (sb_rx_msginfo == MS_LKS_EXIT_DEG) begin
-            state_d = LT_MB_TXSELFCAL;
-          end else if (sb_rx_msginfo == MS_LKS_DONE) begin
-            state_d = LT_LINKINIT;
-          end
-        end
-      end
+      // MBTRAIN.REPAIR is outside the fixed profile. It does not issue a
+      // request and cannot route a LINKSPEED success or failure. Reaching it
+      // is itself fatal, while supported LINKSPEED success goes to LINKINIT.
+      // Spec ref: UCIe 1.0 Section 4.5.3.4.13.
+      LT_MB_REPAIR: state_d = LT_TRAINERROR;
 
       // -----------------------------------------------------------------
       // 4.5.3.5 LINKINIT through 4.5.3.9 terminal/runtime states
@@ -787,8 +1198,11 @@ module ltsm #(
         if (retrain_req_q) state_d = LT_PHYRETRAIN;
       end
 
+      // Phase B does not implement PHYRETRAIN. The fixed profile never
+      // requests this state, and no sideband exchange starts from it.
+      // Spec ref: PLAN.md Section 5.1 and Section 15.9 Phase B.
       LT_PHYRETRAIN: begin
-        if (req_sent_q && resp_rcvd_q) state_d = LT_ACTIVE;
+        state_d = state_q;
       end
 
       LT_L1L2: begin
@@ -802,6 +1216,14 @@ module ltsm #(
       default: state_d = LT_RESET;
     endcase
 
+    // Every invalid packet after SBINIT is fatal. This override also catches
+    // wrong-state traffic in LINKINIT and runtime states without adding any
+    // Phase C message handling.
+    if (phase_b_rx_fatal) begin
+      state_d       = LT_TRAINERROR;
+      timer_start_d = 1'b0;
+    end
+
     // Every timed training state uses one uninterrupted residency deadline.
     if (tmr_expired && timer_start_q &&
         (state_q != LT_ACTIVE) && (state_q != LT_L1L2) &&
@@ -814,30 +1236,110 @@ module ltsm #(
   // =========================================================================
   // Sideband TX packet interface
   // =========================================================================
-  // The specialized SBINIT scheduler selects 91h/00h, 95h/01h, or 9Ah/01h.
-  // All other training states use the existing lookup tables. Every Physical
-  // Layer training packet uses the UCIe-Link PHY source and remote-PHY IDs.
-  assign sb_tx_load = generic_send || sbinit_oor_send ||
-                      sbinit_done_rsp_send || sbinit_done_req_send;
-  assign sb_tx_opcode = SB_OP_MSG_NODATA;
+  // SBINIT keeps its dedicated packet scheduler and field values.
+  // Phase B emits the current fixed-profile subcode with a strict role.
+  // Peer response and duplicate replay paths both emit response packets.
+  // PARAM is the only DATA64 exchange. Every other data input is zero.
+  // Spec refs: UCIe 1.0 Tables 47, 49, 53, 54, and 56.
+  // =========================================================================
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband TX load
+  //
+  // The load pulse selects one raw SBINIT or Phase B transmission.
+  // Phase B source wires are mutually exclusive under the strict arbiter.
+  // A busy mailbox leaves each stored response obligation unchanged.
+  // Spec refs: UCIe 1.0 Section 6.1.3 and PLAN.md Section 15.9 Phase B.
+  // -------------------------------------------------------------------------
+  assign sb_tx_load = sbinit_oor_send || sbinit_done_rsp_send ||
+                      sbinit_done_req_send || tx_peer_resp ||
+                      tx_local_req || tx_dup_peer;
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband TX opcode
+  //
+  // PARAM packets use DATA64 for requests, responses, and replays.
+  // Raw SBINIT and every non-PARAM Phase B packet use MSG_NODATA.
+  // tx_param_send can assert only while a PARAM packet is selected.
+  // Spec refs: UCIe 1.0 Table 47 and Table 56.
+  // -------------------------------------------------------------------------
+  assign sb_tx_opcode = tx_param_send ? SB_OP_MSG_DATA64 : SB_OP_MSG_NODATA;
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband TX source and destination IDs
+  //
+  // Every packet produced by this LTSM uses the Physical Layer source ID.
+  // Every packet targets the remote-die Physical Layer destination ID.
+  // The values apply equally to raw SBINIT packets and Phase B packets.
+  // Spec ref: UCIe 1.0 Table 49.
+  // -------------------------------------------------------------------------
   assign sb_tx_srcid = SRCID_PHY;
   assign sb_tx_dstid = DSTID_REMOTE_PHY;
-  assign sb_tx_msginfo = sbinit_oor_send ? SBINIT_RESULT_PRIMARY :
-                                              msg_info(state_q);
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband TX MsgInfo
+  //
+  // SBINIT Out-of-Reset preserves the primary-side result value.
+  // Every other SBINIT packet and every Phase B packet uses zero MsgInfo.
+  // LINKSPEED results are subcodes and never travel in MsgInfo.
+  // Spec refs: UCIe 1.0 Tables 53, 54, and 56.
+  // -------------------------------------------------------------------------
+  assign sb_tx_msginfo = sbinit_oor_send ? SBINIT_RESULT_PRIMARY : 8'h00;
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband TX message code
+  //
+  // Raw SBINIT packets retain their dedicated request and response codes.
+  // Both peer-service paths use the response code for the current state.
+  // Only tx_local_req uses the current MBINIT or MBTRAIN request code.
+  // Spec refs: UCIe 1.0 Tables 53, 54, and 56.
+  // -------------------------------------------------------------------------
   assign sb_tx_msgcode = sbinit_oor_send      ? MC_SB_OOB_RESET :
-                             sbinit_done_rsp_send ? MC_SB_DONE_RSP  :
-                             sbinit_done_req_send ? MC_SB_DONE_REQ  :
-                                                    msg_req_code(state_q);
-  assign sb_tx_msgsubcode = sbinit_oor_send      ? MS_SB_OOB_RESET :
-                                (sbinit_done_rsp_send ||
-                                 sbinit_done_req_send) ? MS_SB_DONE :
-                                                        msg_subcode(state_q);
+                         sbinit_done_rsp_send ? MC_SB_DONE_RSP  :
+                         sbinit_done_req_send ? MC_SB_DONE_REQ  :
+                         (tx_peer_resp || tx_dup_peer)
+                           ? msg_rsp_code(state_q)
+                           : msg_req_code(state_q);
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband TX message subcode
+  //
+  // Raw SBINIT packets retain Out-of-Reset and Done subcodes.
+  // Every Phase B role uses the exact current sequence subcode.
+  // The private step changes only after the current transaction completes.
+  // Spec refs: UCIe 1.0 Tables 53, 54, and 56.
+  // -------------------------------------------------------------------------
+  assign sb_tx_msgsubcode = sbinit_oor_send ? MS_SB_OOB_RESET :
+                            (sbinit_done_rsp_send || sbinit_done_req_send)
+                              ? MS_SB_DONE
+                              : current_subcode;
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband TX fixed header and payload fields
+  //
+  // PARAM local requests use immutable PARAM_REQ_DATA.
+  // PARAM peer responses and duplicate replays use PARAM_RSP_DATA.
+  // All non-PARAM sends drive zero on sb_tx_data_in and clear has_data.
+  // Remaining message-format fields use their fixed zero values.
+  // Spec refs: UCIe 1.0 Section 6.1.2 and Table 56.
+  // -------------------------------------------------------------------------
   assign sb_tx_be       = 8'h00;
   assign sb_tx_tag      = 5'h00;
   assign sb_tx_ep       = 1'b0;
   assign sb_tx_addr     = 12'h000;
-  assign sb_tx_data_in  = 64'h0;
-  assign sb_tx_has_data = 1'b0;
+  assign sb_tx_data_in  = tx_param_send
+                            ? (tx_local_req ? PARAM_REQ_DATA : PARAM_RSP_DATA)
+                            : 64'h0;
+  assign sb_tx_has_data = tx_param_send;
+
+  // -------------------------------------------------------------------------
+  // assign: Sideband timeout and stall status
+  //
+  // Phase B uses the existing LTSM residency timer instead of message timeout.
+  // This reduced profile does not insert sideband stall messages.
+  // Both status outputs therefore remain at their fixed inactive values.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
+  // -------------------------------------------------------------------------
   assign sb_msg_timeout = 1'b0;
   assign sb_stall_sent  = 1'b0;
 
@@ -963,33 +1465,30 @@ module ltsm #(
   assign lnk_is_x8       = 1'b0;   // x16 only in this reduced capability set
   assign degrade_lanes   = 2'b00;
 
-  // The retrain request is accepted through the sideband interface by the
-  // state machine above; no separate register is needed here.
+  // Phase B does not create a retrain request. Phase C owns runtime RDI
+  // retrain policy, so the retained status register remains inactive here.
 
   // =========================================================================
   // Lint suppression
   // =========================================================================
-  // Continuous assign so Icarus Verilog evaluates all bit-select references.
-  // Every signal listed here is consumed by the combinational logic above
-  // but may appear unused to lint tools due to the function-based message
-  // matching.
+  // The fixed profile does not consume adapter_active_req until Phase C.
+  // This reduction keeps that public input and selected policy wires visible
+  // to simple single-pass lint tools without adding runtime behavior.
   // =========================================================================
   logic unused_match;
   // -------------------------------------------------------------------------
-  // assign: Lint-Suppression Tie-Off
+  // assign: Lint-suppression tie-off
   //
-  // Combines every sideband RX field, timer, and pattern-done signal that
-  // is read only inside functions or conditional expressions. Without this
-  // tie-off, Icarus Verilog reports spurious "unused" warnings because the
-  // function-call-based message matching hides the references from its
-  // single-pass analysis.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // This signal combines the deferred Active-entry input with Phase B
+  // classifier results that some tools hide through function calls.
+  // It does not feed LTSM policy or change any state transition.
+  // Phase C will consume adapter_active_req through its required exchange.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.5 and 8.1.6.
   // -------------------------------------------------------------------------
-  assign unused_match = msg_is_req | msg_is_rsp | tmr_expired | pat_done |
-                        sb_rx_pkt_vld | sb_rx_opcode[0] | sb_rx_srcid[0] |
-                        sb_rx_dstid[0] | sb_rx_msginfo[0] | sb_rx_cp_err |
-                        sb_rx_dp_err | sb_tx_busy;
+  assign unused_match = adapter_active_req | phase_b_packet_valid |
+                        phase_b_rx_fatal | peer_req_identity_match |
+                        tmr_expired | pat_done | sb_tx_busy |
+                        sb_tx_accepted | sb_rx_payload[0];
 
 endmodule
 

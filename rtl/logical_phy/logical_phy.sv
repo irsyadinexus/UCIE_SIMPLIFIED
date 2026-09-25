@@ -140,8 +140,10 @@
 //   v0.0.12 2026-09-24  Phase A: force low mainband data and framing through
 //                        every immediate-success MBINIT and MBTRAIN state.
 //   v0.0.13 2026-09-24  Clarify the private Phase A DATA64 payload boundary.
-//   v0.0.14 2026-09-24  Phase B: expose private mailbox source acceptance and
-//                        the retained DATA64 payload to the LTSM.
+  // v0.0.14 2026-09-24  Phase B: expose private mailbox source acceptance and
+  //                        the retained DATA64 payload to the LTSM.
+  // v0.0.15 2026-09-25  Phase C: route private RDI request, fresh-event,
+  //                        Active-entry result, and Start-copy-clear signals.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -177,8 +179,8 @@ module logical_phy #(
   output logic [2:0]  rdi_pl_lnk_cfg,
   output logic [2:0]  rdi_pl_speedmode,
   output logic        rdi_pl_stallreq,
+  output logic        clear_start_link_train,
   input  logic        adapter_active_req,
-
   // -------------------------------------------------- sideband to partner
   output logic [NC-1:0] sb_tx_data,
   output logic        sb_tx_valid,
@@ -326,7 +328,11 @@ module logical_phy #(
   logic        rst_tmr_expired;
   // ------------------------------------------------- LTSM <-> adapter
   logic        csr_start_link_train;
-  wire         ltsm_start_link_train;
+  logic        ltsm_software_start_q;
+  logic        ltsm_software_start_event;
+  logic        rdi_active_req_q;
+  logic        ltsm_rdi_active_event;
+  logic        ltsm_active_entry_done;
   logic        link_trained;
   logic        train_error;
   logic        link_reset_out;
@@ -334,8 +340,6 @@ module logical_phy #(
   logic [7:0]  ltsm_state;
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
-
-  // ------------------------------------------------- RDI <-> LTSM
   logic        local_active_req;
 
   // ------------------------------------------------- CSR
@@ -653,11 +657,53 @@ module logical_phy #(
   // per spec 4.5.3. The 4 ms reset timer (u_reset_timer) enforces the
   // minimum RESET duration requirement per spec 4.5.3.1.
   // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // always_ff: Private LTSM Start and RDI event sampling
+  //
+  // Samples source levels so the LTSM receives one event for each software
+  // Start rising edge and each RDI NOP-to-Active transition. Held levels do
+  // not create a recovery trigger after RESET. The same RDI request levels
+  // select the Active, LinkReset, and Disabled Phase C exchanges.
+  //
+  // Spec ref: UCIe 1.0, Sections 8.1.6 and 8.3.2.5-.8;
+  //           PLAN.md Sections 15.4 and 15.9 Phase C.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      ltsm_software_start_q <= 1'b0;
+      rdi_active_req_q      <= 1'b0;
+    end else begin
+      ltsm_software_start_q <= start_link_train | csr_start_link_train;
+      rdi_active_req_q      <=
+        (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE);
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // assign: Private LTSM policy events
+  //
+  // These wires translate existing local RDI levels into the LTSM private
+  // Phase C policy interface. The edge forms enforce the fresh-trigger rule.
+  // They do not alter the public RDI interface or the SBINIT raw boundary.
+  //
+  // Spec ref: UCIe 1.0, Sections 8.1.6 and 8.3.2.8;
+  //           PLAN.md Sections 15.4 and 15.9 Phase C.
+  // ---------------------------------------------------------------------------
+  assign ltsm_software_start_event =
+    (start_link_train | csr_start_link_train) && !ltsm_software_start_q;
+  assign ltsm_rdi_active_event =
+    (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE) && !rdi_active_req_q;
+
   ltsm #(.NLANES(NLANES)) u_ltsm (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
-    .start_link_train(ltsm_start_link_train),
-    .adapter_active_req(adapter_active_req),
+    .software_start_event(ltsm_software_start_event),
+    .rdi_active_event(ltsm_rdi_active_event),
+    .rdi_active_req  (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE),
+    .rdi_linkreset_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_LINKRESET),
+    .rdi_disabled_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_DISABLED),
+    .active_entry_done(ltsm_active_entry_done),
+    .clear_start_link_train(clear_start_link_train),
     .link_trained    (link_trained),
     .train_error     (train_error),
     .link_reset_out  (link_reset_out),
@@ -884,6 +930,7 @@ module logical_phy #(
     .lnk_is_x8     (lnk_is_x8),
     .degrade_lanes (degrade_lanes),
     .train_error   (train_error),
+    .clear_start_link_train(clear_start_link_train),
     .start_link_train(csr_start_link_train)
   );
 
@@ -921,15 +968,14 @@ module logical_phy #(
   assign rdi_pl_stallreq = 1'b0;
 
   // ---------------------------------------------------------------------------
-  // LTSM start-link-train OR gate  (spec 4.5.3.1 RESET exits)
+  // Legacy LTSM start-link-train OR gate removed in Phase C.
+  //
+  // The private event sampler above converts the top-level and CSR levels
+  // into one-shot requests. This prevents a held Start level from restarting
+  // training after LinkReset or Disabled recovery.
+  //
+  // Spec ref: UCIe 1.0, Section 8.3.2.8; PLAN.md Section 15.9 Phase C.
   // ---------------------------------------------------------------------------
-  // The LTSM exits RESET on either:
-  //   (a) the top-level start_link_train input pin (testbench / system
-  //       controller), or
-  //   (b) a CSR write to TRAIN_CTL[0] (software-initiated training start).
-  // Both paths are spec-compliant RESET exit stimuli per 4.5.3.1.
-  // ---------------------------------------------------------------------------
-  assign ltsm_start_link_train = start_link_train | csr_start_link_train;
 
   // ---------------------------------------------------------------------------
   // CSR access path stub  (spec 7.1 sideband register access)

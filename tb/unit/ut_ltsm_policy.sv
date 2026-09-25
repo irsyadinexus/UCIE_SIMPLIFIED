@@ -115,6 +115,9 @@
 //                        now exits only after the 15h start and then the
 //                        19h done transaction, both selected by subcode.
 //
+//   v0.0.3  2026-09-25  Phase C: add LinkReset and Disabled recovery,
+//                        TRAINERROR timeout, LinkError hold, RESET dwell,
+//                        and fresh Start-trigger coverage.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -126,6 +129,7 @@ module ut_ltsm_policy;
   // ---- clocks and reset
   logic        lclk, lreset_n;
   logic        start_link_train, adapter_active_req;
+  logic        rdi_linkreset_req, rdi_disabled_req;
   logic        link_trained, train_error, link_reset_out, phy_retrain_done;
   logic [7:0]  ltsm_state;
   logic        lnk_is_x8;
@@ -211,8 +215,13 @@ module ut_ltsm_policy;
   // =========================================================================
   ltsm #(.NLANES(NLANES_MAX)) u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
-    .start_link_train(start_link_train),
-    .adapter_active_req(adapter_active_req),
+    .software_start_event(start_link_train),
+    .rdi_active_event(1'b0),
+    .rdi_active_req(adapter_active_req),
+    .rdi_linkreset_req(rdi_linkreset_req),
+    .rdi_disabled_req(rdi_disabled_req),
+    .active_entry_done(),
+    .clear_start_link_train(),
     .link_trained(link_trained), .train_error(train_error),
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
@@ -445,6 +454,8 @@ module ut_ltsm_policy;
       tx_grant             = grant;
       start_link_train     = 1'b0;
       adapter_active_req   = 1'b0;
+      rdi_linkreset_req    = 1'b0;
+      rdi_disabled_req     = 1'b0;
       sb_rx_pkt_vld        = 1'b0;
       sbinit_rx_iter_vld   = 1'b0;
       sbinit_rx_iter_match = 1'b0;
@@ -543,12 +554,12 @@ module ut_ltsm_policy;
     end
   endtask
 
-  // Lookup: request code -> response code.
   function automatic logic [7:0] rsp_for(input logic [7:0] code);
     case (code)
       MC_SB_DONE_REQ:  rsp_for = MC_SB_DONE_RSP;
       MC_MBINIT_REQ:   rsp_for = MC_MBINIT_RSP;
       MC_MBTRAIN_REQ:  rsp_for = MC_MBTRAIN_RSP;
+      MC_LM_RDI_REQ:   rsp_for = MC_LM_RDI_RSP;
       MC_PHYR_REQ:     rsp_for = MC_PHYR_RSP;
       default:         rsp_for = MC_TE_RSP;
     endcase
@@ -576,7 +587,6 @@ module ut_ltsm_policy;
       await_request();
       reply_matching();
       version = tx_version;
-      // A state change or a new transmission proves this step completed.
       fork
         begin
           wait (ltsm_state != st);
@@ -594,9 +604,14 @@ module ut_ltsm_policy;
     end
   endtask
 
-  // Assert the LTSM escalated to TRAINERROR after a fatal packet.
+  // Assert that a fatal packet completes the Phase C TRAINERROR Entry
+  // exchange. The directed partner answers E5h/00h with EAh/00h, then the
+  // public TRAINERROR hold proves the required LinkError result.
   task expect_fatal;
     begin
+      await_tx_code(MC_TE_REQ);
+      if ((cap_code == MC_TE_REQ) && (cap_sub == MS_TE_ENTRY))
+        drive_nodata(MC_TE_RSP, MS_TE_ENTRY);
       fork
         begin
           wait (ltsm_state == LT_TRAINERROR);
@@ -684,6 +699,7 @@ module ut_ltsm_policy;
       repeat (10) @(posedge lclk);
       drive_rx(bad_opcode, bad_srcid, bad_dstid, bad_msginfo,
                bad_msgcode, bad_msgsubcode, bad_payload, bad_cp, bad_dp);
+      if (!grant) tx_grant = 1'b1;
       expect_fatal();
     end
   endtask
@@ -1100,8 +1116,15 @@ module ut_ltsm_policy;
         errs = errs + 1;
       end
 
-      // Wait for the pattern phase to finish and reach ACTIVE.
-      wait_state_bounded(LT_ACTIVE, C_DEADLINE_LONG);
+      // LINKINIT exits only after the local LinkMgmt.RDI Active request has
+      // a matching response. The diagnostic pattern does not gate this path.
+      await_request();
+      if ((cap_code != MC_LM_RDI_REQ) || (cap_sub != MS_LM_ACTIVE)) begin
+        $display("FAIL linkspeed: missing LinkMgmt.RDI Active request");
+        errs = errs + 1;
+      end
+      drive_nodata(MC_LM_RDI_RSP, MS_LM_ACTIVE);
+      wait_state_bounded(LT_ACTIVE, C_DEADLINE);
       repeat (2) @(posedge lclk);
       if (ltsm_state != LT_ACTIVE) begin
         $display("FAIL linkspeed: LINKINIT did not reach ACTIVE");
@@ -1134,12 +1157,129 @@ module ut_ltsm_policy;
   endtask
 
   // =========================================================================
+  // Scenario 8: Phase C Recovery Policy
+  // TRAINERROR holds LinkError, accepts LinkReset only, and returns to RESET.
+  // Disabled also returns to RESET. Each RESET entry needs a fresh trigger.
+  // =========================================================================
+  task test_recovery_policy;
+    int errs;
+    int reset_cycles;
+    begin
+      errs = 0;
+      $display("--- Scenario 8: Recovery Policy ---");
+
+      // A malformed packet starts TRAINERROR Entry. Do not answer TE_REQ.
+      // The 8 ms timer must complete the exchange and hold LinkError.
+      bad_opcode     = SB_OP_MSG_DATA64;
+      bad_srcid      = SRCID_ADAPT;
+      bad_dstid      = DSTID_REMOTE_PHY;
+      bad_msginfo    = 8'h00;
+      bad_msgcode    = MC_MBINIT_RSP;
+      bad_msgsubcode = MS_PARAM_CFG;
+      bad_payload    = PARAM_RSP_DATA;
+      bad_cp         = 1'b0;
+      bad_dp         = 1'b0;
+      run_to_mbinit_param(1'b1);
+      repeat (10) @(posedge lclk);
+      drive_rx(bad_opcode, bad_srcid, bad_dstid, bad_msginfo,
+               bad_msgcode, bad_msgsubcode, bad_payload, bad_cp, bad_dp);
+      await_tx_code(MC_TE_REQ);
+      @(posedge tmr_expired);
+      @(posedge lclk);
+      #0.1;
+      if ((ltsm_state != LT_TRAINERROR) || !train_error) begin
+        $display("FAIL recovery: TRAINERROR timeout did not hold LinkError");
+        errs = errs + 1;
+      end
+
+      // A Start pulse during TRAINERROR is stale and must not trigger recovery.
+      @(negedge lclk);
+      start_link_train = 1'b1;
+      @(posedge lclk);
+      @(negedge lclk);
+      start_link_train = 1'b0;
+
+      // LinkReset is the only supported TRAINERROR recovery request.
+      rdi_linkreset_req = 1'b1;
+      await_tx_code(MC_LM_RDI_REQ);
+      if (cap_sub != MS_LM_LINKRESET) begin
+        $display("FAIL recovery: missing LinkReset request");
+        errs = errs + 1;
+      end
+      drive_nodata(MC_LM_RDI_RSP, MS_LM_LINKRESET);
+      rdi_linkreset_req = 1'b0;
+      wait_state_bounded(LT_RESET, C_DEADLINE);
+      if (ltsm_state != LT_RESET || train_error) begin
+        $display("FAIL recovery: LinkReset did not enter RESET");
+        errs = errs + 1;
+      end
+
+      // The policy bench uses a short equivalent RESET interval. Count it and
+      // reject the stale Start pulse before checking the fresh pulse.
+      reset_cycles = 0;
+      while (!rst_tmr_expired) begin
+        @(posedge lclk);
+        reset_cycles = reset_cycles + 1;
+      end
+      if (reset_cycles < (C_RESET_FAST - 2)) begin
+        $display("FAIL recovery: RESET dwell too short (%0d cycles)",
+                 reset_cycles);
+        errs = errs + 1;
+      end
+      repeat (2) @(posedge lclk);
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL recovery: stale Start left RESET");
+        errs = errs + 1;
+      end
+
+      // A fresh Start event is required after the recovery dwell.
+      @(negedge lclk);
+      start_link_train = 1'b1;
+      @(posedge lclk);
+      @(negedge lclk);
+      start_link_train = 1'b0;
+      wait_state_bounded(LT_SBINIT, C_DEADLINE);
+      if (ltsm_state != LT_SBINIT) begin
+        $display("FAIL recovery: fresh Start did not leave RESET");
+        errs = errs + 1;
+      end
+
+      // Disabled follows the same RESET and fresh-trigger policy.
+      run_to_mbinit_param(1'b1);
+      rdi_disabled_req = 1'b1;
+      await_tx_code(MC_LM_RDI_REQ);
+      if (cap_sub != MS_LM_DISABLE) begin
+        $display("FAIL recovery: missing Disabled request");
+        errs = errs + 1;
+      end
+      drive_nodata(MC_LM_RDI_RSP, MS_LM_DISABLE);
+      rdi_disabled_req = 1'b0;
+      wait_state_bounded(LT_RESET, C_DEADLINE);
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL recovery: Disabled did not enter RESET");
+        errs = errs + 1;
+      end
+      wait (rst_tmr_expired);
+      repeat (2) @(posedge lclk);
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL recovery: Disabled accepted a held trigger");
+        errs = errs + 1;
+      end
+
+      total_errors = total_errors + errs;
+      if (errs == 0)
+        $display("  PASS: TRAINERROR, LinkReset, Disabled, and fresh Start");
+    end
+  endtask
+
+  // =========================================================================
   // Main test sequence
   // =========================================================================
   initial begin
     total_errors = 0;
     tx_grant     = 1'b1;
-
+    rdi_linkreset_req = 1'b0;
+    rdi_disabled_req  = 1'b0;
     test_role_separation();
     test_invalid_packets();
     test_duplicate_replay();
@@ -1147,6 +1287,7 @@ module ut_ltsm_policy;
     test_arbitration();
     test_param_compatibility();
     test_linkspeed_outcomes();
+    test_recovery_policy();
 
     $display("");
     if (total_errors == 0)

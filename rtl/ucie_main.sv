@@ -240,7 +240,17 @@
 //                                           Link DVSEC - Error Notification
 //                                           Control. The configuration
 //                                           sideband signals are now cited to
-//                                           Table 115 and Section 5.13.
+  // v0.0.5    2026-09-23    Documentation: replace the
+  //                                        fabricated "Table 68 - Sideband
+  //                                        and Configuration signal list"
+  //                                        citation. Table 68 is the UCIe
+  //                                        Link DVSEC - Error Notification
+  //                                        Control. The configuration
+  //                                        sideband signals are now cited to
+  //                                        Table 115 and Section 5.13.
+  // v0.0.6    2026-09-25    Phase C: wire the private LTSM Active-entry Start
+  //                                        clear from logical_phy to the
+  //                                        Adapter register copy.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -367,6 +377,9 @@ module ucie_main #(
   // ==========================================================================
   logic        adapter_active_req;
   logic        link_active_obs;
+  // Private Phase C clear from the Logical PHY Active Entry result.
+  logic        clear_start_link_train;
+
 
   // --------------------------------------------------------------------------
   // assign : adapter_active_req forwarding
@@ -455,6 +468,7 @@ module ucie_main #(
     .pl_cfg          (pl_cfg),
     .pl_cfg_vld      (pl_cfg_vld),
     .start_link_train(start_link_train),
+    .clear_start_link_train(clear_start_link_train),
     .ltsm_state_obs  (),
     .link_active_obs (link_active_obs)
   );
@@ -501,6 +515,7 @@ module ucie_main #(
     .rdi_pl_lnk_cfg  (rdi_pl_lnk_cfg),
     .rdi_pl_speedmode(rdi_pl_speedmode),
     .rdi_pl_stallreq (rdi_pl_stallreq),
+    .clear_start_link_train(clear_start_link_train),
     // sideband to partner
     .sb_tx_data      (sb_tx_data),
     .sb_tx_valid     (sb_tx_valid),

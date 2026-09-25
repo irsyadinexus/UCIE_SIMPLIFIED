@@ -22,7 +22,12 @@
 //   ------  -----------------  ------  ----------------------------------------
 //   0x00    UCIe Link Control  RW      Bit 0: start link training. Set by SW
 //                                       write or by the start_link_train_wr
-//                                       hardware trigger.
+//                                       hardware trigger. Cleared by the
+//                                       private clear_start_link_train input
+//                                       after a successful Active Entry; the
+//                                       clear wins over the SW write and the
+//                                       hardware trigger (PLAN.md 15.9
+//                                       Phase C).
 //   0x08    UCIe Link Status   RO/HW   [0]   in-band presence (from RDI).
 //                                       [4:1] RDI state status.
 //                                       [6:5] link width (hardcoded 10b = x16).
@@ -47,6 +52,12 @@
 //   ltsm_state, trainerror, phyinrecenter) come from the adapter and PHY
 //   status signals. Software-read outputs (start_link_train, link_status_active)
 //   are decoded from the register contents.
+//
+//   Private input: clear_start_link_train. Driven by d2d_adapter.sv from the
+//   private training event path, not a public top-level port. It clears
+//   bit 0 of the Link Control register after the LTSM completes Active Entry,
+//   and has priority over a concurrent CfgWr to 0x00 and over
+//   start_link_train_wr (PLAN.md section 15.9 Phase C).
 //
 //   Per spec 7.1: configuration register access via sideband is supported,
 //   but no analog/AFE circuits are implemented in this simplified endpoint.
@@ -75,6 +86,17 @@
 //                        All now cite Section 7.5, with Link Capability,
 //                        Control and Status as Tables 64, 65 and 66, and the
 //                        error logs as Sections 7.5.3.30/.31 (Tables 108/109).
+//   v0.0.6  2026-09-25  Phase C private clear. Add the private input
+//                        clear_start_link_train. It clears bit 0 of
+//                        reg_link_ctrl (UCIe Link Control, offset 0x00) after
+//                        a successful Active Entry. The clear has priority
+//                        over a concurrent sideband CfgWr to 0x00 and over
+//                        the start_link_train_wr hardware set event, and it
+//                        leaves bits [63:1] unchanged. All other registers
+//                        keep their existing behaviour. Comments for the
+//                        header, interface, Link Control storage and the
+//                        decoded start_link_train output now cite PLAN.md
+//                        section 15.9 Phase C and UCIe 1.0 section 7.5.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -103,6 +125,25 @@ module adapter_regfile (
   input  logic [7:0]  ltsm_state,            // Error Log 0 State N
   input  logic        trainerror,
   input  logic        phyinrecenter,
+
+  // ------------------------------------------------------------------------
+  // Private Active Entry clear (PLAN.md section 15.9 Phase C;
+  // UCIe 1.0 section 7.5 - UCIe Registers).
+  // ------------------------------------------------------------------------
+  // clear_start_link_train is a private input driven by the Adapter wrapper
+  // d2d_adapter.sv, which receives it from the private training event path.
+  // It is NOT a public top-level port.
+  //
+  // The LTSM asserts this input after a successful Active Entry. The clear
+  // retires the Adapter sticky Start copy, so an accepted Start level cannot
+  // request training a second time (PLAN.md section 15.9 Phase C, fresh
+  // software Start event requirement).
+  //
+  // The clear forces bit 0 of reg_link_ctrl to 0 and leaves bits [63:1]
+  // unchanged. It has priority over a concurrent sideband CfgWr to offset
+  // 0x00 and over the start_link_train_wr hardware set event.
+  // ------------------------------------------------------------------------
+  input  logic        clear_start_link_train,
 
   // Software read side.
   output logic        start_link_train,
@@ -134,6 +175,12 @@ module adapter_regfile (
   // Six 64-bit registers. Each is maintained by its own always_ff block
   // below. Error Log 0 bits [7:0] hold the LTSM State N value; the high
   // bits are reserved for local error indications.
+  //
+  // reg_link_ctrl (offset 0x00) is the Adapter Start copy. Bit 0 is sticky:
+  // it is set by a sideband CfgWr or by start_link_train_wr, and it is
+  // cleared by the private input clear_start_link_train after a successful
+  // Active Entry. That clear owns bit 0 with the highest priority
+  // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5).
   // --------------------------------------------------------------------------
   logic [63:0] reg_link_ctrl;
   logic [63:0] reg_link_stat;
@@ -218,6 +265,7 @@ module adapter_regfile (
 
   // -------------------------------------------------------------------------
   // always_ff: UCIe Link Control Register (0x00)
+  // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5 - UCIe Registers)
   //
   // Bit 0: Start UCIe link training. This bit can be set by:
   //   (a) A sideband CfgWr to offset 0x00 (software-initiated training).
@@ -225,9 +273,22 @@ module adapter_regfile (
   //       (external controller or testbench-initiated training).
   //
   // The entire 64-bit register is writable via sideband CfgWr. The hardware
-  // trigger only sets bit 0 without disturbing other bits. There is no
-  // auto-clear: once set, bit 0 remains high until the register is
-  // explicitly rewritten or the module is reset.
+  // trigger only sets bit 0 without disturbing other bits.
+  //
+  // -------------------------------------------------------------------------
+  // Private Active Entry clear and its priority
+  // -------------------------------------------------------------------------
+  // clear_start_link_train is tested FIRST in the if/else chain, so the clear
+  // wins over a concurrent sideband write and over the start_link_train_wr
+  // hardware set event. Bit 0 of the register falls on the lclk edge that
+  // follows the clear assertion, which is the edge on which the LTSM reports
+  // a successful Active Entry.
+  //
+  // The clear writes bit 0 only. Bits [63:1] hold their previous value, so
+  // any other Link Control field programmed by software is preserved.
+  // A sideband CfgWr to offset 0x00 during the clear is dropped, including
+  // its effect on bits [63:1]: the LTSM owns Start policy after Active Entry
+  // and a stale Start request must not re-arm link training.
   //
   // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (Table 65 - UCIe Link
   //           DVSEC - UCIe Link Control).
@@ -235,6 +296,9 @@ module adapter_regfile (
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       reg_link_ctrl <= 64'h0;
+    end else if (clear_start_link_train) begin
+      // Private Active Entry clear. Highest priority for bit 0.
+      reg_link_ctrl[0] <= 1'b0;
     end else if (csr_wr && csr_addr == A_LINK_CTRL) begin
       reg_link_ctrl <= csr_wdata;
     end else if (start_link_train_wr) begin
@@ -274,6 +338,12 @@ module adapter_regfile (
   // start_link_train  : reflects bit 0 of the Link Control register. Used
   //                     by the LTSM (via d2d_adapter) to know when software
   //                     has requested link training to begin.
+  //                     The value falls on reset, on a sideband CfgWr that
+  //                     writes 0, or on the private Active Entry clear
+  //                     clear_start_link_train. The clear path consumes the
+  //                     Adapter Start request once, so the LTSM sees a low
+  //                     level after Active Entry rather than a held request
+  //                     (PLAN.md section 15.9 Phase C).
   //
   // link_status_active: decoded comparison of the RDI state field against
   //                     RDI_STS_ACTIVE. Provides a single-bit "link is

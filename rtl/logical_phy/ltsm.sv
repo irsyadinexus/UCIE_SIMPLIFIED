@@ -6,7 +6,9 @@
 //               central sequencer for the entire link bring-up, from physical
 //               reset through sideband initialisation, main-band calibration,
 //               main-band training, link initialisation, and finally the
-//               ACTIVE state where data may flow.
+//               ACTIVE state where data may flow. Phase C makes this module
+//               the sole owner of Active Entry, fatal recovery, LinkReset,
+//               Disabled, RESET dwell, and fresh training triggers.
 //
 //               Phase B uses a role-aware transaction engine for every
 //               fixed-profile MBINIT and MBTRAIN subcode. Each logical
@@ -16,6 +18,12 @@
 //               peer response, local request, then duplicate replay.
 //               PARAM uses DATA64 with immutable 64-bit payload values.
 //
+//               Phase C adds the LinkMgmt.RDI Active exchange in LINKINIT.
+//               Fatal events use the TRAINERROR Entry exchange before the
+//               public TRAINERROR hold. LinkReset and Disabled use retained
+//               request/response obligations and the common 8 ms timer.
+//               Priority is LinkError, Disabled, LinkReset, then normal work.
+//
 // Spec refs   : UCIe 1.0 spec section 4.5.3 (LTSM), with per-state
 //               references to 4.5.3.1 through 4.5.3.9.
 //
@@ -24,8 +32,8 @@
 // --------------------------------------------------------------------------
 //
 //  +-----------+
-//  |  RESET    |  4.5.3.1  Wait for the 4 ms minimum and either a
-//  |  (00h)    |           local or two-pattern training trigger.
+//  |  RESET    |  4.5.3.1  Wait for the 4 ms minimum and a fresh local
+//  |  (00h)    |           event. Initial RESET also accepts raw detection.
 //  +-----+-----+
 //        |
 //        v
@@ -104,23 +112,26 @@
 //             | 15h then 19h done
 //             v
 //  +-----------+
-//  | LINKINIT  |  4.5.3.5  Reseed per-lane LFSRs; LFSR pattern 4096 UI.
-//  |  (14h)    |           Exit -> ACTIVE on pat_done.
+//  | LINKINIT  |  4.5.3.5  Reseed per-lane LFSRs; perform the complete
+//  |  (14h)    |           LinkMgmt.RDI Active Entry exchange.
 //  +-----+-----+
 //        |
 //        v
 //  +-----------+                 +--------------+
 //  |  ACTIVE   |  4.5.3.6       | PHYRETRAIN   | 4.5.3.7
-//  |  (15h)    |                 |  (13h)       | Unsupported in Phase B.
+//  |  (15h)    |                 |  (13h)       | Unsupported in this profile.
 //  +-----+-----+                 +--------------+
 //        |
-//        | (fatal packet or timeout)
+//        | (fatal packet or timeout, then TRAINERROR Entry exchange)
 //        v
 //  +-----------+                 +-----------+
 //  | TRAINERROR|  4.5.3.8        |   L1L2    | 4.5.3.9
 //  |  (16h)    |                 |  (17h)    | Low-power; clock may gate.
 //  +-----------+                 +-----------+
-//  (only LINKRESET clears)       (start_link_train -> RESET)
+//  (only LinkReset recovers)     (unsupported in this profile)
+//
+//  LinkReset or Disabled exchange -> RESET -> full 4 ms dwell. Recovery
+//  RESET exits only on a fresh software Start or RDI NOP-to-Active event.
 //
 // --------------------------------------------------------------------------
 // Sub-state exit rule  (spec 4.5.3.3 and 4.5.3.4)
@@ -131,16 +142,17 @@
 //   request never satisfies the local response obligation. SBINIT retains
 //   its separate raw and packet-phase rules.
 //
-//   Each public sub-state has one 8 ms residency timer. A state that exceeds
-//   8 ms before all sequence steps complete escalates to TRAINERROR.
+//   Each public sub-state has one 8 ms residency timer. A post-SBINIT state
+//   that exceeds 8 ms starts TRAINERROR Entry before the public error hold.
 //
 // --------------------------------------------------------------------------
 // Sideband message coding  (Tables 53, 54, 56)
 // --------------------------------------------------------------------------
 //   SBINIT selects explicit Out-of-Reset, Done request, and Done response
 //   pairs. Phase B maps through msg_req_code(), msg_rsp_code(), and the
-//   state-and-step msg_subcode() lookup. Every Phase B MsgInfo is zero.
-//   LINKSPEED outcomes use subcodes, and MBTRAIN.REPAIR is unsupported.
+//   state-and-step msg_subcode() lookup. Phase C uses only LinkMgmt.RDI
+//   Active, LinkReset, Disabled, and TRAINERROR Entry no-data messages.
+//   Every Phase B and Phase C MsgInfo is zero.
 //
 // --------------------------------------------------------------------------
 // Raw SBINIT control  (spec 4.5.3.2)
@@ -153,18 +165,18 @@
 // Pattern generator control  (spec 4.5.3.4, 4.5.3.5)
 // --------------------------------------------------------------------------
 //   Phase A disables the pattern generator (pat_enable low) for every MBINIT
-//   and MBTRAIN sub-state. LINKINIT retains the existing LFSR diagnostic
-//   path and its legacy pat_done gate. Phase C replaces that gate with the
-//   required LinkMgmt.RDI Active exchange. This phase does not add electrical
-//   pattern counts or a state-specific pattern selector.
+//   and MBTRAIN sub-state. LINKINIT retains the LFSR diagnostic path, but
+//   pat_done does not delay Active Entry. Phase C exits only after the full
+//   LinkMgmt.RDI Active exchange. This phase does not add electrical pattern
+//   counts or a state-specific pattern selector.
 //   Pattern selection (effective only when pat_enable is high):
 //     - LINKINIT                    -> PAT_LFSR      (4096-UI LFSR)
 //
 // --------------------------------------------------------------------------
 // Timer interface
 // --------------------------------------------------------------------------
-//   tmr_start       : pulses on entry to each timed training state.
-//   tmr_run         : stays high for one uninterrupted state residency window.
+//   tmr_start       : pulses on timed-state entry and Phase C exchange start.
+//   tmr_run         : stays high for one uninterrupted residency or exchange.
 //   rst_tmr_start   : pulses only when the LTSM re-enters RESET.
 //   rst_tmr_expired : 4 ms physical layer RESET minimum timeout (spec 4.5.3.1).
 //
@@ -176,8 +188,10 @@
 // --------------------------------------------------------------------------
 // Interfaces
 // --------------------------------------------------------------------------
-//   Adapter/RDI : start_link_train, adapter_active_req, link_trained,
-//                 train_error, link_reset_out, phy_retrain_done,
+//   Adapter/RDI : software_start_event, rdi_active_event, rdi_active_req,
+//                 rdi_linkreset_req, rdi_disabled_req, active_entry_done,
+//                 clear_start_link_train, link_trained, train_error,
+//                 link_reset_out, phy_retrain_done,
 //                 ltsm_state (8-bit state encoding for Error Log 0),
 //                 lnk_is_x8, degrade_lanes.
 //   Sideband    : Full TX field set (sb_tx_load..sb_tx_has_data) driving
@@ -187,7 +201,7 @@
 //                 remote-result and local-completion events; synchronized
 //                 transmitter-idle boundary status.
 //   Pattern gen : pat_enable, pat_select, pat_lfsr_reset, pat_lfsr_enable,
-//                 pat_done for later main-band training.
+//                 and retained diagnostic pat_done observation.
 //   Timers      : tmr_start, tmr_run, rst_tmr_start, tmr_expired, and
 //                 rst_tmr_expired.
 //
@@ -202,8 +216,15 @@
 //      paths remain wired and are exercised on the ucie_timer unit.
 //   3. lnk_is_x8 and degrade_lanes are tied to zero: x16-only in this
 //      reduced-capability set.
-//   4. sb_msg_timeout and sb_stall_sent are tied to zero: message timeout
-//      recovery and stall insertion are not implemented.
+//   4. The existing residency timer supplies each Phase C exchange with an
+//      8 ms window. TRAINERROR itself has no residency timeout.
+//   5. A peer transition request creates a retained response obligation.
+//      Higher-priority policy can abort normal work but cannot discard it.
+//   6. Recovery RESET does not use a stale request level or LinkReset itself
+//      as a training trigger. Raw SBINIT detection remains unchanged for the
+//      initial RESET epoch.
+//   7. sb_msg_timeout and sb_stall_sent stay low. The LTSM residency timer
+//      owns the supported message-exchange deadlines.
 //
 // --------------------------------------------------------------------------
 // Revision history
@@ -250,6 +271,11 @@
 //                        coalesce current duplicates into one response.
 //                        Replay completed duplicates after local requests.
 //                        Require LINKSPEED 15h then 19h and disable REPAIR.
+//   v0.0.14 2026-09-25  Phase C: own LinkMgmt.RDI Active Entry, TRAINERROR
+//                        Entry exchange and hold, LinkReset and Disabled
+//                        exchange, full recovery RESET dwell, and fresh
+//                        software or RDI triggers. Enforce LinkError over
+//                        Disabled over LinkReset over normal transactions.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -263,16 +289,21 @@ module ltsm #(
   input  logic        lclk,
   input  logic        lreset_n,
 
-  // ---- adapter / RDI
-  input  logic        start_link_train,   // adapter requests RESET exit
-  input  logic        adapter_active_req, // partner declared ACTIVE
-  output logic        link_trained,       // LTSM reached ACTIVE
-  output logic        train_error,        // unrecoverable failure
-  output logic        link_reset_out,     // drives RDI LINKRESET
-  output logic        phy_retrain_done,   // PHYRETRAIN completed
-  output logic [7:0]  ltsm_state,         // Error Log 0 "State N"
-  output logic        lnk_is_x8,          // negotiated x8 degrade
-  output logic [1:0]  degrade_lanes,      // which half survives
+  // ---- private adapter / RDI policy
+  input  logic        software_start_event, // fresh software Start event
+  input  logic        rdi_active_event,     // fresh RDI NOP-to-Active event
+  input  logic        rdi_active_req,       // current local Active request
+  input  logic        rdi_linkreset_req,    // current local LinkReset request
+  input  logic        rdi_disabled_req,     // current local Disabled request
+  output logic        active_entry_done,    // completed Active Entry result
+  output logic        clear_start_link_train, // one-cycle Start-copy clear
+  output logic        link_trained,         // LTSM reached ACTIVE
+  output logic        train_error,          // unrecoverable failure
+  output logic        link_reset_out,       // drives RDI RESET indication
+  output logic        phy_retrain_done,     // fixed profile never retrains
+  output logic [7:0]  ltsm_state,           // Error Log 0 "State N"
+  output logic        lnk_is_x8,            // negotiated x8 degrade
+  output logic [1:0]  degrade_lanes,        // which half survives
 
   // ---- lclk-facing sideband CDC endpoint (the LTSM is the only master)
   output logic        sb_tx_load,
@@ -329,10 +360,10 @@ module ltsm #(
   // =========================================================================
   // State, handshake, and SBINIT policy registers
   // =========================================================================
-  // The public LTSM encoding remains unchanged. A private phase register owns
-  // the four Standard Package SBINIT activities inside LT_SBINIT. The raw
-  // sbclk primitive reports only complete iteration events; all detection,
-  // retry, tail-count, packet-order, and timeout policy remains here in lclk.
+  // The public LTSM encoding remains unchanged. Private state retains raw
+  // SBINIT policy, Phase B transactions, Active Entry, and recovery exchanges.
+  // A Phase C exchange remains in the current public state until all required
+  // responses are accepted or its 8 ms timer expires.
   // =========================================================================
   typedef enum logic [1:0] {
     SBI_PATTERN_ACTIVE = 2'd0,
@@ -341,12 +372,21 @@ module ltsm #(
     SBI_DONE           = 2'd3
   } sbinit_phase_t;
 
+  typedef enum logic [1:0] {
+    PC_NONE       = 2'd0,
+    PC_LINKRESET  = 2'd1,
+    PC_DISABLED   = 2'd2,
+    PC_TRAINERROR = 2'd3
+  } phase_c_mode_t;
+
   ltsm_state_t state_q, state_d;
   sbinit_phase_t sbinit_phase_q, sbinit_phase_d;
+  phase_c_mode_t phase_c_mode_q, phase_c_mode_d;
 
-  logic        timer_start_q, timer_start_d;
-  logic        reset_min_done_q, reset_min_done_d;
-  logic        retrain_req_q, retrain_req_d;
+  logic timer_start_q, timer_start_d;
+  logic reset_min_done_q, reset_min_done_d;
+  logic reset_trigger_pending_q, reset_trigger_pending_d;
+  logic recovery_reset_q, recovery_reset_d;
 
   logic [1:0]  sbinit_match_streak_q, sbinit_match_streak_d;
   logic        pattern_trigger_pending_q, pattern_trigger_pending_d;
@@ -372,71 +412,142 @@ module ltsm #(
   logic [98:0] peer_req_identity_q, peer_req_identity_d;
   logic        phase_b_state_complete;
 
+  // ---- Phase C Active Entry state
+  // The local RDI Active level is sampled and retained in active_ready_q.
+  // Peer requests and local requests remain separate obligations.
+  logic active_ready_q, active_ready_d;
+  logic active_req_accepted_q, active_req_accepted_d;
+  logic active_rsp_received_q, active_rsp_received_d;
+  logic active_peer_req_seen_q, active_peer_req_seen_d;
+  logic active_peer_rsp_pending_q, active_peer_rsp_pending_d;
+  logic active_peer_rsp_accepted_q, active_peer_rsp_accepted_d;
+
+  // ---- Phase C LinkReset exchange state
+  logic linkreset_local_needed_q, linkreset_local_needed_d;
+  logic linkreset_req_accepted_q, linkreset_req_accepted_d;
+  logic linkreset_rsp_received_q, linkreset_rsp_received_d;
+  logic linkreset_peer_rsp_pending_q, linkreset_peer_rsp_pending_d;
+
+  // ---- Phase C Disabled exchange state
+  logic disabled_local_needed_q, disabled_local_needed_d;
+  logic disabled_req_accepted_q, disabled_req_accepted_d;
+  logic disabled_rsp_received_q, disabled_rsp_received_d;
+  logic disabled_peer_rsp_pending_q, disabled_peer_rsp_pending_d;
+
+  // ---- Phase C TRAINERROR Entry exchange state
+  logic trainerror_local_needed_q, trainerror_local_needed_d;
+  logic trainerror_req_accepted_q, trainerror_req_accepted_d;
+  logic trainerror_rsp_received_q, trainerror_rsp_received_d;
+  logic trainerror_peer_rsp_pending_q, trainerror_peer_rsp_pending_d;
+
   // -------------------------------------------------------------------------
   // State and policy register bank
   // -------------------------------------------------------------------------
-  // This bank stores raw SBINIT policy and Phase B transaction obligations.
-  // Sequence steps reset on each public state entry and after the last step.
-  // Peer request identity remains stable until the current step completes.
-  // The raw SBINIT fields keep their existing reset and update behavior.
-  // Spec refs: UCIe 1.0 Sections 4.5.3.2, 4.5.3.3, and 4.5.3.4.
+  // This bank retains every accepted peer response obligation across a
+  // higher-priority Phase C transition. It also records fresh RESET triggers.
+  // UCIe 1.0 Sections 4.5.3.1, 4.5.3.8, 8.1.6, and 8.3.2.8 define the
+  // RESET, Active Entry, TRAINERROR, and transition ordering rules.
+  // PLAN.md Sections 15.4 and 15.9 Phase C define this fixed-profile policy.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      state_q                       <= LT_RESET;
-      sbinit_phase_q                <= SBI_PATTERN_ACTIVE;
-      timer_start_q                 <= 1'b0;
-      reset_min_done_q              <= 1'b0;
-      retrain_req_q                 <= 1'b0;
-      sbinit_match_streak_q         <= 2'd0;
-      pattern_trigger_pending_q     <= 1'b0;
-      sbinit_tail_count_q           <= 3'd0;
-      sbinit_window_count_q         <= 32'd0;
-      sbinit_oor_sent_q             <= 1'b0;
-      sbinit_oor_received_q         <= 1'b0;
-      sbinit_done_req_sent_q        <= 1'b0;
-      sbinit_done_rsp_sent_q        <= 1'b0;
-      sbinit_done_rsp_received_q    <= 1'b0;
-      sbinit_done_rsp_pending_q     <= 8'd0;
-      txn_step_q                    <= 3'd0;
-      local_req_accepted_q          <= 1'b0;
-      local_resp_rcvd_q             <= 1'b0;
-      peer_req_valid_q              <= 1'b0;
-      peer_resp_pending_q           <= 1'b0;
-      peer_replay_pending_q         <= 1'b0;
-      peer_req_identity_q           <= 99'd0;
+      state_q                         <= LT_RESET;
+      sbinit_phase_q                  <= SBI_PATTERN_ACTIVE;
+      phase_c_mode_q                  <= PC_NONE;
+      timer_start_q                   <= 1'b0;
+      reset_min_done_q                <= 1'b0;
+      reset_trigger_pending_q         <= 1'b0;
+      recovery_reset_q                <= 1'b0;
+      sbinit_match_streak_q           <= 2'd0;
+      pattern_trigger_pending_q       <= 1'b0;
+      sbinit_tail_count_q             <= 3'd0;
+      sbinit_window_count_q           <= 32'd0;
+      sbinit_oor_sent_q               <= 1'b0;
+      sbinit_oor_received_q           <= 1'b0;
+      sbinit_done_req_sent_q          <= 1'b0;
+      sbinit_done_rsp_sent_q          <= 1'b0;
+      sbinit_done_rsp_received_q      <= 1'b0;
+      sbinit_done_rsp_pending_q       <= 8'd0;
+      txn_step_q                      <= 3'd0;
+      local_req_accepted_q            <= 1'b0;
+      local_resp_rcvd_q               <= 1'b0;
+      peer_req_valid_q                <= 1'b0;
+      peer_resp_pending_q             <= 1'b0;
+      peer_replay_pending_q           <= 1'b0;
+      peer_req_identity_q             <= 99'd0;
+      active_ready_q                  <= 1'b0;
+      active_req_accepted_q           <= 1'b0;
+      active_rsp_received_q           <= 1'b0;
+      active_peer_req_seen_q          <= 1'b0;
+      active_peer_rsp_pending_q       <= 1'b0;
+      active_peer_rsp_accepted_q      <= 1'b0;
+      linkreset_local_needed_q        <= 1'b0;
+      linkreset_req_accepted_q        <= 1'b0;
+      linkreset_rsp_received_q        <= 1'b0;
+      linkreset_peer_rsp_pending_q    <= 1'b0;
+      disabled_local_needed_q         <= 1'b0;
+      disabled_req_accepted_q         <= 1'b0;
+      disabled_rsp_received_q         <= 1'b0;
+      disabled_peer_rsp_pending_q     <= 1'b0;
+      trainerror_local_needed_q       <= 1'b0;
+      trainerror_req_accepted_q       <= 1'b0;
+      trainerror_rsp_received_q       <= 1'b0;
+      trainerror_peer_rsp_pending_q   <= 1'b0;
     end else begin
-      state_q                       <= state_d;
-      sbinit_phase_q                <= sbinit_phase_d;
-      timer_start_q                 <= timer_start_d;
-      reset_min_done_q              <= reset_min_done_d;
-      retrain_req_q                 <= retrain_req_d;
-      sbinit_match_streak_q         <= sbinit_match_streak_d;
-      pattern_trigger_pending_q     <= pattern_trigger_pending_d;
-      sbinit_tail_count_q           <= sbinit_tail_count_d;
-      sbinit_window_count_q         <= sbinit_window_count_d;
-      sbinit_oor_sent_q             <= sbinit_oor_sent_d;
-      sbinit_oor_received_q         <= sbinit_oor_received_d;
-      sbinit_done_req_sent_q        <= sbinit_done_req_sent_d;
-      sbinit_done_rsp_sent_q        <= sbinit_done_rsp_sent_d;
-      sbinit_done_rsp_received_q    <= sbinit_done_rsp_received_d;
-      sbinit_done_rsp_pending_q     <= sbinit_done_rsp_pending_d;
-      txn_step_q                    <= txn_step_d;
-      local_req_accepted_q          <= local_req_accepted_d;
-      local_resp_rcvd_q             <= local_resp_rcvd_d;
-      peer_req_valid_q              <= peer_req_valid_d;
-      peer_resp_pending_q           <= peer_resp_pending_d;
-      peer_replay_pending_q         <= peer_replay_pending_d;
-      peer_req_identity_q           <= peer_req_identity_d;
+      state_q                         <= state_d;
+      sbinit_phase_q                  <= sbinit_phase_d;
+      phase_c_mode_q                  <= phase_c_mode_d;
+      timer_start_q                   <= timer_start_d;
+      reset_min_done_q                <= reset_min_done_d;
+      reset_trigger_pending_q         <= reset_trigger_pending_d;
+      recovery_reset_q                <= recovery_reset_d;
+      sbinit_match_streak_q           <= sbinit_match_streak_d;
+      pattern_trigger_pending_q       <= pattern_trigger_pending_d;
+      sbinit_tail_count_q             <= sbinit_tail_count_d;
+      sbinit_window_count_q           <= sbinit_window_count_d;
+      sbinit_oor_sent_q               <= sbinit_oor_sent_d;
+      sbinit_oor_received_q           <= sbinit_oor_received_d;
+      sbinit_done_req_sent_q          <= sbinit_done_req_sent_d;
+      sbinit_done_rsp_sent_q          <= sbinit_done_rsp_sent_d;
+      sbinit_done_rsp_received_q      <= sbinit_done_rsp_received_d;
+      sbinit_done_rsp_pending_q       <= sbinit_done_rsp_pending_d;
+      txn_step_q                      <= txn_step_d;
+      local_req_accepted_q            <= local_req_accepted_d;
+      local_resp_rcvd_q               <= local_resp_rcvd_d;
+      peer_req_valid_q                <= peer_req_valid_d;
+      peer_resp_pending_q             <= peer_resp_pending_d;
+      peer_replay_pending_q           <= peer_replay_pending_d;
+      peer_req_identity_q             <= peer_req_identity_d;
+      active_ready_q                  <= active_ready_d;
+      active_req_accepted_q           <= active_req_accepted_d;
+      active_rsp_received_q           <= active_rsp_received_d;
+      active_peer_req_seen_q          <= active_peer_req_seen_d;
+      active_peer_rsp_pending_q       <= active_peer_rsp_pending_d;
+      active_peer_rsp_accepted_q      <= active_peer_rsp_accepted_d;
+      linkreset_local_needed_q        <= linkreset_local_needed_d;
+      linkreset_req_accepted_q        <= linkreset_req_accepted_d;
+      linkreset_rsp_received_q        <= linkreset_rsp_received_d;
+      linkreset_peer_rsp_pending_q    <= linkreset_peer_rsp_pending_d;
+      disabled_local_needed_q         <= disabled_local_needed_d;
+      disabled_req_accepted_q         <= disabled_req_accepted_d;
+      disabled_rsp_received_q         <= disabled_rsp_received_d;
+      disabled_peer_rsp_pending_q     <= disabled_peer_rsp_pending_d;
+      trainerror_local_needed_q       <= trainerror_local_needed_d;
+      trainerror_req_accepted_q       <= trainerror_req_accepted_d;
+      trainerror_rsp_received_q       <= trainerror_rsp_received_d;
+      trainerror_peer_rsp_pending_q   <= trainerror_peer_rsp_pending_d;
     end
   end
 
   // =========================================================================
   // Previous-state edge detector
   // =========================================================================
-  // Separate RESET and residency restart pulses are derived from this delayed
-  // state. This gives each RESET entry a fresh 4 ms epoch without restarting
-  // the SBINIT 8 ms deadline at private phase changes.
+  // state_q_prev makes state-entry pulses independent from private exchanges.
+  // RESET uses the pulse to restart its full 4 ms minimum dwell. ACTIVE uses
+  // it to produce the one-cycle Start-copy clear after Active Entry succeeds.
+  // UCIe 1.0 Sections 4.5.3.1 and 4.5.3.5 define these two entry actions.
+  // PLAN.md Sections 15.4 and 15.9 Phase C require both actions on every entry.
+  // =========================================================================
   ltsm_state_t state_q_prev;
 
   always_ff @(posedge lclk or negedge lreset_n) begin
@@ -775,19 +886,160 @@ module ltsm #(
   wire phase_b_peer_req_conflict = phase_b_peer_req && !state_entry &&
                                    peer_req_valid_q &&
                                    !peer_req_identity_match;
-  wire post_sbinit_rx_event = sb_rx_pkt_vld &&
-                              (state_q != LT_RESET) &&
-                              (state_q != LT_SBINIT);
-  wire phase_b_rx_fatal = post_sbinit_rx_event &&
-                          (!phase_b_packet_valid || phase_b_early_rsp ||
-                           phase_b_peer_req_conflict);
+
+  // =========================================================================
+  // Phase C no-data packet decoding
+  // =========================================================================
+  // Every supported LinkMgmt.RDI and TRAINERROR packet is a parity-clean,
+  // no-data PHY-to-PHY packet with zero MsgInfo. The decoder intentionally
+  // accepts no other LinkMgmt subcode. A valid remote LinkError request is a
+  // fatal trigger and therefore starts TRAINERROR Entry instead of producing
+  // an unsupported LinkMgmt.RDI LinkError response.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.8, 6.1.2.2, 8.1.6, and 8.3.2.8;
+  //            Tables 53 and 54; PLAN.md Sections 15.4 and 15.9 Phase C.
+  // =========================================================================
+  wire phase_c_common_valid = sb_rx_pkt_vld &&
+                              !sb_rx_cp_err && !sb_rx_dp_err &&
+                              (sb_rx_opcode == SB_OP_MSG_NODATA) &&
+                              (sb_rx_srcid == SRCID_PHY) &&
+                              (sb_rx_dstid == DSTID_REMOTE_PHY) &&
+                              (sb_rx_msginfo == 8'h00);
+
+  wire rx_active_req = phase_c_common_valid &&
+                       (sb_rx_msgcode == MC_LM_RDI_REQ) &&
+                       (sb_rx_msgsubcode == MS_LM_ACTIVE);
+  wire rx_active_rsp = phase_c_common_valid &&
+                       (sb_rx_msgcode == MC_LM_RDI_RSP) &&
+                       (sb_rx_msgsubcode == MS_LM_ACTIVE);
+  wire rx_linkreset_req = phase_c_common_valid &&
+                          (sb_rx_msgcode == MC_LM_RDI_REQ) &&
+                          (sb_rx_msgsubcode == MS_LM_LINKRESET);
+  wire rx_linkreset_rsp = phase_c_common_valid &&
+                          (sb_rx_msgcode == MC_LM_RDI_RSP) &&
+                          (sb_rx_msgsubcode == MS_LM_LINKRESET);
+  wire rx_disabled_req = phase_c_common_valid &&
+                         (sb_rx_msgcode == MC_LM_RDI_REQ) &&
+                         (sb_rx_msgsubcode == MS_LM_DISABLE);
+  wire rx_disabled_rsp = phase_c_common_valid &&
+                         (sb_rx_msgcode == MC_LM_RDI_RSP) &&
+                         (sb_rx_msgsubcode == MS_LM_DISABLE);
+  wire rx_linkerror_req = phase_c_common_valid &&
+                          (sb_rx_msgcode == MC_LM_RDI_REQ) &&
+                          (sb_rx_msgsubcode == MS_LM_LINKERROR);
+  wire rx_trainerror_req = phase_c_common_valid &&
+                           (sb_rx_msgcode == MC_TE_REQ) &&
+                           (sb_rx_msgsubcode == MS_TE_ENTRY);
+  wire rx_trainerror_rsp = phase_c_common_valid &&
+                           (sb_rx_msgcode == MC_TE_RSP) &&
+                           (sb_rx_msgsubcode == MS_TE_ENTRY);
+
+  // A response is valid only after the matching local request was accepted.
+  // Valid requests remain accepted while a higher-priority transition aborts
+  // normal progress, because their response obligation must not be discarded.
+  wire phase_b_rsp_expected = phase_b_peer_rsp &&
+                              local_req_accepted_q;
+  wire active_rsp_expected = rx_active_rsp && active_req_accepted_q;
+  wire linkreset_rsp_expected = rx_linkreset_rsp &&
+                                (phase_c_mode_q == PC_LINKRESET) &&
+                                linkreset_req_accepted_q;
+  wire disabled_rsp_expected = rx_disabled_rsp &&
+                               (phase_c_mode_q == PC_DISABLED) &&
+                               disabled_req_accepted_q;
+  wire trainerror_rsp_expected = rx_trainerror_rsp &&
+                                 (phase_c_mode_q == PC_TRAINERROR) &&
+                                 trainerror_req_accepted_q;
+
+  wire sideband_policy_active = (state_q != LT_RESET) &&
+                                (state_q != LT_SBINIT);
+  wire current_phase_b_packet_valid = phase_b_active &&
+    ((phase_b_peer_req && !phase_b_peer_req_conflict) ||
+     phase_b_rsp_expected);
+  wire current_active_packet_valid = (state_q == LT_LINKINIT) &&
+    (rx_active_req || active_rsp_expected);
+  wire phase_c_request_valid = rx_linkreset_req ||
+    ((state_q != LT_TRAINERROR) &&
+     (rx_disabled_req || rx_linkerror_req || rx_trainerror_req));
+  wire phase_c_response_valid = linkreset_rsp_expected ||
+                                disabled_rsp_expected ||
+                                trainerror_rsp_expected;
+  wire post_sbinit_packet_valid = current_phase_b_packet_valid ||
+                                  current_active_packet_valid ||
+                                  phase_c_request_valid ||
+                                  phase_c_response_valid;
+  wire post_sbinit_rx_event = sb_rx_pkt_vld && sideband_policy_active;
+  wire post_sbinit_rx_fatal = post_sbinit_rx_event &&
+                              !post_sbinit_packet_valid;
+  wire local_packet_fatal = post_sbinit_rx_fatal;
+  wire fatal_trigger_event = local_packet_fatal || rx_linkerror_req;
+
+  // =========================================================================
+  // Phase C transition triggers and 8 ms timeout classes
+  // =========================================================================
+  // LinkError has priority over Disabled, which has priority over LinkReset.
+  // A normal state timeout and a LinkReset or Disabled response timeout are
+  // local fatal events. A TRAINERROR timeout enters the public error hold.
+  // SBINIT keeps its separate direct timeout path because Section 4.5.3.8
+  // exempts SBINIT from the TRAINERROR Entry handshake.
+  // Spec refs: UCIe 1.0 Sections 4.5, 4.5.3.8, and 8.3.2.8;
+  //            PLAN.md Sections 15.4 and 15.9 Phase C.
+  // =========================================================================
+  wire normal_timed_state = (state_q != LT_RESET) &&
+                            (state_q != LT_ACTIVE) &&
+                            (state_q != LT_L1L2) &&
+                            (state_q != LT_TRAINERROR);
+  wire normal_residency_timeout = tmr_expired && timer_start_q &&
+                                  (phase_c_mode_q == PC_NONE) &&
+                                  normal_timed_state &&
+                                  (state_q != LT_SBINIT);
+  wire transition_timeout_fatal = tmr_expired && timer_start_q &&
+    (((phase_c_mode_q == PC_LINKRESET) &&
+      (state_q != LT_TRAINERROR)) ||
+     (phase_c_mode_q == PC_DISABLED));
+  wire trainerror_exchange_timeout = tmr_expired && timer_start_q &&
+                                     (phase_c_mode_q == PC_TRAINERROR);
+  wire recovery_exchange_timeout = tmr_expired && timer_start_q &&
+                                    (phase_c_mode_q == PC_LINKRESET) &&
+                                    (state_q == LT_TRAINERROR);
+
+  wire internal_fatal_event = sideband_policy_active &&
+                              (state_q != LT_TRAINERROR) &&
+    (fatal_trigger_event || normal_residency_timeout ||
+     (state_q == LT_MB_REPAIR));
+  wire peer_trainerror_event = sideband_policy_active &&
+                               (state_q != LT_TRAINERROR) &&
+                               rx_trainerror_req;
+
+  wire start_trainerror_exchange =
+    (phase_c_mode_q != PC_TRAINERROR) &&
+    (internal_fatal_event || peer_trainerror_event);
+  wire disabled_request_event = sideband_policy_active &&
+                                (state_q != LT_TRAINERROR) &&
+                                (rdi_disabled_req ||
+                                 (rx_disabled_req && !rx_linkerror_req));
+  wire start_disabled_exchange = !start_trainerror_exchange &&
+                                 disabled_request_event &&
+                                 (phase_c_mode_q != PC_DISABLED) &&
+                                 (phase_c_mode_q != PC_TRAINERROR);
+  wire linkreset_request_event = sideband_policy_active &&
+                                 (rdi_linkreset_req ||
+                                  (rx_linkreset_req && !rx_linkerror_req &&
+                                   !rx_disabled_req));
+  wire start_linkreset_exchange = !start_trainerror_exchange &&
+                                  !start_disabled_exchange &&
+                                  linkreset_request_event &&
+                                  (phase_c_mode_q == PC_NONE);
+  wire phase_c_exchange_start = start_trainerror_exchange ||
+                                start_disabled_exchange ||
+                                start_linkreset_exchange;
+  wire normal_transaction_allowed = (phase_c_mode_q == PC_NONE) &&
+                                    !phase_c_exchange_start;
 
   // =========================================================================
   // Sideband transmit scheduling
   // =========================================================================
-  // Out-of-Reset repeats until a valid peer copy arrives. Done responses have
-  // priority over the one local Done request. The pending counter preserves a
-  // separate response obligation for every valid peer Done request.
+  // SBINIT keeps its private scheduler. Post-SBINIT arbitration preserves the
+  // required response-first ordering across Phase B and Phase C obligations.
+  // =========================================================================
   wire sbinit_oor_send = (state_q == LT_SBINIT) &&
                          (sbinit_phase_q == SBI_OUT_OF_RESET) &&
                          !sbinit_oor_received_q && !sb_tx_busy;
@@ -801,210 +1053,385 @@ module ltsm #(
                               !sbinit_done_req_sent_q && !sb_tx_busy;
 
   // =========================================================================
-  // Phase B transmit scheduling and arbitration
+  // Phase C and Phase B transmit arbitration
   // =========================================================================
-  // Arbitration is strict: queued current peer response, local request,
-  // then duplicate replay. A pending bit survives mailbox busy cycles and
-  // clears only when sb_tx_accepted identifies the selected transmission.
-  // State-entry and fatal-packet cycles suppress every Phase B transmission.
-  // PARAM uses DATA64. Every other sequence entry uses MSG_NODATA.
-  // Spec refs: UCIe 1.0 Tables 47 and 56;
-  //            PLAN.md Section 15.9 Phase B.
+  // The fixed priority is Disabled or LinkReset response, TRAINERROR response,
+  // current peer response, current local request, then duplicate replay.
+  // LinkError never emits LinkMgmt.RDI LinkError in this fixed profile. It
+  // selects TRAINERROR Entry. Pending bits survive mailbox busy cycles and
+  // clear only when sb_tx_accepted identifies the selected transmission.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.8, 8.1.6, and 8.3.2.8;
+  //            PLAN.md Sections 15.3, 15.4, and 15.9 Phase C.
   // =========================================================================
+  wire tx_disabled_resp = sideband_policy_active &&
+                          disabled_peer_rsp_pending_q && !sb_tx_busy;
+  wire tx_linkreset_resp = sideband_policy_active &&
+                           linkreset_peer_rsp_pending_q && !sb_tx_busy &&
+                           !tx_disabled_resp;
+  wire tx_trainerror_resp = sideband_policy_active &&
+                            trainerror_peer_rsp_pending_q && !sb_tx_busy &&
+                            !tx_disabled_resp && !tx_linkreset_resp;
 
-  // -------------------------------------------------------------------------
-  // Wire: queued current peer response
-  // -------------------------------------------------------------------------
-  // This response has first priority and remains selected until acceptance.
-  // TX busy cannot discard the stored obligation or its request identity.
-  // The response role uses the current response code and current subcode.
-  // PARAM returns the immutable fixed response, not the peer request data.
-  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
-  // -------------------------------------------------------------------------
-  wire tx_peer_resp = phase_b_active && !state_entry &&
-                      !phase_b_rx_fatal && peer_resp_pending_q &&
-                      !sb_tx_busy;
+  wire tx_peer_resp = phase_b_active && peer_resp_pending_q && !sb_tx_busy &&
+                      !tx_disabled_resp && !tx_linkreset_resp &&
+                      !tx_trainerror_resp;
+  wire tx_active_peer_resp = (state_q == LT_LINKINIT) &&
+                             active_peer_rsp_pending_q && !sb_tx_busy &&
+                             !tx_disabled_resp && !tx_linkreset_resp &&
+                             !tx_trainerror_resp && !tx_peer_resp;
 
-  // -------------------------------------------------------------------------
-  // Wire: current local request
-  // -------------------------------------------------------------------------
-  // This request has second priority after the queued peer response.
-  // One request remains outstanding until the mailbox accepts this send.
-  // A matching response cannot complete it before that acceptance event.
-  // Each sequence step resets local_req_accepted_q before the next request.
-  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
-  // -------------------------------------------------------------------------
-  wire tx_local_req = phase_b_active && !state_entry &&
-                      !phase_b_rx_fatal && !sb_tx_busy &&
-                      !local_req_accepted_q && !tx_peer_resp;
+  wire high_priority_response_tx = tx_disabled_resp ||
+                                   tx_linkreset_resp || tx_trainerror_resp;
+  wire current_peer_response_tx = tx_peer_resp || tx_active_peer_resp;
+  wire higher_response_tx = high_priority_response_tx ||
+                            current_peer_response_tx;
+  wire tx_trainerror_req = (phase_c_mode_q == PC_TRAINERROR) &&
+                           trainerror_local_needed_q &&
+                           !trainerror_req_accepted_q && !sb_tx_busy &&
+                           !higher_response_tx;
+  wire tx_disabled_req = (phase_c_mode_q == PC_DISABLED) &&
+                         disabled_local_needed_q &&
+                         !disabled_req_accepted_q && !sb_tx_busy &&
+                         !higher_response_tx && !tx_trainerror_req;
+  wire tx_linkreset_req = (phase_c_mode_q == PC_LINKRESET) &&
+                          linkreset_local_needed_q &&
+                          !linkreset_req_accepted_q && !sb_tx_busy &&
+                          !higher_response_tx && !tx_trainerror_req &&
+                          !tx_disabled_req;
+  wire tx_active_req = normal_transaction_allowed &&
+                       (state_q == LT_LINKINIT) && active_ready_q &&
+                       !active_req_accepted_q && !sb_tx_busy &&
+                       !higher_response_tx && !tx_trainerror_req &&
+                       !tx_disabled_req && !tx_linkreset_req;
 
-  // -------------------------------------------------------------------------
-  // Wire: exact duplicate peer-request replay
-  // -------------------------------------------------------------------------
-  // This replay has third priority after the normal local request.
-  // One pending bit coalesces identical duplicates into one obligation.
-  // The response reproduces the current response code, subcode, and payload.
-  // A different request identity is fatal and never reaches this scheduler.
-  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
-  // -------------------------------------------------------------------------
-  wire tx_dup_peer = phase_b_active && !state_entry &&
-                     !phase_b_rx_fatal && peer_replay_pending_q &&
-                     !sb_tx_busy && !tx_peer_resp && !tx_local_req;
+  wire phase_c_local_tx = tx_trainerror_req || tx_disabled_req ||
+                          tx_linkreset_req || tx_active_req;
+  wire tx_local_req = phase_b_active && normal_transaction_allowed &&
+                      !local_req_accepted_q && !sb_tx_busy &&
+                      !higher_response_tx && !phase_c_local_tx;
+  wire tx_dup_peer = phase_b_active && peer_replay_pending_q && !sb_tx_busy &&
+                     !high_priority_response_tx && !tx_peer_resp &&
+                     !tx_active_peer_resp && !phase_c_local_tx &&
+                     !tx_local_req;
 
-  // -------------------------------------------------------------------------
-  // Wire: PARAM DATA64 selection
-  // -------------------------------------------------------------------------
-  // PARAM is the only Phase B state with a data payload.
-  // Local requests use PARAM_REQ_DATA. Both response paths use
-  // PARAM_RSP_DATA. All non-PARAM sends retain a zero data input.
-  // Spec refs: UCIe 1.0 Table 47 and Table 56.
-  // -------------------------------------------------------------------------
+  // PARAM is the only supported packet with a data payload. Phase C sends are
+  // all MSG_NODATA packets and therefore never select this payload path.
   wire tx_param_send = (state_q == LT_MBINIT_PARAM) &&
                        (tx_peer_resp || tx_local_req || tx_dup_peer);
+
+  wire phase_c_response_accept = sb_tx_accepted &&
+    (tx_disabled_resp || tx_linkreset_resp || tx_trainerror_resp ||
+     tx_active_peer_resp || tx_peer_resp || tx_dup_peer);
 
   // =========================================================================
   // Timer interfaces
   // =========================================================================
-  // The residency timer starts only for a new timed LTSM state. Private
-  // SBINIT phases never restart it. The RESET timer has an independent entry
-  // pulse and runs for each complete RESET epoch.
-  assign tmr_start = state_entry && (state_q != LT_RESET) &&
-                     (state_q != LT_ACTIVE) && (state_q != LT_L1L2) &&
-                     (state_q != LT_TRAINERROR);
-  assign rst_tmr_start = reset_entry;
-  assign tmr_run       = timer_start_q;
+  // A public timed-state entry and each new or upgraded Phase C exchange
+  // restart the shared 8 ms timer. The running level remains high for the
+  // complete uninterrupted state or exchange. RESET uses its separate timer.
+  // Spec refs: UCIe 1.0 Sections 4.5, 4.5.3.1, 4.5.3.8, and 8.3.2.8;
+  //            PLAN.md Sections 15.4 and 15.9 Phase C.
+  // =========================================================================
+  // This pulse starts the 8 ms interval on a transition to a timed state
+  // or a private exchange-mode change. It aligns with the register update.
+  // UCIe 1.0 Section 4.5 defines the 8 ms residency requirement.
+  // UCIe 1.0 Section 8.3.2.8 applies it to RDI transition handshakes.
+  // PLAN.md Section 15.9 Phase C requires reuse of this timer interface.
+  assign tmr_start = ((state_d != state_q) &&
+                      (state_d != LT_RESET) &&
+                      (state_d != LT_ACTIVE) &&
+                      (state_d != LT_L1L2) &&
+                      (state_d != LT_TRAINERROR)) ||
+                     (phase_c_mode_d != phase_c_mode_q);
+
+  // Every transition into RESET starts an independent 4 ms interval.
+  // LinkReset and Disabled completion both generate this transition pulse.
+  // UCIe 1.0 Section 4.5.3.1 requires the dwell on every RESET entry.
+  // UCIe 1.0 Section 8.3.2.8 requires fresh training after recovery.
+  // PLAN.md Sections 15.4 and 15.9 Phase C preserve both requirements.
+  assign rst_tmr_start = (state_d == LT_RESET) && (state_q != LT_RESET);
+
+  // The registered running level spans each public residency or private
+  // exchange. Completion and terminal timeout clear it without a gap.
+  // UCIe 1.0 Section 4.5 defines uninterrupted state residency timing.
+  // UCIe 1.0 Section 4.5.3.8 defines the TRAINERROR Entry timeout.
+  // PLAN.md Section 15.9 Phase C requires the existing tmr_run interface.
+  assign tmr_run = timer_start_q;
 
   // =========================================================================
-  // Next-state, raw SBINIT policy, and Phase B transaction policy
+  // Next-state, SBINIT, Phase B, and Phase C policy
   // =========================================================================
-  // Defaults retain every registered obligation until an explicit event.
-  // State entry clears only state-scoped Phase B data and preserves SBINIT.
-  // A sequence step advances after local acceptance, its matching response,
-  // and all peer response or replay obligations complete.
-  // Invalid post-SBINIT packets override normal state progress below.
-  // Spec refs: UCIe 1.0 Sections 4.5.3.2, 4.5.3.3, and 4.5.3.4;
-  //            PLAN.md Section 15.9 Phase B.
+  // This block keeps raw SBINIT behavior isolated, advances Phase B only when
+  // no higher-priority transition exists, and retains every peer response
+  // obligation across a transition. Active Entry requires both directions.
+  // TRAINERROR, Disabled, and LinkReset each use a private 8 ms exchange.
+  // UCIe 1.0 Sections 4.5.3.1, 4.5.3.8, 8.1.6, and 8.3.2.8 define the
+  // state transitions and handshakes. PLAN.md Sections 15.4 and 15.9 Phase C
+  // define the reduced-profile priority and fresh-trigger policy.
   // =========================================================================
   always_comb begin
-    state_d                    = state_q;
-    sbinit_phase_d             = sbinit_phase_q;
-    timer_start_d              = timer_start_q;
-    reset_min_done_d           = reset_min_done_q;
-    retrain_req_d              = retrain_req_q;
-    sbinit_match_streak_d      = sbinit_match_streak_q;
-    pattern_trigger_pending_d  = pattern_trigger_pending_q;
-    sbinit_tail_count_d        = sbinit_tail_count_q;
-    sbinit_window_count_d      = sbinit_window_count_q;
-    sbinit_oor_sent_d          = sbinit_oor_sent_q;
-    sbinit_oor_received_d      = sbinit_oor_received_q;
-    sbinit_done_req_sent_d     = sbinit_done_req_sent_q;
-    sbinit_done_rsp_sent_d     = sbinit_done_rsp_sent_q;
-    sbinit_done_rsp_received_d = sbinit_done_rsp_received_q;
-    sbinit_done_rsp_pending_d  = sbinit_done_rsp_pending_q;
-    txn_step_d                 = txn_step_q;
-    local_req_accepted_d       = local_req_accepted_q;
-    local_resp_rcvd_d          = local_resp_rcvd_q;
-    peer_req_valid_d           = peer_req_valid_q;
-    peer_resp_pending_d        = peer_resp_pending_q;
-    peer_replay_pending_d      = peer_replay_pending_q;
-    peer_req_identity_d        = peer_req_identity_q;
-    phase_b_state_complete     = 1'b0;
+    state_d                          = state_q;
+    sbinit_phase_d                   = sbinit_phase_q;
+    phase_c_mode_d                   = phase_c_mode_q;
+    timer_start_d                    = timer_start_q;
+    reset_min_done_d                 = reset_min_done_q;
+    reset_trigger_pending_d          = reset_trigger_pending_q;
+    recovery_reset_d                 = recovery_reset_q;
+    sbinit_match_streak_d            = sbinit_match_streak_q;
+    pattern_trigger_pending_d        = pattern_trigger_pending_q;
+    sbinit_tail_count_d              = sbinit_tail_count_q;
+    sbinit_window_count_d            = sbinit_window_count_q;
+    sbinit_oor_sent_d                = sbinit_oor_sent_q;
+    sbinit_oor_received_d            = sbinit_oor_received_q;
+    sbinit_done_req_sent_d           = sbinit_done_req_sent_q;
+    sbinit_done_rsp_sent_d           = sbinit_done_rsp_sent_q;
+    sbinit_done_rsp_received_d       = sbinit_done_rsp_received_q;
+    sbinit_done_rsp_pending_d        = sbinit_done_rsp_pending_q;
+    txn_step_d                       = txn_step_q;
+    local_req_accepted_d             = local_req_accepted_q;
+    local_resp_rcvd_d                = local_resp_rcvd_q;
+    peer_req_valid_d                 = peer_req_valid_q;
+    peer_resp_pending_d              = peer_resp_pending_q;
+    peer_replay_pending_d            = peer_replay_pending_q;
+    peer_req_identity_d              = peer_req_identity_q;
+    active_ready_d                   = active_ready_q;
+    active_req_accepted_d            = active_req_accepted_q;
+    active_rsp_received_d            = active_rsp_received_q;
+    active_peer_req_seen_d           = active_peer_req_seen_q;
+    active_peer_rsp_pending_d        = active_peer_rsp_pending_q;
+    active_peer_rsp_accepted_d       = active_peer_rsp_accepted_q;
+    linkreset_local_needed_d         = linkreset_local_needed_q;
+    linkreset_req_accepted_d         = linkreset_req_accepted_q;
+    linkreset_rsp_received_d         = linkreset_rsp_received_q;
+    linkreset_peer_rsp_pending_d     = linkreset_peer_rsp_pending_q;
+    disabled_local_needed_d          = disabled_local_needed_q;
+    disabled_req_accepted_d          = disabled_req_accepted_q;
+    disabled_rsp_received_d          = disabled_rsp_received_q;
+    disabled_peer_rsp_pending_d      = disabled_peer_rsp_pending_q;
+    trainerror_local_needed_d        = trainerror_local_needed_q;
+    trainerror_req_accepted_d        = trainerror_req_accepted_q;
+    trainerror_rsp_received_d        = trainerror_rsp_received_q;
+    trainerror_peer_rsp_pending_d    = trainerror_peer_rsp_pending_q;
+    phase_b_state_complete           = 1'b0;
 
-    // State entry resets state-scoped transaction data. A new RESET epoch
-    // also clears every sticky pattern and raw SBINIT policy register.
+    // Every public state owns fresh state-scoped transaction data. A RESET
+    // entry also creates a recovery epoch and clears all raw SBINIT history.
     if (state_entry) begin
-      txn_step_d                 = 3'd0;
-      local_req_accepted_d       = 1'b0;
-      local_resp_rcvd_d          = 1'b0;
-      peer_req_valid_d           = 1'b0;
-      peer_resp_pending_d        = 1'b0;
-      peer_replay_pending_d      = 1'b0;
-      peer_req_identity_d        = 99'd0;
-      timer_start_d = (state_q != LT_RESET) &&
-                      (state_q != LT_ACTIVE) &&
-                      (state_q != LT_L1L2) &&
-                      (state_q != LT_TRAINERROR);
+      phase_c_mode_d                 = PC_NONE;
+      reset_trigger_pending_d        = 1'b0;
+      txn_step_d                     = 3'd0;
+      local_req_accepted_d           = 1'b0;
+      local_resp_rcvd_d              = 1'b0;
+      peer_req_valid_d               = 1'b0;
+      peer_resp_pending_d            = 1'b0;
+      peer_replay_pending_d          = 1'b0;
+      peer_req_identity_d            = 99'd0;
+      active_ready_d                 = 1'b0;
+      active_req_accepted_d          = 1'b0;
+      active_rsp_received_d          = 1'b0;
+      active_peer_req_seen_d         = 1'b0;
+      active_peer_rsp_pending_d      = 1'b0;
+      active_peer_rsp_accepted_d     = 1'b0;
+      linkreset_local_needed_d       = 1'b0;
+      linkreset_req_accepted_d       = 1'b0;
+      linkreset_rsp_received_d       = 1'b0;
+      linkreset_peer_rsp_pending_d   = 1'b0;
+      disabled_local_needed_d        = 1'b0;
+      disabled_req_accepted_d        = 1'b0;
+      disabled_rsp_received_d        = 1'b0;
+      disabled_peer_rsp_pending_d    = 1'b0;
+      trainerror_local_needed_d      = 1'b0;
+      trainerror_req_accepted_d      = 1'b0;
+      trainerror_rsp_received_d      = 1'b0;
+      trainerror_peer_rsp_pending_d  = 1'b0;
+      timer_start_d                  = normal_timed_state;
 
       if (state_q == LT_RESET) begin
-        reset_min_done_d           = 1'b0;
-        sbinit_phase_d             = SBI_PATTERN_ACTIVE;
-        sbinit_match_streak_d      = 2'd0;
-        pattern_trigger_pending_d  = 1'b0;
-        sbinit_tail_count_d        = 3'd0;
-        sbinit_window_count_d      = 32'd0;
-        sbinit_oor_sent_d          = 1'b0;
-        sbinit_oor_received_d      = 1'b0;
-        sbinit_done_req_sent_d     = 1'b0;
-        sbinit_done_rsp_sent_d     = 1'b0;
-        sbinit_done_rsp_received_d = 1'b0;
-        sbinit_done_rsp_pending_d  = 8'd0;
+        reset_min_done_d             = 1'b0;
+        recovery_reset_d             = 1'b1;
+        sbinit_phase_d               = SBI_PATTERN_ACTIVE;
+        sbinit_match_streak_d        = 2'd0;
+        pattern_trigger_pending_d    = 1'b0;
+        sbinit_tail_count_d          = 3'd0;
+        sbinit_window_count_d        = 32'd0;
+        sbinit_oor_sent_d            = 1'b0;
+        sbinit_oor_received_d        = 1'b0;
+        sbinit_done_req_sent_d       = 1'b0;
+        sbinit_done_rsp_sent_d       = 1'b0;
+        sbinit_done_rsp_received_d   = 1'b0;
+        sbinit_done_rsp_pending_d    = 8'd0;
       end else if (state_q == LT_SBINIT) begin
-        sbinit_phase_d             = SBI_PATTERN_ACTIVE;
-        sbinit_tail_count_d        = 3'd0;
-        sbinit_window_count_d      = 32'd0;
-        sbinit_oor_sent_d          = 1'b0;
-        sbinit_oor_received_d      = 1'b0;
-        sbinit_done_req_sent_d     = 1'b0;
-        sbinit_done_rsp_sent_d     = 1'b0;
-        sbinit_done_rsp_received_d = 1'b0;
-        sbinit_done_rsp_pending_d  = 8'd0;
+        sbinit_phase_d               = SBI_PATTERN_ACTIVE;
+        sbinit_tail_count_d          = 3'd0;
+        sbinit_window_count_d        = 32'd0;
+        sbinit_oor_sent_d            = 1'b0;
+        sbinit_oor_received_d        = 1'b0;
+        sbinit_done_req_sent_d       = 1'b0;
+        sbinit_done_rsp_sent_d       = 1'b0;
+        sbinit_done_rsp_received_d   = 1'b0;
+        sbinit_done_rsp_pending_d    = 8'd0;
       end
     end
 
-    // Phase B accepts only the transmission selected by the strict arbiter.
-    // A response updates the local flag only after the request was accepted.
-    // The fatal wire removes early responses before this block can use them.
-    if (phase_b_active && !phase_b_rx_fatal) begin
-      if (sb_tx_accepted && tx_peer_resp)
+    // RESET consumes event inputs, never their source levels. An event on the
+    // RESET-entry cycle belongs to the transition being completed and cannot
+    // trigger recovery. A later event remains pending through the 4 ms dwell.
+    if ((state_q == LT_RESET) && !reset_entry &&
+        (software_start_event || rdi_active_event))
+      reset_trigger_pending_d = 1'b1;
+
+    // LINKINIT remembers that the local RDI requested Active. This permits a
+    // queued peer response after the level later changes, while preventing any
+    // request or response before Active was sampled at least once.
+    if ((state_q == LT_LINKINIT) && rdi_active_req)
+      active_ready_d = 1'b1;
+
+    // Accepted transmissions retire exactly the selected obligation. Request
+    // acceptance and peer-response acceptance remain separate state bits.
+    if (sb_tx_accepted) begin
+      if (tx_disabled_resp)
+        disabled_peer_rsp_pending_d = 1'b0;
+      if (tx_linkreset_resp)
+        linkreset_peer_rsp_pending_d = 1'b0;
+      if (tx_trainerror_resp)
+        trainerror_peer_rsp_pending_d = 1'b0;
+      if (tx_peer_resp)
         peer_resp_pending_d = 1'b0;
-      if (sb_tx_accepted && tx_local_req)
-        local_req_accepted_d = 1'b1;
-      if (sb_tx_accepted && tx_dup_peer)
-        peer_replay_pending_d = 1'b0;
-
-      if (phase_b_peer_rsp)
-        local_resp_rcvd_d = 1'b1;
-
-      // The first peer request stores one exact identity and one response.
-      // An identical request while that response is queued adds nothing.
-      // After completion, one identical request creates one replay obligation.
-      if (phase_b_peer_req) begin
-        if (state_entry || !peer_req_valid_q) begin
-          peer_req_valid_d      = 1'b1;
-          peer_resp_pending_d   = 1'b1;
-          peer_req_identity_d   = rx_peer_req_identity;
-        end else if (peer_req_identity_match) begin
-          if (!peer_resp_pending_q && !peer_replay_pending_q)
-            peer_replay_pending_d = 1'b1;
-        end
+      if (tx_active_peer_resp) begin
+        active_peer_rsp_pending_d  = 1'b0;
+        active_peer_rsp_accepted_d = 1'b1;
       end
-
-      // Complete one logical transaction only after every current obligation.
-      // Wait one cycle after peer-service acceptance. The retained identity
-      // then recognizes a duplicate that arrives after the completed response.
-      // Clearing all step-local data makes the next subcode a new transaction.
-      if (local_req_accepted_d && local_resp_rcvd_d &&
-          !peer_resp_pending_d && !peer_replay_pending_d &&
-          !(sb_tx_accepted && (tx_peer_resp || tx_dup_peer))) begin
-        local_req_accepted_d  = 1'b0;
-        local_resp_rcvd_d     = 1'b0;
-        peer_req_valid_d      = 1'b0;
-        peer_resp_pending_d   = 1'b0;
+      if (tx_trainerror_req)
+        trainerror_req_accepted_d = 1'b1;
+      if (tx_disabled_req)
+        disabled_req_accepted_d = 1'b1;
+      if (tx_linkreset_req)
+        linkreset_req_accepted_d = 1'b1;
+      if (tx_active_req)
+        active_req_accepted_d = 1'b1;
+      if (tx_local_req)
+        local_req_accepted_d = 1'b1;
+      if (tx_dup_peer)
         peer_replay_pending_d = 1'b0;
-        peer_req_identity_d   = 99'd0;
+    end
 
-        if (active_txn_step == sequence_last_step(state_q)) begin
-          txn_step_d             = 3'd0;
-          phase_b_state_complete = 1'b1;
-          timer_start_d          = 1'b0;
-        end else begin
-          txn_step_d = active_txn_step + 1'b1;
-        end
+    // A valid peer transition request creates one retained response.
+    // TRAINERROR accepts only LinkReset recovery, so it ignores Disabled.
+    // A valid TRAINERROR request is retained even if another field is bad.
+    // A duplicate coalesces into the one pending obligation.
+    if (sideband_policy_active && (state_q != LT_TRAINERROR) &&
+        rx_disabled_req && !rx_linkerror_req &&
+        !local_packet_fatal &&
+        !(sb_tx_accepted && tx_disabled_resp))
+      disabled_peer_rsp_pending_d = 1'b1;
+    if (sideband_policy_active && rx_linkreset_req &&
+        !rx_linkerror_req && !rx_disabled_req && !local_packet_fatal &&
+        !(sb_tx_accepted && tx_linkreset_resp))
+      linkreset_peer_rsp_pending_d = 1'b1;
+    if (sideband_policy_active && rx_trainerror_req &&
+        !(sb_tx_accepted && tx_trainerror_resp))
+      trainerror_peer_rsp_pending_d = 1'b1;
+
+    // Matching responses complete only requests already accepted by the TX
+    // mailbox. Early and unsupported responses fail packet validation above.
+    if (disabled_rsp_expected && !local_packet_fatal)
+      disabled_rsp_received_d = 1'b1;
+    if (linkreset_rsp_expected && !local_packet_fatal)
+      linkreset_rsp_received_d = 1'b1;
+    if (trainerror_rsp_expected && !local_packet_fatal)
+      trainerror_rsp_received_d = 1'b1;
+
+    // Phase B retains a current peer response or one exact duplicate replay
+    // even while Phase C blocks normal transaction advancement.
+    if (phase_b_peer_req && !phase_b_peer_req_conflict &&
+        !local_packet_fatal) begin
+      if (state_entry || !peer_req_valid_q) begin
+        peer_req_valid_d      = 1'b1;
+        peer_resp_pending_d   = 1'b1;
+        peer_req_identity_d   = rx_peer_req_identity;
+      end else if (peer_req_identity_match) begin
+        if (!peer_resp_pending_d && !peer_replay_pending_d &&
+            !(sb_tx_accepted && tx_dup_peer))
+          peer_replay_pending_d = 1'b1;
+      end
+    end
+    if (phase_b_rsp_expected && !local_packet_fatal)
+      local_resp_rcvd_d = 1'b1;
+
+    // Active requests are fixed-field idempotent requests. One pending bit
+    // coalesces duplicates, but every accepted replay delays state completion.
+    if ((state_q == LT_LINKINIT) && rx_active_req &&
+        !local_packet_fatal) begin
+      active_peer_req_seen_d = 1'b1;
+      if (!(sb_tx_accepted && tx_active_peer_resp))
+        active_peer_rsp_pending_d = 1'b1;
+    end
+    if ((state_q == LT_LINKINIT) && active_rsp_expected &&
+        !local_packet_fatal)
+      active_rsp_received_d = 1'b1;
+
+    // A remote-only transition can become bidirectional if the local RDI
+    // requests the same state before the exchange completes.
+    if ((phase_c_mode_q == PC_LINKRESET) && rdi_linkreset_req)
+      linkreset_local_needed_d = 1'b1;
+    if ((phase_c_mode_q == PC_DISABLED) && rdi_disabled_req)
+      disabled_local_needed_d = 1'b1;
+    if ((phase_c_mode_q == PC_TRAINERROR) && internal_fatal_event)
+      trainerror_local_needed_d = 1'b1;
+
+    // Start or upgrade one transition according to the required priority.
+    // An upgrade drops the lower-priority local request but retains all peer
+    // response obligations. Each change restarts the shared 8 ms timer.
+    if (start_trainerror_exchange) begin
+      phase_c_mode_d             = PC_TRAINERROR;
+      linkreset_local_needed_d   = 1'b0;
+      linkreset_req_accepted_d   = 1'b0;
+      linkreset_rsp_received_d   = 1'b0;
+      disabled_local_needed_d    = 1'b0;
+      disabled_req_accepted_d    = 1'b0;
+      disabled_rsp_received_d    = 1'b0;
+      if (internal_fatal_event)
+        trainerror_local_needed_d = 1'b1;
+      timer_start_d = 1'b1;
+    end else if (start_disabled_exchange) begin
+      phase_c_mode_d             = PC_DISABLED;
+      linkreset_local_needed_d   = 1'b0;
+      linkreset_req_accepted_d   = 1'b0;
+      linkreset_rsp_received_d   = 1'b0;
+      if (rdi_disabled_req)
+        disabled_local_needed_d = 1'b1;
+      timer_start_d = 1'b1;
+    end else if (start_linkreset_exchange) begin
+      phase_c_mode_d = PC_LINKRESET;
+      if (rdi_linkreset_req)
+        linkreset_local_needed_d = 1'b1;
+      timer_start_d = 1'b1;
+    end
+
+    // Complete one normal Phase B transaction only after every current
+    // request, response, and replay obligation is complete.
+    if (phase_b_active && normal_transaction_allowed &&
+        local_req_accepted_d && local_resp_rcvd_d &&
+        !peer_resp_pending_d && !peer_replay_pending_d &&
+        !phase_c_response_accept) begin
+      local_req_accepted_d  = 1'b0;
+      local_resp_rcvd_d     = 1'b0;
+      peer_req_valid_d      = 1'b0;
+      peer_resp_pending_d   = 1'b0;
+      peer_replay_pending_d = 1'b0;
+      peer_req_identity_d   = 99'd0;
+
+      if (active_txn_step == sequence_last_step(state_q)) begin
+        txn_step_d             = 3'd0;
+        phase_b_state_complete = 1'b1;
+        timer_start_d          = 1'b0;
+      end else begin
+        txn_step_d = active_txn_step + 1'b1;
       end
     end
 
-    // Consume each atomic remote iteration result in lclk. A mismatch clears
-    // only the current streak. The second match sets a sticky epoch trigger.
+    // Consume each atomic remote iteration result in lclk. This is the
+    // unchanged raw SBINIT detection and post-detection tail policy.
     if (!reset_entry && sbinit_rx_iter_vld &&
         ((state_q == LT_RESET) ||
          ((state_q == LT_SBINIT) &&
@@ -1026,22 +1453,22 @@ module ltsm #(
       // -----------------------------------------------------------------
       // 4.5.3.1 RESET
       // -----------------------------------------------------------------
-      // RESET exits only after the local 4 ms minimum and either the local
-      // training request or the sticky two-consecutive-pattern trigger.
+      // The initial epoch can use raw detection or either fresh event.
+      // Recovery epochs require a fresh software or RDI event after entry.
       LT_RESET: begin
-        if (rst_tmr_expired) reset_min_done_d = 1'b1;
+        if (rst_tmr_expired)
+          reset_min_done_d = 1'b1;
         if (!reset_entry && (rst_tmr_expired || reset_min_done_q) &&
-            (start_link_train || pattern_trigger_pending_d))
+            (reset_trigger_pending_d ||
+             (!recovery_reset_q && pattern_trigger_pending_d)))
           state_d = LT_SBINIT;
       end
 
       // -----------------------------------------------------------------
       // 4.5.3.2 SBINIT
       // -----------------------------------------------------------------
-      // Pattern policy alternates 1 ms active and 1 ms fully-idle windows
-      // before detection. After detection, the fourth completion event moves
-      // to repeated Out-of-Reset packets. Done uses distinct request and
-      // response obligations and shares this state's single 8 ms deadline.
+      // Raw waveform, detection, retry, packet ordering, and timeout policy
+      // remain unchanged from Phase A.
       LT_SBINIT: begin
         case (sbinit_phase_q)
           SBI_PATTERN_ACTIVE,
@@ -1060,8 +1487,6 @@ module ltsm #(
                 end
               end
             end else if (sbinit_phase_q == SBI_PATTERN_ACTIVE) begin
-              // Count only while the synchronized primitive is not idle, so
-              // the active window excludes lclk-to-sbclk startup latency.
               if (!sbinit_tx_idle) begin
                 if (sbinit_window_count_q == (SBINIT_ACTIVE_LCLK_CYCLES - 1)) begin
                   sbinit_phase_d        = SBI_PATTERN_IDLE;
@@ -1071,8 +1496,6 @@ module ltsm #(
                 end
               end
             end else begin
-              // Start the idle window only after the raw primitive reaches a
-              // low boundary and reports idle back into lclk.
               if (sbinit_tx_idle) begin
                 if (sbinit_window_count_q == (SBINIT_IDLE_LCLK_CYCLES - 1)) begin
                   sbinit_phase_d        = SBI_PATTERN_ACTIVE;
@@ -1085,11 +1508,11 @@ module ltsm #(
           end
 
           SBI_OUT_OF_RESET: begin
-            if (sbinit_oor_rx)   sbinit_oor_received_d = 1'b1;
-            if (sbinit_oor_send) sbinit_oor_sent_d     = 1'b1;
+            if (sbinit_oor_rx)
+              sbinit_oor_received_d = 1'b1;
+            if (sbinit_oor_send)
+              sbinit_oor_sent_d = 1'b1;
 
-            // Preserve an early peer Done request until packet mode reaches
-            // the Done phase. This does not satisfy the response we await.
             if (sbinit_done_req_rx &&
                 (sbinit_done_rsp_pending_q != 8'hFF))
               sbinit_done_rsp_pending_d = sbinit_done_rsp_pending_q + 1'b1;
@@ -1100,23 +1523,21 @@ module ltsm #(
           end
 
           SBI_DONE: begin
-            if (sbinit_done_req_send) sbinit_done_req_sent_d = 1'b1;
-            if (sbinit_done_rsp_send) sbinit_done_rsp_sent_d = 1'b1;
+            if (sbinit_done_req_send)
+              sbinit_done_req_sent_d = 1'b1;
+            if (sbinit_done_rsp_send)
+              sbinit_done_rsp_sent_d = 1'b1;
 
-            // Queue every peer request and retire one obligation for every
-            // response accepted by the TX mailbox. Simultaneous events leave
-            // the queue depth unchanged.
             case ({sbinit_done_req_rx, sbinit_done_rsp_send})
               2'b10: begin
                 if (sbinit_done_rsp_pending_q != 8'hFF)
                   sbinit_done_rsp_pending_d = sbinit_done_rsp_pending_q + 1'b1;
               end
               2'b01: sbinit_done_rsp_pending_d =
-                       sbinit_done_rsp_pending_q - 1'b1;
+                         sbinit_done_rsp_pending_q - 1'b1;
               default: sbinit_done_rsp_pending_d = sbinit_done_rsp_pending_q;
             endcase
 
-            // An early response cannot complete a request that was not sent.
             if (sbinit_done_rsp_rx && sbinit_done_req_sent_q)
               sbinit_done_rsp_received_d = 1'b1;
 
@@ -1136,10 +1557,6 @@ module ltsm #(
       // -----------------------------------------------------------------
       // 4.5.3.3 MBINIT fixed-profile sequences
       // -----------------------------------------------------------------
-      // PARAM [00], CAL [02], REPAIRCLK [03..08], REPAIRVAL [09..0C],
-      // REVERSALMB [0D..10], and REPAIRMB [11..14] complete in order.
-      // phase_b_state_complete asserts only after the final transaction.
-      // Spec ref: UCIe 1.0 Section 4.5.3.3 and Table 56.
       LT_MBINIT_PARAM:
         if (phase_b_state_complete) state_d = LT_MBINIT_CAL;
       LT_MBINIT_CAL:
@@ -1156,10 +1573,6 @@ module ltsm #(
       // -----------------------------------------------------------------
       // 4.5.3.4 MBTRAIN fixed-profile sequences
       // -----------------------------------------------------------------
-      // Each state consumes every listed subcode from the sequence lookup.
-      // LINKSPEED requires both 15h and 19h transactions before LINKINIT.
-      // Any other LINKSPEED result fails complete-packet validation.
-      // Spec ref: UCIe 1.0 Section 4.5.3.4 and Tables 53 and 54.
       LT_MB_VALVREF:
         if (phase_b_state_complete) state_d = LT_MB_DATAVREF;
       LT_MB_DATAVREF:
@@ -1181,167 +1594,275 @@ module ltsm #(
       LT_MB_LINKSPEED:
         if (phase_b_state_complete) state_d = LT_LINKINIT;
 
-      // MBTRAIN.REPAIR is outside the fixed profile. It does not issue a
-      // request and cannot route a LINKSPEED success or failure. Reaching it
-      // is itself fatal, while supported LINKSPEED success goes to LINKINIT.
-      // Spec ref: UCIe 1.0 Section 4.5.3.4.13.
-      LT_MB_REPAIR: state_d = LT_TRAINERROR;
+      // Unsupported MBTRAIN.REPAIR is converted to a local fatal event above.
+      LT_MB_REPAIR: state_d = state_q;
 
       // -----------------------------------------------------------------
-      // 4.5.3.5 LINKINIT through 4.5.3.9 terminal/runtime states
+      // 4.5.3.5 LINKINIT and fixed-profile runtime states
       // -----------------------------------------------------------------
+      // Active Entry does not wait for pat_done. The local request and its
+      // matching response complete the mandatory local exchange. A valid peer
+      // request, if received, adds a response obligation but is not required
+      // before Active because the remote exchange can be peer-initiated.
       LT_LINKINIT: begin
-        if (pat_done) state_d = LT_ACTIVE;
+        if (normal_transaction_allowed && active_ready_d &&
+            active_req_accepted_d && active_rsp_received_d &&
+            !active_peer_rsp_pending_d && !phase_c_response_accept) begin
+          state_d       = LT_ACTIVE;
+          timer_start_d = 1'b0;
+        end
       end
 
-      LT_ACTIVE: begin
-        if (retrain_req_q) state_d = LT_PHYRETRAIN;
-      end
+      LT_ACTIVE: state_d = state_q;
 
-      // Phase B does not implement PHYRETRAIN. The fixed profile never
-      // requests this state, and no sideband exchange starts from it.
-      // Spec ref: PLAN.md Section 5.1 and Section 15.9 Phase B.
-      LT_PHYRETRAIN: begin
-        state_d = state_q;
-      end
+      // PHYRETRAIN and L1/L2 remain unsupported in the fixed profile.
+      LT_PHYRETRAIN: state_d = state_q;
+      LT_L1L2:       state_d = state_q;
 
-      LT_L1L2: begin
-        if (start_link_train) state_d = LT_RESET;
-      end
-
-      LT_TRAINERROR: begin
-        if (start_link_train) state_d = LT_RESET;
-      end
+      // TRAINERROR holds until a LinkReset request starts and completes the
+      // supported recovery exchange. Start and Active events cannot exit it.
+      LT_TRAINERROR: state_d = state_q;
 
       default: state_d = LT_RESET;
     endcase
 
-    // Every invalid packet after SBINIT is fatal. This override also catches
-    // wrong-state traffic in LINKINIT and runtime states without adding any
-    // Phase C message handling.
-    if (phase_b_rx_fatal) begin
-      state_d       = LT_TRAINERROR;
-      timer_start_d = 1'b0;
-    end
+    // A newly selected higher-priority exchange suppresses any normal state
+    // transition calculated in the same cycle.
+    if (phase_c_exchange_start)
+      state_d = state_q;
 
-    // Every timed training state uses one uninterrupted residency deadline.
+    // A missing LinkReset or Disabled response is a fatal LinkError result.
+    // It starts TRAINERROR Entry with a new 8 ms interval. If that exchange
+    // also times out, the public TRAINERROR hold begins unconditionally.
+
+    // Complete the selected Phase C exchange only after its local exchange,
+    // when required, and every retained peer response obligation are done.
+    case (phase_c_mode_q)
+      PC_LINKRESET: begin
+        if (recovery_exchange_timeout) begin
+          state_d        = LT_TRAINERROR;
+          phase_c_mode_d = PC_NONE;
+          timer_start_d  = 1'b0;
+        end else if ((phase_c_mode_d == PC_LINKRESET) &&
+                     (!linkreset_local_needed_d ||
+                      (linkreset_req_accepted_d &&
+                       linkreset_rsp_received_d)) &&
+                     !peer_resp_pending_d && !peer_replay_pending_d &&
+                     !active_peer_rsp_pending_d &&
+                     !linkreset_peer_rsp_pending_d &&
+                     !disabled_peer_rsp_pending_d &&
+                     !trainerror_peer_rsp_pending_d &&
+                     !phase_c_response_accept) begin
+          state_d        = LT_RESET;
+          phase_c_mode_d = PC_NONE;
+          timer_start_d  = 1'b0;
+        end
+      end
+
+      PC_DISABLED: begin
+        if ((phase_c_mode_d == PC_DISABLED) &&
+            (!disabled_local_needed_d ||
+             (disabled_req_accepted_d && disabled_rsp_received_d)) &&
+            !peer_resp_pending_d && !peer_replay_pending_d &&
+            !active_peer_rsp_pending_d &&
+            !linkreset_peer_rsp_pending_d &&
+            !disabled_peer_rsp_pending_d &&
+            !trainerror_peer_rsp_pending_d &&
+            !phase_c_response_accept) begin
+          state_d        = LT_RESET;
+          phase_c_mode_d = PC_NONE;
+          timer_start_d  = 1'b0;
+        end
+      end
+
+      PC_TRAINERROR: begin
+        if (trainerror_exchange_timeout) begin
+          state_d        = LT_TRAINERROR;
+          phase_c_mode_d = PC_NONE;
+          timer_start_d  = 1'b0;
+        end else if ((phase_c_mode_d == PC_TRAINERROR) &&
+                     trainerror_local_needed_d &&
+                     trainerror_req_accepted_d &&
+                     trainerror_rsp_received_d &&
+                     !peer_resp_pending_d && !peer_replay_pending_d &&
+                     !active_peer_rsp_pending_d &&
+                     !linkreset_peer_rsp_pending_d &&
+                     !disabled_peer_rsp_pending_d &&
+                     !trainerror_peer_rsp_pending_d &&
+                     !phase_c_response_accept) begin
+          state_d        = LT_TRAINERROR;
+          phase_c_mode_d = PC_NONE;
+          timer_start_d  = 1'b0;
+        end else if ((phase_c_mode_d == PC_TRAINERROR) &&
+                     !trainerror_local_needed_d &&
+                     !peer_resp_pending_d && !peer_replay_pending_d &&
+                     !active_peer_rsp_pending_d &&
+                     !linkreset_peer_rsp_pending_d &&
+                     !disabled_peer_rsp_pending_d &&
+                     !trainerror_peer_rsp_pending_d &&
+                     !phase_c_response_accept) begin
+          state_d        = LT_TRAINERROR;
+          phase_c_mode_d = PC_NONE;
+          timer_start_d  = 1'b0;
+        end
+      end
+
+      default: ;
+    endcase
+
+    // SBINIT is the one sideband-initialization exception to TRAINERROR Entry.
+    // Its existing 8 ms timeout enters the public error hold directly.
     if (tmr_expired && timer_start_q &&
-        (state_q != LT_ACTIVE) && (state_q != LT_L1L2) &&
-        (state_q != LT_TRAINERROR) && (state_q != LT_RESET)) begin
-      state_d       = LT_TRAINERROR;
-      timer_start_d = 1'b0;
+        (phase_c_mode_q == PC_NONE) && (state_q == LT_SBINIT)) begin
+      state_d        = LT_TRAINERROR;
+      phase_c_mode_d = PC_NONE;
+      timer_start_d  = 1'b0;
     end
   end
 
   // =========================================================================
   // Sideband TX packet interface
   // =========================================================================
-  // SBINIT keeps its dedicated packet scheduler and field values.
-  // Phase B emits the current fixed-profile subcode with a strict role.
-  // Peer response and duplicate replay paths both emit response packets.
-  // PARAM is the only DATA64 exchange. Every other data input is zero.
-  // Spec refs: UCIe 1.0 Tables 47, 49, 53, 54, and 56.
+  // SBINIT, Phase B, and Phase C share one mailbox source. The scheduler above
+  // makes every source mutually exclusive and keeps response obligations until
+  // sb_tx_accepted. Phase C packets are no-data PHY-to-PHY messages with zero
+  // MsgInfo, as required by the fixed profile.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.8, 6.1.2.2, and 8.1.6;
+  //            Tables 53 and 54; PLAN.md Sections 15.4 and 15.9 Phase C.
   // =========================================================================
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband TX load
-  //
-  // The load pulse selects one raw SBINIT or Phase B transmission.
-  // Phase B source wires are mutually exclusive under the strict arbiter.
-  // A busy mailbox leaves each stored response obligation unchanged.
-  // Spec refs: UCIe 1.0 Section 6.1.3 and PLAN.md Section 15.9 Phase B.
-  // -------------------------------------------------------------------------
+  // The mailbox load includes every raw, Phase B, and Phase C source.
+  // The strict scheduler permits only one source in a cycle.
+  // Busy mailbox cycles retain each registered response obligation.
+  // UCIe 1.0 Section 6.1.3 defines packet transmission behavior.
+  // PLAN.md Sections 15.3 and 15.9 define the arbitration contract.
   assign sb_tx_load = sbinit_oor_send || sbinit_done_rsp_send ||
-                      sbinit_done_req_send || tx_peer_resp ||
+                      sbinit_done_req_send || tx_disabled_resp ||
+                      tx_linkreset_resp || tx_trainerror_resp ||
+                      tx_peer_resp || tx_active_peer_resp ||
+                      tx_trainerror_req || tx_disabled_req ||
+                      tx_linkreset_req || tx_active_req ||
                       tx_local_req || tx_dup_peer;
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband TX opcode
-  //
-  // PARAM packets use DATA64 for requests, responses, and replays.
-  // Raw SBINIT and every non-PARAM Phase B packet use MSG_NODATA.
-  // tx_param_send can assert only while a PARAM packet is selected.
-  // Spec refs: UCIe 1.0 Table 47 and Table 56.
-  // -------------------------------------------------------------------------
+  // PARAM remains the only DATA64 packet generated by this module.
+  // Every Active, LinkReset, Disabled, and TRAINERROR packet is no-data.
+  // UCIe 1.0 Section 6.1.2.2 defines no-data message packets.
+  // UCIe 1.0 Tables 53 and 54 list the Phase C encodings.
+  // PLAN.md Section 15.9 Phase C limits the supported packet set.
   assign sb_tx_opcode = tx_param_send ? SB_OP_MSG_DATA64 : SB_OP_MSG_NODATA;
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband TX source and destination IDs
-  //
-  // Every packet produced by this LTSM uses the Physical Layer source ID.
-  // Every packet targets the remote-die Physical Layer destination ID.
-  // The values apply equally to raw SBINIT packets and Phase B packets.
-  // Spec ref: UCIe 1.0 Table 49.
-  // -------------------------------------------------------------------------
+  // Every generated sideband message originates at the local PHY.
+  // LinkMgmt.RDI and TRAINERROR both use the Physical Layer source.
+  // UCIe 1.0 Section 6.1.2.2 defines LinkMgmt.RDI endpoint ownership.
+  // UCIe 1.0 Table 49 defines the source identifier field.
+  // PLAN.md Section 15.9 Phase C preserves the PHY-to-PHY contract.
   assign sb_tx_srcid = SRCID_PHY;
+
+  // Every generated sideband message targets the remote PHY.
+  // No Phase C message is routed through the Adapter destination.
+  // UCIe 1.0 Section 6.1.2.2 defines LinkMgmt.RDI endpoint ownership.
+  // UCIe 1.0 Table 49 defines the destination identifier field.
+  // PLAN.md Section 15.9 Phase C preserves the PHY-to-PHY contract.
   assign sb_tx_dstid = DSTID_REMOTE_PHY;
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband TX MsgInfo
-  //
-  // SBINIT Out-of-Reset preserves the primary-side result value.
-  // Every other SBINIT packet and every Phase B packet uses zero MsgInfo.
-  // LINKSPEED results are subcodes and never travel in MsgInfo.
-  // Spec refs: UCIe 1.0 Tables 53, 54, and 56.
-  // -------------------------------------------------------------------------
+  // SBINIT Out-of-Reset retains its primary-side result encoding.
+  // All other SBINIT, Phase B, and Phase C messages use zero MsgInfo.
+  // UCIe 1.0 Tables 53, 54, and 56 define these MsgInfo values.
+  // UCIe 1.0 Section 4.5.3.8 defines TRAINERROR Entry.
+  // PLAN.md Section 15.9 Phase C requires zero Phase C MsgInfo.
   assign sb_tx_msginfo = sbinit_oor_send ? SBINIT_RESULT_PRIMARY : 8'h00;
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband TX message code
-  //
-  // Raw SBINIT packets retain their dedicated request and response codes.
-  // Both peer-service paths use the response code for the current state.
-  // Only tx_local_req uses the current MBINIT or MBTRAIN request code.
-  // Spec refs: UCIe 1.0 Tables 53, 54, and 56.
-  // -------------------------------------------------------------------------
+  // The selected role determines the message code. LinkMgmt responses cover
+  // Active, LinkReset, and Disabled. TRAINERROR uses E5h and EAh.
+  // Phase B keeps its state-specific request and response lookup.
+  // UCIe 1.0 Tables 53, 54, and 56 define all selected codes.
+  // PLAN.md Sections 15.3 and 15.9 define the supported roles.
   assign sb_tx_msgcode = sbinit_oor_send      ? MC_SB_OOB_RESET :
                          sbinit_done_rsp_send ? MC_SB_DONE_RSP  :
                          sbinit_done_req_send ? MC_SB_DONE_REQ  :
+                         (tx_disabled_resp || tx_linkreset_resp ||
+                          tx_active_peer_resp) ? MC_LM_RDI_RSP :
+                         tx_trainerror_resp ? MC_TE_RSP :
                          (tx_peer_resp || tx_dup_peer)
-                           ? msg_rsp_code(state_q)
-                           : msg_req_code(state_q);
+                           ? msg_rsp_code(state_q) :
+                         tx_trainerror_req ? MC_TE_REQ :
+                         (tx_disabled_req || tx_linkreset_req || tx_active_req)
+                           ? MC_LM_RDI_REQ : msg_req_code(state_q);
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband TX message subcode
-  //
-  // Raw SBINIT packets retain Out-of-Reset and Done subcodes.
-  // Every Phase B role uses the exact current sequence subcode.
-  // The private step changes only after the current transaction completes.
-  // Spec refs: UCIe 1.0 Tables 53, 54, and 56.
-  // -------------------------------------------------------------------------
+  // The selected transition determines the Phase C message subcode.
+  // Active uses 01h, LinkReset uses 09h, and Disabled uses 0Ch.
+  // TRAINERROR Entry uses subcode 00h for request and response.
+  // UCIe 1.0 Tables 53 and 54 define these exact values.
+  // PLAN.md Section 15.9 Phase C limits the supported subcodes.
   assign sb_tx_msgsubcode = sbinit_oor_send ? MS_SB_OOB_RESET :
                             (sbinit_done_rsp_send || sbinit_done_req_send)
-                              ? MS_SB_DONE
-                              : current_subcode;
+                              ? MS_SB_DONE :
+                            (tx_disabled_resp || tx_disabled_req)
+                              ? MS_LM_DISABLE :
+                            (tx_linkreset_resp || tx_linkreset_req)
+                              ? MS_LM_LINKRESET :
+                            (tx_active_peer_resp || tx_active_req)
+                              ? MS_LM_ACTIVE :
+                            (tx_trainerror_resp || tx_trainerror_req)
+                              ? MS_TE_ENTRY : current_subcode;
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband TX fixed header and payload fields
-  //
-  // PARAM local requests use immutable PARAM_REQ_DATA.
-  // PARAM peer responses and duplicate replays use PARAM_RSP_DATA.
-  // All non-PARAM sends drive zero on sb_tx_data_in and clear has_data.
-  // Remaining message-format fields use their fixed zero values.
-  // Spec refs: UCIe 1.0 Section 6.1.2 and Table 56.
-  // -------------------------------------------------------------------------
-  assign sb_tx_be       = 8'h00;
-  assign sb_tx_tag      = 5'h00;
-  assign sb_tx_ep       = 1'b0;
-  assign sb_tx_addr     = 12'h000;
-  assign sb_tx_data_in  = tx_param_send
-                            ? (tx_local_req ? PARAM_REQ_DATA : PARAM_RSP_DATA)
-                            : 64'h0;
+  // Message packets in this profile do not use byte enables.
+  // PARAM carries a fixed full DATA64 payload through its message format.
+  // UCIe 1.0 Section 6.1.2 defines the packet fields.
+  // UCIe 1.0 Tables 53 through 56 define the supported messages.
+  // PLAN.md Sections 15.3 and 15.9 add no byte-enable behavior.
+  assign sb_tx_be = 8'h00;
+
+  // Message packets in this profile do not use a transaction tag.
+  // The value remains zero for raw, Phase B, and Phase C messages.
+  // UCIe 1.0 Section 6.1.2 defines the packet fields.
+  // UCIe 1.0 Tables 53 through 56 define the supported messages.
+  // PLAN.md Sections 15.3 and 15.9 add no tag behavior.
+  assign sb_tx_tag = 5'h00;
+
+  // The fixed packet profile does not request end-to-end poison handling.
+  // The EP bit remains low for every generated message.
+  // UCIe 1.0 Section 6.1.2 defines the packet fields.
+  // UCIe 1.0 Tables 53 through 56 define the supported messages.
+  // PLAN.md Sections 15.3 and 15.9 add no EP behavior.
+  assign sb_tx_ep = 1'b0;
+
+  // These messages do not carry a register-access address.
+  // The address field remains zero for every generated packet.
+  // UCIe 1.0 Section 6.1.2 defines the packet fields.
+  // UCIe 1.0 Tables 53 through 56 define the supported messages.
+  // PLAN.md Sections 15.3 and 15.9 add no address behavior.
+  assign sb_tx_addr = 12'h000;
+
+  // PARAM local requests use PARAM_REQ_DATA and peer responses use
+  // PARAM_RSP_DATA. Every Phase C packet drives a zero payload value.
+  // UCIe 1.0 Table 56 defines the PARAM DATA64 payload.
+  // UCIe 1.0 Tables 53 and 54 define Phase C as no-data.
+  // PLAN.md Sections 15.3 and 15.9 preserve this separation.
+  assign sb_tx_data_in = tx_param_send
+                           ? (tx_local_req ? PARAM_REQ_DATA : PARAM_RSP_DATA)
+                           : 64'h0;
+
+  // Only PARAM asserts the mailbox data-payload qualifier.
+  // LinkMgmt.RDI and TRAINERROR always clear this qualifier.
+  // UCIe 1.0 Section 6.1.2 separates data and no-data messages.
+  // UCIe 1.0 Tables 53, 54, and 56 define the selected formats.
+  // PLAN.md Section 15.9 Phase C requires no-data exchanges.
   assign sb_tx_has_data = tx_param_send;
 
-  // -------------------------------------------------------------------------
-  // assign: Sideband timeout and stall status
-  //
-  // Phase B uses the existing LTSM residency timer instead of message timeout.
-  // This reduced profile does not insert sideband stall messages.
-  // Both status outputs therefore remain at their fixed inactive values.
-  // Spec refs: UCIe 1.0 Sections 4.5.3.3 and 4.5.3.4.
-  // -------------------------------------------------------------------------
+  // The LTSM residency timer owns Phase B and Phase C deadlines.
+  // No independent sideband timeout status is exposed by this profile.
+  // UCIe 1.0 Sections 4.5 and 8.3.2.8 define the 8 ms deadlines.
+  // UCIe 1.0 Section 4.5.3.8 defines TRAINERROR timeout behavior.
+  // PLAN.md Section 15.9 Phase C requires reuse of tmr_start and tmr_run.
   assign sb_msg_timeout = 1'b0;
-  assign sb_stall_sent  = 1'b0;
+
+  // This fixed profile does not transmit a Stall encoding.
+  // Phase C therefore leaves the sideband stall status inactive.
+  // UCIe 1.0 Section 4.5 defines the optional timer reset on Stall.
+  // UCIe 1.0 Section 8.3.2.8 defines the transition timeout result.
+  // PLAN.md Section 15.9 Phase C does not add Stall transmission.
+  assign sb_stall_sent = 1'b0;
 
   // =========================================================================
   // Raw SBINIT primitive controls
@@ -1363,132 +1884,139 @@ module ltsm #(
                                 (SBINIT_POST_DETECT_ITERS - 1)));
 
   // =========================================================================
-  // Pattern generator control  (spec 4.5.3.4, 4.5.3.5)
+  // Pattern generator control
   // =========================================================================
-  // The LTSM disables the pattern generator for every MBINIT (02h-07h) and
-  // MBTRAIN (08h-12h) sub-state. pat_enable is high only during LINKINIT
-  // (14h), where the LFSR diagnostic path emits 4096 UI of PAT_LFSR.
-  // logical_phy applies the matching Phase A low mainband-data and framing
-  // gate while these immediate-success actions are skipped.
-  //
-  // The LINKINIT diagnostic path preserves the per-lane LFSR reseed
-  // (pat_lfsr_reset) and run (pat_lfsr_enable) sequence. Phase A retains
-  // the existing pat_done transition. Phase C replaces it with the required
-  // LinkMgmt.RDI Active exchange.
-  //
-  // Pattern selection mux (effective only when pat_enable is high):
-  //   LINKINIT          -> PAT_LFSR      (per-lane LFSR, 4096 UI)
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
-  //           Section 4.4.1 - Scrambling and training pattern generation.
+  // MBINIT and MBTRAIN keep the Phase A immediate-success low-data policy.
+  // LINKINIT retains the diagnostic LFSR path and reseeds it on entry.
+  // Diagnostic completion does not gate Active Entry. The LinkMgmt.RDI
+  // exchange is the only normal LINKINIT exit condition.
+  // Spec refs: UCIe 1.0 Sections 4.4.1 and 4.5.3.5;
+  //            PLAN.md Sections 15.4 and 15.9 Phase C.
   // =========================================================================
-  assign pat_enable     = (state_q == LT_LINKINIT);
-  // -------------------------------------------------------------------------
-  // assign: Training Pattern Selection Mux
-  //
-  // Selects the training pattern driven onto the main-band lanes based on
-  // the current LTSM sub-state.  This mux is effective only when pat_enable
-  // is high (LINKINIT state).  During MBINIT and MBTRAIN the pattern
-  // generator is disabled and the output is zero.
-  //   LINKINIT            -> PAT_LFSR       (per-lane scrambled LFSR)
-  //
-  // The priority-encoded ternary chain is retained for the LINKINIT
-  // diagnostic path.  The default value (PAT_PERLANEID) is harmless
-  // because pat_enable gates the output.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
-  //           Section 4.4.1 - Scrambling and training pattern generation.
-  // -------------------------------------------------------------------------
-  assign pat_select     = (state_q == LT_MB_VALVREF)  ? PAT_VALTRAIN  :
-                          (state_q == LT_MB_DATAVREF) ? PAT_VALTRAIN  :
-                          (state_q == LT_LINKINIT)    ? PAT_LFSR      :
-                          (state_q == LT_MB_RXDESKEW) ? PAT_CLKREPAIR :
-                                                        PAT_PERLANEID;
-  // -------------------------------------------------------------------------
-  // assign: LFSR Reseed Pulse
-  //
-  // Generates a 1-cycle reset pulse on LINKINIT entry so the per-lane
-  // LFSRs start from a known seed.  Because pat_enable is low for all
-  // MBINIT and MBTRAIN states, the LFSR is only exercised during LINKINIT
-  // where the LFSR pattern IS the training payload.  The clean reseed
-  // ensures the LFSR advances freely for the full 4096-UI duration.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
-  //           Section 4.4.1 - Scrambling and training pattern generation.
-  // -------------------------------------------------------------------------
-  assign pat_lfsr_reset = (state_q == LT_LINKINIT) && (state_q != state_q_prev);
-  // -------------------------------------------------------------------------
-  // assign: LFSR Enable Gate
-  //
-  // Enables the per-lane LFSR only during the LINKINIT sub-state (14h).
-  // During all MBINIT, MBTRAIN, and other states the LFSR holds its
-  // current value so it can be cleanly reseeded on the next LINKINIT
-  // entry via pat_lfsr_reset. The existing LINKINIT diagnostic uses the
-  // 4096-UI completion until Phase C replaces its state-exit condition.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
-  //           Section 4.4.1 - Scrambling and training pattern generation.
-  // -------------------------------------------------------------------------
-  assign pat_lfsr_enable= (state_q == LT_LINKINIT);
-  // =========================================================================
-  // LTSM status outputs  (spec 4.5.3 – reported to RDI state machine)
-  // =========================================================================
-  // link_trained     : Asserted when the LTSM is in ACTIVE (4.5.3.6).
-  // train_error      : Asserted when the LTSM is in TRAINERROR (4.5.3.8).
-  // link_reset_out   : Asserted when the LTSM is in RESET (4.5.3.1).
-  // phy_retrain_done : Asserted when the LTSM returns to ACTIVE after
-  //                    PHYRETRAIN with retrain_req_q still set.
-  // ltsm_state       : 8-bit state encoding for Error Log 0 "State N".
-  // lnk_is_x8        : Tied to 0 (x16 only in this build).
-  // degrade_lanes    : Tied to 00 (no degradation in this build).
-  // =========================================================================
-  assign link_trained    = (state_q == LT_ACTIVE);
-  // -------------------------------------------------------------------------
-  // assign (group): Status and Observability Outputs
-  //
-  // Six continuous assignments that reflect the LTSM state to the RDI
-  // state machine and to top-level observability ports:
-  //   train_error      – asserted in LT_TRAINERROR (4.5.3.8).
-  //   link_reset_out   – asserted in LT_RESET (4.5.3.1); drives RDI LINKRESET.
-  //   phy_retrain_done – asserted when ACTIVE is re-entered after PHYRETRAIN
-  //                      with retrain_req_q still set (4.5.3.7).
-  //   ltsm_state       – raw 8-bit state encoding for Error Log 0.
-  //   lnk_is_x8        – tied to 0; x16-only in this reduced build.
-  //   degrade_lanes    – tied to 00; no lane degradation supported.
-  //
-  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
-  // -------------------------------------------------------------------------
-  assign train_error     = (state_q == LT_TRAINERROR);
-  assign link_reset_out  = (state_q == LT_RESET);
-  assign phy_retrain_done= (state_q == LT_ACTIVE) && retrain_req_q;
-  assign ltsm_state      = state_q;
-  assign lnk_is_x8       = 1'b0;   // x16 only in this reduced capability set
-  assign degrade_lanes   = 2'b00;
 
-  // Phase B does not create a retrain request. Phase C owns runtime RDI
-  // retrain policy, so the retained status register remains inactive here.
+  // The diagnostic pattern remains enabled throughout LINKINIT.
+  // It is disabled for every MBINIT and MBTRAIN immediate-success state.
+  // UCIe 1.0 Section 4.5.3.5 requires the LINKINIT LFSR reset.
+  // UCIe 1.0 Section 8.1.6 defines Active Entry independently of pat_done.
+  // PLAN.md Section 15.9 Phase C forbids diagnostic-pattern delay.
+  assign pat_enable = (state_q == LT_LINKINIT);
+
+  // The existing selection mux remains unchanged for Phase A compatibility.
+  // Only PAT_LFSR is effective because pat_enable is high only in LINKINIT.
+  // UCIe 1.0 Section 4.4.1 defines the diagnostic LFSR pattern.
+  // UCIe 1.0 Section 4.5.3.5 defines the LINKINIT reseed action.
+  // PLAN.md Sections 15.4 and 15.9 retain this diagnostic path.
+  assign pat_select = (state_q == LT_MB_VALVREF)  ? PAT_VALTRAIN  :
+                      (state_q == LT_MB_DATAVREF) ? PAT_VALTRAIN  :
+                      (state_q == LT_LINKINIT)    ? PAT_LFSR      :
+                      (state_q == LT_MB_RXDESKEW) ? PAT_CLKREPAIR :
+                                                    PAT_PERLANEID;
+
+  // LINKINIT entry emits exactly one LFSR reseed pulse.
+  // The pulse is independent from local and remote Active request timing.
+  // UCIe 1.0 Section 4.5.3.5 requires reset on LINKINIT entry.
+  // UCIe 1.0 Section 8.1.6 defines the later Active Entry exchange.
+  // PLAN.md Section 15.9 Phase C preserves this entry action.
+  assign pat_lfsr_reset = (state_q == LT_LINKINIT) && state_entry;
+
+  // The diagnostic LFSR can advance while LINKINIT waits for Active Entry.
+  // Its completion cannot change the LTSM state or the exchange obligations.
+  // UCIe 1.0 Section 4.4.1 defines LFSR operation.
+  // UCIe 1.0 Sections 4.5.3.5 and 8.1.6 define LINKINIT completion.
+  // PLAN.md Section 15.9 Phase C removes the pat_done exit gate.
+  assign pat_lfsr_enable = (state_q == LT_LINKINIT);
 
   // =========================================================================
-  // Lint suppression
+  // LTSM status and private Phase C outputs
   // =========================================================================
-  // The fixed profile does not consume adapter_active_req until Phase C.
-  // This reduction keeps that public input and selected policy wires visible
-  // to simple single-pass lint tools without adding runtime behavior.
+  // ACTIVE and TRAINERROR remain public LTSM states. Active Entry completion
+  // is a stable result while ACTIVE, while the Start clear is a one-cycle
+  // state-entry pulse. RESET remains visible only after a completed LinkReset
+  // or Disabled exchange, or a defensive state recovery.
+  // Spec refs: UCIe 1.0 Sections 4.5.3.1, 4.5.3.5, and 4.5.3.8;
+  //            PLAN.md Sections 15.4 and 15.9 Phase C.
+  // =========================================================================
+
+  // active_entry_done stays high for the complete ACTIVE residency.
+  // The parent RDI state machine can therefore sample a stable result.
+  // UCIe 1.0 Section 8.1.6 requires Active Entry before RDI Active.
+  // UCIe 1.0 Section 4.5.3.6 defines the LTSM ACTIVE state.
+  // PLAN.md Section 15.9 Phase C adds this private result port.
+  assign active_entry_done = (state_q == LT_ACTIVE);
+
+  // clear_start_link_train pulses for one cycle on successful ACTIVE entry.
+  // No timeout or recovery transition can produce this clear pulse.
+  // UCIe 1.0 Section 4.5.3.5 requires clearing the PHY Start copy.
+  // UCIe 1.0 Section 8.1.6 defines successful Active Entry.
+  // PLAN.md Sections 15.4 and 15.9 require the one-shot clear.
+  assign clear_start_link_train = (state_q == LT_ACTIVE) && state_entry;
+
+  // link_trained reflects the same completed ACTIVE residency.
+  // It remains low during LINKINIT even after diagnostic pat_done.
+  // UCIe 1.0 Section 4.5.3.6 defines completed physical initialization.
+  // UCIe 1.0 Section 8.1.6 requires the Active Entry handshake first.
+  // PLAN.md Section 15.9 Phase C makes the LTSM the sole owner.
+  assign link_trained = (state_q == LT_ACTIVE);
+
+  // train_error remains high throughout the public TRAINERROR hold.
+  // It deasserts only after a completed LinkReset exchange enters RESET.
+  // UCIe 1.0 Section 4.5.3.8 defines TRAINERROR behavior.
+  // UCIe 1.0 Section 8.3.2.7 defines LinkError recovery constraints.
+  // PLAN.md Sections 15.4 and 15.9 require LinkReset-only recovery.
+  assign train_error = (state_q == LT_TRAINERROR);
+
+  // link_reset_out identifies the public RESET state after transition work.
+  // LinkReset and Disabled private exchanges do not assert it prematurely.
+  // UCIe 1.0 Section 4.5.3.1 defines the RESET state and dwell.
+  // UCIe 1.0 Section 8.3.2.8 defines transition handshake completion.
+  // PLAN.md Section 15.9 Phase C requires RESET after exchange completion.
+  assign link_reset_out = (state_q == LT_RESET);
+
+  // Runtime PHYRETRAIN is outside the fixed profile and never completes.
+  // The retained public compatibility output therefore remains inactive.
+  // UCIe 1.0 Section 4.5.3.7 defines PHYRETRAIN.
+  // PLAN.md Sections 15.4 and 15.9 exclude runtime retrain behavior.
+  // Phase D owns any later RDI policy cutover, not this Phase C change.
+  assign phy_retrain_done = 1'b0;
+
+  // ltsm_state exports the exact public state encoding for observability.
+  // Private Phase C exchange modes do not add public LTSM encodings.
+  // UCIe 1.0 Section 4.5.3 defines the LTSM states.
+  // UCIe 1.0 Section 7.5 defines state logging through PHY registers.
+  // PLAN.md Section 15.9 Phase C keeps public state compatibility.
+  assign ltsm_state = state_q;
+
+  // Width degradation remains unsupported in the fixed x16 profile.
+  // Phase C transition policy does not change negotiated width.
+  // UCIe 1.0 Section 4.5.3.4 defines unsupported degrade outcomes.
+  // PLAN.md Section 15.3 fixes width and treats degrade as fatal.
+  // PLAN.md Section 15.9 Phase C preserves that Phase B result.
+  assign lnk_is_x8 = 1'b0;
+
+  // No half-lane selection exists because x8 degradation is unsupported.
+  // The output remains zero through Active Entry and all recovery states.
+  // UCIe 1.0 Section 4.5.3.4 defines width training outcomes.
+  // PLAN.md Section 15.3 fixes this endpoint at x16.
+  // PLAN.md Section 15.9 Phase C does not alter lane negotiation.
+  assign degrade_lanes = 2'b00;
+
+  // =========================================================================
+  // Lint suppression for retained diagnostic observations
+  // =========================================================================
+  // pat_done remains a public compatibility input, but Phase C does not use it
+  // as a state condition. phase_b_packet_valid and phase_b_early_rsp remain
+  // useful decode observations while the contextual validator drives policy.
   // =========================================================================
   logic unused_match;
-  // -------------------------------------------------------------------------
-  // assign: Lint-suppression tie-off
-  //
-  // This signal combines the deferred Active-entry input with Phase B
-  // classifier results that some tools hide through function calls.
-  // It does not feed LTSM policy or change any state transition.
-  // Phase C will consume adapter_active_req through its required exchange.
-  // Spec refs: UCIe 1.0 Sections 4.5.3.5 and 8.1.6.
-  // -------------------------------------------------------------------------
-  assign unused_match = adapter_active_req | phase_b_packet_valid |
-                        phase_b_rx_fatal | peer_req_identity_match |
-                        tmr_expired | pat_done | sb_tx_busy |
-                        sb_tx_accepted | sb_rx_payload[0];
+
+  // This reduction combines intentionally non-policy observations.
+  // It cannot affect a state transition or a sideband transmission.
+  // UCIe 1.0 Sections 4.5.3.5 and 8.1.6 separate pat_done from Active Entry.
+  // PLAN.md Sections 15.4 and 15.9 require no diagnostic completion gate.
+  // The Phase B terms retain visibility for simple single-pass lint tools.
+  assign unused_match = phase_b_packet_valid | phase_b_early_rsp |
+                        peer_req_identity_match | pat_done |
+                        sb_tx_busy | sb_rx_payload[0];
 
 endmodule
 

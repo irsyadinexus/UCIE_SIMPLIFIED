@@ -138,10 +138,12 @@
 //                        (Flit-Aware Die-to-Die Interface). Width degrade is
 //                        Section 4.3.7, not 4.3.4. The CSR and link control
 //                        references now cite Section 7.5 with Table 65.
-//   v0.0.5  2026-09-23  Documentation: correct the Section 8.3.1 title and
-//                        replace the false Section 4.5.x packet reference with
-//                        the applicable sideband references. Normalize the
-//                        Table 115 citation for lp_linkerror.
+  // v0.0.5  2026-09-23  Documentation: correct the Section 8.3.1 title and
+  //                      replace the false Section 4.5.x packet reference with
+  //                      the applicable sideband references. Normalize the
+  //                      Table 115 citation for lp_linkerror.
+  // v0.0.6  2026-09-25  Phase C: pass the private completed-Active clear to the
+  //                      Adapter Start copy. The public interface is unchanged.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -208,9 +210,9 @@ module d2d_adapter #(
   output logic                  rdi_lp_stallack,
   input  logic [2:0]            rdi_pl_lnk_cfg,
   input  logic [2:0]            rdi_pl_speedmode,
-
   // Adapter-internal
   input  logic                  start_link_train,
+  input  logic                  clear_start_link_train,
   output logic [7:0]            ltsm_state_obs,
   output logic                  link_active_obs
 );
@@ -487,6 +489,7 @@ module d2d_adapter #(
     .csr_rdata(csr_rdata),
     .csr_rdata_vld(csr_rdata_vld),
     .start_link_train_wr(start_link_train_wr),
+    .clear_start_link_train(clear_start_link_train),
     .in_band_pres(rdi_pl_inband_pres),
     .rdi_state_sts(rdi_pl_state_sts),
     .ltsm_state(ltsm_state_obs),

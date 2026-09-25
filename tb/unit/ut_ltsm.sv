@@ -181,6 +181,9 @@
 //                        private ports. Transport complete DATA64 RX
 //                        packets through the CDC. Model a valid DATA64
 //                        PARAM peer request in the responder.
+//   v0.0.9  2026-09-25  Phase C: verify TRAINERROR timeout and LinkError
+//                        hold, LinkReset recovery, RESET dwell, and fresh
+//                        Start-trigger behavior.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -302,8 +305,13 @@ module ut_ltsm;
 //
   ltsm #(.NLANES(NLANES_MAX)) u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
-    .start_link_train(start_link_train),
-    .adapter_active_req(adapter_active_req),
+    .software_start_event(start_link_train),
+    .rdi_active_event(1'b0),
+    .rdi_active_req(adapter_active_req),
+    .rdi_linkreset_req(1'b0),
+    .rdi_disabled_req(1'b0),
+    .active_entry_done(),
+    .clear_start_link_train(),
     .link_trained(link_trained), .train_error(train_error),
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
@@ -492,58 +500,57 @@ module ut_ltsm;
 // MsgInfo is always zero and the message code maps through rsp_for().
   always @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
-      par_tx_load  <= 1'b0;
-      par_tx_opcode<= 5'b0;
-      par_tx_srcid <= 3'b0;
-      par_tx_dstid <= 3'b0;
-      par_tx_msginfo <= 8'b0;
-      par_tx_msgcode <= 8'b0;
+      par_tx_load       <= 1'b0;
+      par_tx_opcode     <= 5'b0;
+      par_tx_srcid      <= 3'b0;
+      par_tx_dstid      <= 3'b0;
+      par_tx_msginfo    <= 8'b0;
+      par_tx_msgcode    <= 8'b0;
       par_tx_msgsubcode <= 8'b0;
-      par_tx_be     <= 8'b0;
-      par_tx_tag    <= 5'b0;
-      par_tx_ep     <= 1'b0;
-      par_tx_addr   <= 12'b0;
-      par_tx_data_in<= 64'b0;
-      par_tx_has_data<= 1'b0;
+      par_tx_be         <= 8'b0;
+      par_tx_tag        <= 5'b0;
+      par_tx_ep         <= 1'b0;
+      par_tx_addr       <= 12'b0;
+      par_tx_data_in    <= 64'b0;
+      par_tx_has_data   <= 1'b0;
     end else begin
-      par_tx_load  <= 1'b0;
-      if (par_enable_resp && par_rx_pkt_vld && !par_tx_busy && !par_tx_load) begin
-        par_tx_load    <= 1'b1;
-        par_tx_srcid   <= SRCID_PHY;
-        par_tx_dstid   <= DSTID_REMOTE_PHY;
-        par_tx_be      <= 8'b0;
-        par_tx_tag     <= 5'b0;
-        par_tx_ep      <= 1'b0;
-        par_tx_addr    <= 12'b0;
-        // MBINIT.PARAM is the only DATA64 exchange of the training walk.
-        // The peer's response carries the immutable PARAM_RSP_DATA payload.
-        // Every other state exchanges a no-data packet with a zero payload.
+      par_tx_load <= 1'b0;
+      if (par_enable_resp && par_rx_pkt_vld && !par_rx_cp_err &&
+          !par_rx_dp_err && (par_rx_msgcode != MC_LM_RDI_RSP) &&
+          !par_tx_busy && !par_tx_load) begin
+        par_tx_load       <= 1'b1;
+        par_tx_srcid      <= SRCID_PHY;
+        par_tx_dstid      <= DSTID_REMOTE_PHY;
+        par_tx_be         <= 8'b0;
+        par_tx_tag        <= 5'b0;
+        par_tx_ep         <= 1'b0;
+        par_tx_addr       <= 12'b0;
         if ((par_rx_msgcode == MC_MBINIT_REQ) &&
             (par_rx_msgsubcode == MS_PARAM_CFG)) begin
-          par_tx_opcode    <= SB_OP_MSG_DATA64;
-          par_tx_msginfo   <= 8'h00;
-          par_tx_msgcode   <= MC_MBINIT_RSP;
+          par_tx_opcode     <= SB_OP_MSG_DATA64;
+          par_tx_msginfo    <= 8'h00;
+          par_tx_msgcode    <= MC_MBINIT_RSP;
           par_tx_msgsubcode <= MS_PARAM_CFG;
-          par_tx_data_in   <= PARAM_RSP_DATA;
-          par_tx_has_data  <= 1'b1;
+          par_tx_data_in    <= PARAM_RSP_DATA;
+          par_tx_has_data   <= 1'b1;
         end else begin
-          par_tx_opcode    <= par_rx_opcode;
-          par_tx_msginfo   <= 8'h00;
-          par_tx_msgcode   <= rsp_for(par_rx_msgcode);
+          par_tx_opcode     <= par_rx_opcode;
+          par_tx_msginfo    <= 8'h00;
+          par_tx_msgcode    <= rsp_for(par_rx_msgcode);
           par_tx_msgsubcode <= par_rx_msgsubcode;
-          par_tx_data_in   <= 64'b0;
-          par_tx_has_data  <= 1'b0;
+          par_tx_data_in    <= 64'b0;
+          par_tx_has_data   <= 1'b0;
         end
       end
     end
   end
 
-  // Map a request code to its paired response.
   function automatic logic [7:0] rsp_for(input logic [7:0] code);
     case (code)
       MC_SB_DONE_REQ:  rsp_for = MC_SB_DONE_RSP;
       MC_MBINIT_REQ:   rsp_for = MC_MBINIT_RSP;
       MC_MBTRAIN_REQ:  rsp_for = MC_MBTRAIN_RSP;
+      MC_LM_RDI_REQ:   rsp_for = MC_LM_RDI_RSP;
       MC_PHYR_REQ:     rsp_for = MC_PHYR_RSP;
       default:         rsp_for = MC_TE_RSP;
     endcase
@@ -904,11 +911,15 @@ module ut_ltsm;
     expect_state(LT_MB_RXDESKEW);
     expect_state(LT_MB_DTCENTER2);
     expect_state(LT_MB_LINKSPEED);
+    wait (ltsm_state == LT_LINKINIT);
+    repeat (2) @(posedge lclk);
     // MBTRAIN.REPAIR is unsupported by the fixed profile and is never
-    // visited. LINKSPEED exits to LINKINIT only after the 15h start and
-    // 19h done transactions, both answered by the responder above.
+    // visited. LINKSPEED enters LINKINIT after its 15h and 19h exchanges.
+    // A remote Active request requires the local LinkMgmt.RDI.Rsp.Active
+    // before the matching local request-response exchange can finish.
+    inject_sbinit_packet(MC_LM_RDI_REQ, MS_LM_ACTIVE,
+                         SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
     expect_state(LT_LINKINIT);
-
     // Reach ACTIVE.
     fork
       begin
@@ -996,9 +1007,10 @@ module ut_ltsm;
       errors = errors + 1;
     end
 
-    // Pipeline Stage 2 (Running Edges 1 .. C_RESIDENCY-1):
-    // The timer is now actively counting. tmr_expired must remain 0.
-    repeat (C_RESIDENCY - 1) begin
+    // Pipeline Stage 2 (Running Edges 1 .. C_RESIDENCY):
+    // The Phase C state-entry pulse reaches the timer after the state update,
+    // so the timer keeps tmr_expired low through these C_RESIDENCY edges.
+    repeat (C_RESIDENCY) begin
       @(posedge lclk);
       #0.1;
       if (tmr_expired !== 1'b0 || ltsm_state !== LT_SBINIT || tmr_run !== 1'b1) begin

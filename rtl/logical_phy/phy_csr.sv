@@ -58,6 +58,11 @@
 //   rising lclk edge. Only TRAIN_CTL and ELEC_PARAM are writable; writes to
 //   other addresses are silently ignored.
 //
+//   A private input, clear_start_link_train, clears the sticky TRAIN_CTL bit
+//   0 value after a successful Active Entry. The clear has priority over a
+//   concurrent csr_wr and over any hardware Start set event
+//   (PLAN.md section 15.9 Phase C).
+//
 // --------------------------------------------------------------------------
 // Read path
 // --------------------------------------------------------------------------
@@ -72,6 +77,9 @@
 //   Read  : csr_rd, csr_addr[26:0] -> csr_rdata[63:0], csr_rdata_vld.
 //   Status: ltsm_state[7:0], lnk_is_x8, degrade_lanes[1:0], train_error.
 //   Output: start_link_train (from TRAIN_CTL bit 0).
+//   Private input: clear_start_link_train. Driven by logical_phy.sv, not a
+//                  public top-level port. Clears the sticky Start copy when
+//                  the LTSM completes Active Entry (PLAN.md 15.9 Phase C).
 //
 // --------------------------------------------------------------------------
 // Implementation notes
@@ -101,6 +109,16 @@
 //                        header and the unused-signal block cited "Section
 //                        8.3 - Register Interface"; 8.3 is "Common rules for
 //                        FDI and RDI". Both now cite Section 7.5.
+//   v0.0.4  2026-09-25  Phase C private clear. Add the private input
+//                        clear_start_link_train. It clears start_train_q, the
+//                        sticky TRAIN_CTL bit 0 Start copy, after a successful
+//                        Active Entry. The clear has priority over a
+//                        concurrent csr_wr and over any hardware Start set
+//                        event for bit 0 only; elec_param_q and all status
+//                        registers keep their existing behaviour. Comments for
+//                        the interface, storage, write path and output now
+//                        cite PLAN.md section 15.9 Phase C and UCIe 1.0
+//                        section 7.5.
 // ============================================================================
 `ifndef PhyCsr_SV
 `define PhyCsr_SV
@@ -122,7 +140,25 @@ module phy_csr (
   input  logic        lnk_is_x8,
   input  logic [1:0]  degrade_lanes,
   input  logic        train_error,
-  output logic        start_link_train
+  output logic        start_link_train,
+
+  // -----------------------------------------------------------------------
+  // Private Active Entry clear input
+  // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5 - UCIe Registers)
+  // -----------------------------------------------------------------------
+  // clear_start_link_train is a private input driven by logical_phy.sv. It
+  // is NOT a public top-level port: the parent module wires it internally.
+  //
+  // The LTSM asserts this input after a successful Active Entry. The clear
+  // retires the local sticky software Start copy, so a Start level that was
+  // already accepted cannot request training a second time
+  // (PLAN.md section 15.9 Phase C, fresh-Start-event requirement).
+  //
+  // While clear_start_link_train is high, start_train_q is forced to 0 and
+  // the TRAIN_CTL decode of bit 0 reads 0. The clear does not touch
+  // elec_param_q or any status register. See the write-path block below.
+  // -----------------------------------------------------------------------
+  input  logic        clear_start_link_train
 );
 
   // =========================================================================
@@ -150,6 +186,12 @@ module phy_csr (
   // start_train_q: Training start bit. Writing 1 to TRAIN_CTL[0] pulses
   //                start_link_train, which causes the LTSM to exit RESET
   //                (spec 4.5.3.1).
+  //                The bit is sticky: it holds its value until reset, a
+  //                later TRAIN_CTL write, or the private Active Entry clear
+  //                input clear_start_link_train. The bit is the single
+  //                software Start copy owned by the logical PHY side of the
+  //                link, and the LTSM clears it once training has reached
+  //                Active (PLAN.md section 15.9 Phase C).
   // =========================================================================
   logic [63:0] elec_param_q;
   logic        start_train_q;
@@ -163,11 +205,36 @@ module phy_csr (
   //
   // Reset initialises elec_param_q to the placeholder defaults and clears
   // start_train_q.
+  //
+  // -------------------------------------------------------------------------
+  // Private Active Entry clear and its priority
+  // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5 - UCIe Registers)
+  // -------------------------------------------------------------------------
+  // clear_start_link_train is tested FIRST in the if/else chain, so the
+  // clear wins over a concurrent software write and over any hardware Start
+  // set event. Start Link Training is therefore deasserted in the same lclk
+  // cycle in which the LTSM reports a successful Active Entry.
+  //
+  // The clear only forces start_train_q to 0. A concurrent sideband write to
+  // ELEC_PARAM still lands, because elec_param_q keeps its own assignment
+  // inside the clear branch. A concurrent write to TRAIN_CTL is dropped for
+  // bit 0 only, which is the intended priority: the LTSM owns Start policy
+  // after Active Entry and a stale Start level must not re-arm training.
+  //
+  // A write to any other address leaves both registers unchanged when the
+  // clear is high.
   // =========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       elec_param_q <= 64'h0000_0C80_0000_0834; // 1.0 V, 2104 ohm placeholder
       start_train_q<= 1'b0;
+    end else if (clear_start_link_train) begin
+      // Private Active Entry clear. Highest priority for start_train_q.
+      start_train_q <= 1'b0;
+      // A sideband write to ELEC_PARAM is still honoured during the clear.
+      if (csr_wr && csr_addr == CSR_ELEC_PARAM) begin
+        elec_param_q <= csr_wdata;
+      end
     end else if (csr_wr) begin
       case (csr_addr)
         CSR_TRAIN_CTL : start_train_q <= csr_wdata[0];
@@ -183,6 +250,15 @@ module phy_csr (
   // Directly reflects TRAIN_CTL bit 0. When asserted, the LTSM exits RESET
   // and begins the link training sequence. This output is OR'd with the
   // top-level start_link_train pin in logical_phy.sv.
+  //
+  // The value is the sticky storage start_train_q, so the output falls on
+  // reset, on a TRAIN_CTL write of 0, or on the private Active Entry clear
+  // clear_start_link_train (PLAN.md section 15.9 Phase C). The clear path
+  // means the LTSM consumes the Start level once, then sees a low level
+  // after Active Entry instead of a held request.
+  //
+  // Because the clear is registered in the write-path always_ff above, the
+  // output drops on the lclk edge that follows the clear assertion.
   // =========================================================================
   assign start_link_train = start_train_q;
 
@@ -192,7 +268,9 @@ module phy_csr (
   // On csr_rd, csr_rdata is loaded with the addressed register's value and
   // csr_rdata_vld is asserted one cycle later. The case statement selects
   // the register content:
-  //   TRAIN_CTL  : Bit 0 = start_train_q, bits [63:1] = 0.
+  //   TRAIN_CTL  : Bit 0 = start_train_q, bits [63:1] = 0. A read issued
+  //                while the private clear is active returns 0 in bit 0,
+  //                because the clear forces the stored bit low.
   //   ELEC_PARAM : Full 64-bit electrical parameter register.
   //   LINK_STS   : Bit 0 = lnk_is_x8, bits [15:8] = ltsm_state, rest = 0.
   //   TRAIN_STS  : Bit 0 = train_error, bits [2:1] = degrade_lanes, rest = 0.

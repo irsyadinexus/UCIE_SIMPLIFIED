@@ -245,6 +245,9 @@
 //   v0.0.14 2026-09-25  Use already latched Phase F evidence in the coverage
 //                        monitor port expressions to avoid simulator implicit
 //                        net warnings in hierarchical named connections.
+//   v0.0.15 2026-09-25  Sample framing-fault evidence from both logical-PHY
+//                        receive paths so the injected Die 1 fault appears
+//                        in coverage.json.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -1043,10 +1046,15 @@ module tb_loopback_top;
         dut_b.u_lphy.tx_user_transfer || dut_b.u_lphy.rx_user_transfer)
       cov_scrambling_seen = 1'b1;
 
-    // Phase F: Mainband framing boundary fault (spec 4.1.2; PLAN.md 15.6)
+    // Phase F: Mainband framing boundary fault on either receive path
+    // (spec 4.1.2; PLAN.md 15.6). The injected fault crosses into Die 1,
+    // so both logical-PHY RX gearbox paths must feed the coverage latch.
     if (dut_a.u_lphy.ltsm_framing_fault_event ||
         dut_a.u_lphy.rx_framing_fault_sync_q  ||
-        dut_a.u_lphy.u_rx_gearbox.framing_fault)
+        dut_a.u_lphy.u_rx_gearbox.framing_fault ||
+        dut_b.u_lphy.ltsm_framing_fault_event ||
+        dut_b.u_lphy.rx_framing_fault_sync_q  ||
+        dut_b.u_lphy.u_rx_gearbox.framing_fault)
       cov_framing_fault_seen = 1'b1;
   end
 

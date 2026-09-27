@@ -112,20 +112,16 @@
 //
 // DESIGN NOTES
 //   - The stall handshake (spec 8.3.1 four-phase) is implemented inline in
-//     this wrapper rather than in a sub-block, because it cross-cuts both
-//     the datapath and the state machine (stall_active gates lp_valid/irdy
-//     in u_datapath, and stallreq_q drives pl_stallreq to the Protocol
-//     Layer while simultaneously acknowledging back to the PHY).
+//     this wrapper rather than in a sub-block. The registered phase tracker
+//     drives the Protocol Layer request, PHY acknowledgement, and datapath
+//     gate in order.
 //   - lp_linkerror is tied to 1'b0 in this reduced scope. The adapter does
 //     not autonomously generate LinkError; it only forwards the PHY's
 //     rdi_pl_error indication through the FDI state machine.
-//   - partner_active_req on u_sb_if is tied to 1'b0 because this simplified
-//     design does not decode inbound LinkMgmt.RDI.Req packets at the top
-//     level; the sideband module itself latches them from the received
-//     packet stream.
+//   - The Adapter Start CSR copy is exported as an internal level to
+//     logical_phy, where edge detection creates the private LTSM event.
 //   - The unused_inputs assignment silences lint warnings for signals that
-//     are architecturally present on the RDI/FDI but not consumed in this
-//     reduced implementation.
+//     are architecturally present on the RDI/FDI but not consumed here.
 //
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
@@ -144,6 +140,13 @@
   //                      Table 115 citation for lp_linkerror.
   // v0.0.6  2026-09-25  Phase C: pass the private completed-Active clear to the
   //                      Adapter Start copy. The public interface is unchanged.
+//   v0.0.7  2026-09-25  Phase D: route the Adapter Start copy as a private
+//                        training event, remove peer-Active transport policy,
+//                        and retain a registered four-phase stall path.
+//   v0.0.8  2026-09-25  Preserve the public FDI adapter_active_req port as a
+//                        low tie-off while keeping peer-Active policy removed.
+//   v0.0.9  2026-09-25  Clarify that the registered stall data gate remains
+//                        closed through the RELEASED phase.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -213,6 +216,7 @@ module d2d_adapter #(
   // Adapter-internal
   input  logic                  start_link_train,
   input  logic                  clear_start_link_train,
+  output logic                  adapter_start_link_train,
   output logic [7:0]            ltsm_state_obs,
   output logic                  link_active_obs
 );
@@ -222,19 +226,14 @@ module d2d_adapter #(
   // --------------------------------------------------------------------------
   // Internal interconnect signals
   // --------------------------------------------------------------------------
-  // adapter_active_req : asserted by u_sb_if when the partner Adapter's
-  //                      sideband has sent a LinkMgmt.RDI.Req.Active message,
-  //                      indicating the remote die wants to enter Active.
-  // adapter_state_req_vld / adapter_state_req : general state-request channel
-  //                      from u_sb_if to u_fdi_sm (unused in reduced scope).
-  // fdi_active_req     : u_fdi_sm indicates the local Protocol Layer has
-  //                      requested Active (lp_state_req == FDI_REQ_ACTIVE).
-  // fdi_state_req_out  : the state request that u_fdi_sm forwards to the RDI
-  //                      lp_state_req port, after gating Active on the four-way
-  //                      handshake.
+  // adapter_state_req_vld / adapter_state_req : generic request transport
+  //                      from u_sb_if to u_fdi_sm.
+  // fdi_active_req     : u_fdi_sm reports a local Protocol Layer Active
+  //                      request for observability only.
+  // fdi_state_req_out  : supported request forwarded to the RDI.
   // fdi_state_req_vld  : qualifies fdi_state_req_out.
-  // stall_active       : high while the four-phase stall handshake is in the
-  //                      stalled phase (both pl_stallreq and lp_stallack high).
+  // stall_active       : high in ACKED or RELEASED after the registered
+  //                      four-phase handshake reaches the data-quiescent phase.
   // lnk_is_x8          : decoded from rdi_pl_lnk_cfg, true when the link has
   //                      degraded to x8 (spec 4.3.7 width degrade).
   // csr_*              : CSR access bus between u_sb_if and u_regfile.
@@ -242,7 +241,6 @@ module d2d_adapter #(
   // sb_stall_sent      : u_sb_if signals that a stall keep-alive was sent.
   // sb_msg_timeout     : u_sb_if signals the 8 ms message timeout expired.
   // --------------------------------------------------------------------------
-  logic        adapter_active_req;
   logic        adapter_state_req_vld;
   logic [3:0]  adapter_state_req;
   logic        fdi_active_req;
@@ -256,77 +254,101 @@ module d2d_adapter #(
   logic        csr_rdata_vld;
   logic        sb_credit_returned, sb_stall_sent, sb_msg_timeout;
   logic        start_link_train_wr;
+  logic        start_link_train_q;
   logic        link_status_active;
 
   // --------------------------------------------------------------------------
   // Stall Handshake Logic (spec 8.3.1 four-phase)
   // --------------------------------------------------------------------------
-  // The PHY asserts rdi_pl_stallreq when it needs the data path quiesced
-  // (e.g. during clock-phase recalibration). The Protocol Layer responds
-  // with lp_stallack after draining its pipeline. This register captures
-  // the qualified stallreq so that:
-  //   - pl_stallreq to the Protocol Layer rises only while lp_stallack is low
-  //     (spec 8.3.1 rule: assertion only when ack is deasserted).
-  //   - rdi_lp_stallack feeds back to the PHY, acknowledging the stall.
-  //   - stall_active = stallreq_q && lp_stallack gates both lp_valid and
-  //     lp_irdy inside u_datapath, preventing data movement during stall.
+  // The registered tracker relays the PHY request to the Protocol Layer and
+  // returns the Protocol Layer acknowledgement to the PHY:
+  //   IDLE -> REQUESTED -> ACKED -> RELEASED -> IDLE.
+  // The data gate closes in ACKED and RELEASED, after both sides complete
+  // the request and acknowledgement phases. This keeps data quiescent.
   //
   // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism.
   // --------------------------------------------------------------------------
-  logic stallreq_q;
+  typedef enum logic [1:0] {
+    STALL_IDLE      = 2'd0,
+    STALL_REQUESTED = 2'd1,
+    STALL_ACKED     = 2'd2,
+    STALL_RELEASED  = 2'd3
+  } stall_phase_t;
+  stall_phase_t stall_phase_q, stall_phase_d;
 
   // -------------------------------------------------------------------------
-  // always_ff: Stall Request Register
+  // always_ff: Registered four-phase stall tracker
   //
-  // Captures rdi_pl_stallreq gated with !lp_stallack on every rising edge
-  // of lclk. The gate ensures that pl_stallreq (driven from stallreq_q)
-  // cannot re-assert while the Protocol Layer's acknowledge is still high,
-  // satisfying the four-phase handshake requirement of spec 8.3.1.
+  // Advances one handshake phase per lclk edge. Reset closes both request and
+  // acknowledgement so a reset cannot leave the data path stalled.
   //
   // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) stallreq_q <= 1'b0;
-    else           stallreq_q <= rdi_pl_stallreq && !lp_stallack;
+    if (!lreset_n) stall_phase_q <= STALL_IDLE;
+    else           stall_phase_q <= stall_phase_d;
+  end
+
+  // -------------------------------------------------------------------------
+  // always_comb: Stall phase next-state logic
+  //
+  // Phase one starts only while lp_stallack is low. Phase two waits for the
+  // Protocol Layer acknowledgement. Phase three waits for the PHY request to
+  // fall. Phase four waits for lp_stallack to fall before returning idle.
+  //
+  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism.
+  // -------------------------------------------------------------------------
+  always_comb begin
+    stall_phase_d = stall_phase_q;
+    case (stall_phase_q)
+      STALL_IDLE: begin
+        if (rdi_pl_stallreq && !lp_stallack)
+          stall_phase_d = STALL_REQUESTED;
+      end
+      STALL_REQUESTED: begin
+        if (!rdi_pl_stallreq)
+          stall_phase_d = STALL_IDLE;
+        else if (lp_stallack)
+          stall_phase_d = STALL_ACKED;
+      end
+      STALL_ACKED: begin
+        if (!rdi_pl_stallreq)
+          stall_phase_d = STALL_RELEASED;
+      end
+      STALL_RELEASED: begin
+        if (!lp_stallack)
+          stall_phase_d = STALL_IDLE;
+      end
+      default: stall_phase_d = STALL_IDLE;
+    endcase
   end
 
   // -------------------------------------------------------------------------
   // always_comb: Stall and Link-Width Decode Outputs
   //
-  // Drives four combinational outputs from the stall register and the RDI
-  // link configuration:
-  //   pl_stallreq     - forwarded stall request to the Protocol Layer.
-  //   rdi_lp_stallack - stall acknowledge back to the Logical PHY.
-  //   stall_active    - internal gate: high when both stallreq and ack are
-  //                     asserted, meaning data movement is frozen.
-  //   lnk_is_x8       - true when rdi_pl_lnk_cfg indicates x8 width, used
-  //                     by u_datapath to zero the upper byte lanes.
+  // Drives the registered request, registered PHY acknowledgement, active
+  // data gate, and fixed link-width decode. The request is high only in
+  // REQUESTED. ACKED and RELEASED assert the acknowledgement and close data.
   //
-  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism (stall),
-  //           Section 4.3.7 - Width Degrade in Standard Package Interfaces.
+  // Spec ref: UCIe 1.0, Section 8.3.1; Section 4.3.7.
   // -------------------------------------------------------------------------
   always_comb begin
-    pl_stallreq   = stallreq_q;
-    rdi_lp_stallack = stallreq_q;
-    stall_active  = stallreq_q && lp_stallack;
-    lnk_is_x8     = (rdi_pl_lnk_cfg == LNKCFG_X8);
+    pl_stallreq    = (stall_phase_q == STALL_REQUESTED);
+    rdi_lp_stallack = (stall_phase_q == STALL_ACKED) ||
+                      (stall_phase_q == STALL_RELEASED);
+    stall_active   = (stall_phase_q == STALL_ACKED) ||
+                     (stall_phase_q == STALL_RELEASED);
+    lnk_is_x8      = (rdi_pl_lnk_cfg == LNKCFG_X8);
   end
 
   // -------------------------------------------------------------------------
   // always_comb: FDI -> RDI State Request Forwarding
   //
-  // The FDI state machine (u_fdi_sm) generates fdi_state_req_out, which is
-  // the Protocol Layer's state request after the four-way Active handshake
-  // gating has been applied. This combinational assignment forwards it to
-  // the RDI lp_state_req port that the Logical PHY consumes.
+  // The FDI state machine emits only supported Active, LinkReset, and
+  // Disabled requests. It suppresses L1, L2, and Retrain without changing the
+  // LTSM. Active completion depends on the PHY-owned LTSM result.
   //
-  // The Active request is the one exception: it is only forwarded when both
-  // the local Protocol Layer (lp_state_req == FDI_REQ_ACTIVE plus
-  // lp_rx_active_sts) and the remote Adapter (adapter_active_req from
-  // u_sb_if) have both requested Active. All other requests (LinkReset,
-  // Retrain, L1, L2, Disabled) pass through directly.
-  //
-  // Spec ref: UCIe 1.0, Section 8.1.6 step 6 (Active gating), Section 8.2.
+  // Spec ref: UCIe 1.0 Sections 8.1.5, 8.1.6, and 8.2; PLAN.md Section 15.5.
   // -------------------------------------------------------------------------
   always_comb begin
     rdi_lp_state_req = fdi_state_req_out;
@@ -335,21 +357,11 @@ module d2d_adapter #(
   // -------------------------------------------------------------------------
   // Module Instantiation: fdi_state_machine (u_fdi_sm)
   //
-  // The FDI Link Sub-state Machine per spec 8.2. This block:
-  //   - Tracks the FDI state (F_RESET, F_ACTIVE, F_PMNAK, F_L1, F_L2,
-  //     F_LINKRESET, F_LINKERROR, F_RETRAIN, F_DISABLED) mirroring the
-  //     RDI state transitions reported by rdi_pl_state_sts.
-  //   - Implements the four-way Active handshake: Active is only reported
-  //     on pl_state_sts when both the local Protocol Layer has requested it
-  //     (lp_state_req == FDI_REQ_ACTIVE && lp_rx_active_sts) AND the RDI
-  //     has reached Active (rdi_state_sts == RDI_STS_ACTIVE).
-  //   - Drives all FDI status/indication outputs: pl_state_sts, pl_error,
-  //     pl_cerror, pl_nferror, pl_trainerror, pl_phyinrecenter,
-  //     pl_inband_pres, pl_rx_active_req, pl_protocol, pl_protocol_flitfmt.
-  //   - Forwards the Protocol Layer's state request to the RDI after gating
-  //     Active on the four-way handshake (fdi_state_req_out).
+  // The FDI state machine mirrors only supported RDI states and forwards
+  // Active, LinkReset, and Disabled requests. Legacy adapter request inputs
+  // remain structurally present but do not own Active policy.
   //
-  // Spec ref: UCIe 1.0, Section 8.2 (FDI), Table 115 (FDI signals).
+  // Spec ref: UCIe 1.0 Section 8.2, Table 115; PLAN.md Section 15.5.
   // -------------------------------------------------------------------------
   fdi_state_machine u_fdi_sm (
     .lclk(lclk),
@@ -374,7 +386,7 @@ module d2d_adapter #(
     .rdi_phyinrecenter(rdi_pl_phyinrecenter),
     .rdi_cerror(rdi_pl_cerror),
     .rdi_nferror(rdi_pl_nferror),
-    .adapter_active_req(adapter_active_req),
+    .adapter_active_req(1'b0),
     .adapter_state_req_vld(adapter_state_req_vld),
     .adapter_state_req(adapter_state_req),
     .fdi_active_req(fdi_active_req),
@@ -424,17 +436,11 @@ module d2d_adapter #(
   // -------------------------------------------------------------------------
   // Module Instantiation: adapter_sb_if (u_sb_if)
   //
-  // Adapter-side sideband interface per spec 6.1:
-  //   - FDI credit loop: lp_cfg/pl_cfg credit handshakes with Protocol Layer.
-  //   - Remote credit loop: up to SB_CRD_MAX (4) remote credits.
-  //   - Reduced-model monitor hooks: 8 ms message timeout & 4 ms stall hook.
-  //   - Link management: LinkMgmt.RDI.Req.Active sets adapter_active_req.
-  //   - CSR access: packets for SRCID_ADAPT routed to u_regfile.
+  // Adapter-side sideband transport per spec 6.1. It owns CSR decode,
+  // generic request transport, credit accounting, and monitor timers.
+  // LinkMgmt.RDI Active policy remains in the Logical PHY LTSM.
   //
-  // partner_active_req is tied to 1'b0 (u_sb_if latches Active from stream).
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission; Section 6.1
-  //           - Protocol specification; Sections 6.1.1-6.1.3; Table 47.
+  // Spec ref: UCIe 1.0 Sections 4.1.5 and 6.1; PLAN.md Section 15.5.
   // -------------------------------------------------------------------------
   adapter_sb_if u_sb_if (
     .lclk(lclk),
@@ -445,8 +451,6 @@ module d2d_adapter #(
     .pl_cfg(pl_cfg),
     .pl_cfg_vld(pl_cfg_vld),
     .pl_cfg_crd(pl_cfg_crd),
-    .partner_active_req(1'b0),
-    .adapter_active_req(adapter_active_req),
     .adapter_state_req_vld(adapter_state_req_vld),
     .adapter_state_req(adapter_state_req),
     .csr_wr(csr_wr),
@@ -495,7 +499,7 @@ module d2d_adapter #(
     .ltsm_state(ltsm_state_obs),
     .trainerror(rdi_pl_trainerror),
     .phyinrecenter(rdi_pl_phyinrecenter),
-    .start_link_train(),
+    .start_link_train(adapter_start_link_train),
     .link_status_active(link_status_active)
   );
 
@@ -519,19 +523,23 @@ module d2d_adapter #(
   end
 
   // -------------------------------------------------------------------------
-  // always_ff: Start-Link-Train Write-Enable Latch
+  // always_ff: Adapter Start event latch
   //
-  // Captures the externally-driven start_link_train pulse (from a testbench
-  // or top-level controller) and converts it into a sticky write-enable
-  // (start_link_train_wr) that sets bit 0 of the UCIe Link Control register
-  // inside u_regfile. Once set, it remains high until reset.
+  // Converts the external Start level into one registered write event for the
+  // Adapter Link Control copy. The previous level blocks a held Start from
+  // re-arming the copy after the Phase C Active-entry clear.
   //
-  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (Table 65 - UCIe Link
-  //           DVSEC - UCIe Link Control, bit 0).
+  // Spec ref: UCIe 1.0, Section 7.5, Table 65; PLAN.md Sections 15.5 and
+  //           15.9 Phase D Start cutover.
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n)            start_link_train_wr <= 1'b0;
-    else if (start_link_train) start_link_train_wr <= 1'b1;
+    if (!lreset_n) begin
+      start_link_train_q  <= 1'b0;
+      start_link_train_wr <= 1'b0;
+    end else begin
+      start_link_train_q  <= start_link_train;
+      start_link_train_wr <= start_link_train && !start_link_train_q;
+    end
   end
 
   // -------------------------------------------------------------------------

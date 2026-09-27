@@ -129,8 +129,8 @@
 // REVISION HISTORY
 // ----------------
 //   v0.0.1  2025-XX-XX  Initial creation.
-//   v0.0.2  2026-09-23  Documentation: expand header, add per-block comments.
-//
+//   v0.0.3  2026-09-25  Phase D: add integrated Adapter four-phase request,
+//                        acknowledgement, release, and data-gate checks.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -151,6 +151,36 @@ module ut_stall;
   logic [NBYTES*8-1:0] rdi_pl_data;
   logic        rdi_lnk_is_x8;
   logic        stall_active;
+  // Integrated Adapter stall path signals.
+  logic        ad_lp_irdy, ad_lp_valid, ad_lp_stallack, ad_lp_rx_active_sts;
+  logic [NBYTES*8-1:0] ad_lp_data;
+  logic [7:0]  ad_lp_stream;
+  logic        ad_pl_trdy, ad_pl_valid, ad_pl_stallreq;
+  logic [NBYTES*8-1:0] ad_pl_data;
+  logic [7:0]  ad_pl_stream;
+  logic [3:0]  ad_pl_state_sts;
+  logic        ad_pl_inband_pres, ad_pl_error, ad_pl_cerror;
+  logic        ad_pl_nferror, ad_pl_trainerror, ad_pl_phyinrecenter;
+  logic        ad_pl_rx_active_req;
+  logic [2:0]  ad_pl_protocol;
+  logic [3:0]  ad_pl_protocol_flitfmt;
+  logic [NC-1:0] ad_lp_cfg, ad_pl_cfg;
+  logic        ad_lp_cfg_vld, ad_lp_cfg_crd, ad_pl_cfg_vld, ad_pl_cfg_crd;
+  logic        ad_lp_linkerror;
+  logic        ad_rdi_lp_irdy, ad_rdi_lp_valid, ad_rdi_lp_stallack;
+  logic [NBYTES*8-1:0] ad_rdi_lp_data;
+  logic [3:0]  ad_rdi_lp_state_req;
+  logic        ad_rdi_pl_valid, ad_rdi_pl_error, ad_rdi_pl_cerror;
+  logic        ad_rdi_pl_nferror, ad_rdi_pl_trainerror;
+  logic        ad_rdi_pl_phyinrecenter, ad_rdi_pl_stallreq;
+  logic [NBYTES*8-1:0] ad_rdi_pl_data;
+  logic [3:0]  ad_rdi_pl_state_sts;
+  logic        ad_rdi_pl_inband_pres, ad_rdi_pl_trdy;
+  logic [2:0]  ad_rdi_pl_lnk_cfg, ad_rdi_pl_speedmode;
+  logic        ad_start_link_train, ad_clear_start_link_train;
+  logic        ad_adapter_start_link_train;
+  logic [7:0]  ad_ltsm_state_obs;
+  logic        ad_link_active_obs;
   int          errors;
   integer fd;
 
@@ -181,6 +211,54 @@ module ut_stall;
     .stall_active(stall_active)
   );
 
+  // ---------------------------------------------------------------------------
+  // DUT Instantiation — integrated d2d_adapter stall path
+  //
+  // This instance proves the registered four-phase bridge between the PHY
+  // request, Protocol Layer request/acknowledge, PHY acknowledgement, and
+  // adapter_datapath stall gate. The direct datapath instance above retains
+  // the existing data-preservation and x8 masking checks.
+  //
+  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism.
+  // ---------------------------------------------------------------------------
+  d2d_adapter #(.NBYTES(NBYTES)) u_adapter (
+    .lclk(lclk), .lreset_n(lreset_n),
+    .lp_irdy(ad_lp_irdy), .lp_valid(ad_lp_valid), .lp_data(ad_lp_data),
+    .pl_trdy(ad_pl_trdy), .pl_valid(ad_pl_valid), .pl_data(ad_pl_data),
+    .lp_state_req(4'h0), .pl_state_sts(ad_pl_state_sts),
+    .pl_inband_pres(ad_pl_inband_pres), .pl_error(ad_pl_error),
+    .pl_cerror(ad_pl_cerror), .pl_nferror(ad_pl_nferror),
+    .pl_trainerror(ad_pl_trainerror),
+    .pl_phyinrecenter(ad_pl_phyinrecenter),
+    .pl_stallreq(ad_pl_stallreq), .lp_stallack(ad_lp_stallack),
+    .pl_rx_active_req(ad_pl_rx_active_req),
+    .lp_rx_active_sts(ad_lp_rx_active_sts),
+    .lp_stream(ad_lp_stream), .pl_stream(ad_pl_stream),
+    .pl_protocol(ad_pl_protocol), .pl_protocol_flitfmt(ad_pl_protocol_flitfmt),
+    .lp_cfg(ad_lp_cfg), .lp_cfg_vld(ad_lp_cfg_vld), .lp_cfg_crd(ad_lp_cfg_crd),
+    .pl_cfg(ad_pl_cfg), .pl_cfg_vld(ad_pl_cfg_vld), .pl_cfg_crd(ad_pl_cfg_crd),
+    .lp_linkerror(ad_lp_linkerror),
+    .rdi_lp_irdy(ad_rdi_lp_irdy), .rdi_lp_valid(ad_rdi_lp_valid),
+    .rdi_lp_data(ad_rdi_lp_data), .rdi_pl_trdy(ad_rdi_pl_trdy),
+    .rdi_pl_valid(ad_rdi_pl_valid), .rdi_pl_data(ad_rdi_pl_data),
+    .rdi_lp_state_req(ad_rdi_lp_state_req),
+    .rdi_pl_state_sts(ad_rdi_pl_state_sts),
+    .rdi_pl_inband_pres(ad_rdi_pl_inband_pres),
+    .rdi_pl_error(ad_rdi_pl_error), .rdi_pl_cerror(ad_rdi_pl_cerror),
+    .rdi_pl_nferror(ad_rdi_pl_nferror),
+    .rdi_pl_trainerror(ad_rdi_pl_trainerror),
+    .rdi_pl_phyinrecenter(ad_rdi_pl_phyinrecenter),
+    .rdi_pl_stallreq(ad_rdi_pl_stallreq),
+    .rdi_lp_stallack(ad_rdi_lp_stallack),
+    .rdi_pl_lnk_cfg(ad_rdi_pl_lnk_cfg),
+    .rdi_pl_speedmode(ad_rdi_pl_speedmode),
+    .start_link_train(ad_start_link_train),
+    .clear_start_link_train(ad_clear_start_link_train),
+    .adapter_start_link_train(ad_adapter_start_link_train),
+    .ltsm_state_obs(ad_ltsm_state_obs),
+    .link_active_obs(ad_link_active_obs)
+  );
+
   initial lclk = 1'b0;
 // ---------------------------------------------------------------------------
 // Clock Generator
@@ -207,9 +285,66 @@ module ut_stall;
     rdi_pl_data  = '0;
     rdi_lnk_is_x8 = 1'b0;
     stall_active = 1'b0;
-
+    ad_lp_irdy = 1'b0;
+    ad_lp_valid = 1'b0;
+    ad_lp_data = '0;
+    ad_lp_stream = 8'h00;
+    ad_lp_stallack = 1'b0;
+    ad_lp_rx_active_sts = 1'b0;
+    ad_lp_cfg = '0;
+    ad_lp_cfg_vld = 1'b0;
+    ad_lp_cfg_crd = 1'b0;
+    ad_rdi_pl_trdy = 1'b0;
+    ad_rdi_pl_valid = 1'b0;
+    ad_rdi_pl_data = '0;
+    ad_rdi_pl_state_sts = RDI_STS_RESET;
+    ad_rdi_pl_inband_pres = 1'b0;
+    ad_rdi_pl_error = 1'b0;
+    ad_rdi_pl_cerror = 1'b0;
+    ad_rdi_pl_nferror = 1'b0;
+    ad_rdi_pl_trainerror = 1'b0;
+    ad_rdi_pl_phyinrecenter = 1'b0;
+    ad_rdi_pl_stallreq = 1'b0;
+    ad_rdi_pl_lnk_cfg = LNKCFG_X16;
+    ad_rdi_pl_speedmode = SPEED_4GT;
+    ad_start_link_train = 1'b0;
+    ad_clear_start_link_train = 1'b0;
     #5 lreset_n = 1'b1;
     @(negedge lclk);
+
+    // Integrated four-phase proof: request, acknowledge, request release,
+    // then acknowledgement release. The Adapter must gate both directions
+    // while lp_stallack remains high.
+    ad_lp_irdy = 1'b1;
+    ad_lp_valid = 1'b1;
+    ad_rdi_pl_trdy = 1'b1;
+    ad_rdi_pl_valid = 1'b1;
+    ad_rdi_pl_stallreq = 1'b1;
+    @(posedge lclk); #0.1;
+    if (!ad_pl_stallreq || ad_rdi_lp_stallack) begin
+      $display("FAIL ut_stall: request phase ordering");
+      errors = errors + 1;
+    end
+    ad_lp_stallack = 1'b1;
+    @(posedge lclk); #0.1;
+    if (ad_pl_stallreq || !ad_rdi_lp_stallack ||
+        ad_rdi_lp_irdy || ad_rdi_lp_valid || ad_pl_trdy) begin
+      $display("FAIL ut_stall: acknowledge phase ordering or data gate");
+      errors = errors + 1;
+    end
+    ad_rdi_pl_stallreq = 1'b0;
+    @(posedge lclk); #0.1;
+    if (ad_pl_stallreq || !ad_rdi_lp_stallack ||
+        ad_rdi_lp_irdy || ad_rdi_lp_valid || ad_pl_trdy) begin
+      $display("FAIL ut_stall: request release phase ordering or data gate");
+      errors = errors + 1;
+    end
+    ad_lp_stallack = 1'b0;
+    @(posedge lclk); #0.1;
+    if (ad_pl_stallreq || ad_rdi_lp_stallack) begin
+      $display("FAIL ut_stall: acknowledge release phase ordering");
+      errors = errors + 1;
+    end
 
     // ---- pass-through: one byte per UI, data preserved
     for (int i = 0; i < 4; i = i + 1) begin

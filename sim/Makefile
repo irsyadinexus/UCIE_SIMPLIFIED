@@ -27,11 +27,13 @@
 #                   back from a log file rather than trusted from the exit
 #                   code, because Icarus returns 0 for some diagnostics.
 #
-#     2. unit     - Eight directed testbenches in tb/unit/, one per FSM and
-#                   datapath block. Each drives its DUT directly and prints
-#                   the literal line "TEST PASSED <name>". The recipe checks
-#                   for that exact string, so a test that merely compiles but
-#                   never asserts success still fails the gate.
+#     2. unit     - Directed testbenches in tb/unit/, one per FSM, datapath
+#                   block, and protocol function. Each drives its DUT directly
+#                   and prints the literal line "TEST PASSED <name>". The recipe
+#                   checks for that exact string, so a test that merely compiles
+#                   but never asserts success still fails the gate. On success,
+#                   relevant unit tests write Phase F event evidence JSON
+#                   fragments into logs/ (*_evidence.json) for coverage merging.
 #
 #     3. loopback - Two real ucie_main instances with the sideband and main
 #                   band crossed die-to-die. This is the only test that
@@ -39,49 +41,74 @@
 #                   LTSM bring-up, and Raw Mode streaming in both directions.
 #
 #   Coverage is computed by sim/cov_report.py from a JSON file that the
-#   loopback monitor writes, combined with per-test evidence fragments. See
-#   the coverage target below for why two sources are required.
+#   loopback monitor writes (sim/logs/coverage.json), combined with Phase F
+#   event evidence fragments (*_evidence.json) written by unit tests. The
+#   two-source model is required because nominal loopback is x16-only and
+#   stallreq is tied low; paths such as the 4-phase stall handshake, x8 width
+#   degrade, and lane reversal are observable only via unit test evidence.
+#   Phase F event coverage captures PARAM roles, transaction classes,
+#   arbitration, fatal causes, TRAINERROR, LinkReset, Disabled, PMNAK, Active
+#   Entry, pre-Active block, scrambling, and framing faults.
+#
+#   The final integration gate (make -C sim clean && make -C sim all) serves
+#   as the comprehensive exit proof. It requires zero compile warnings, all
+#   unit test PASS markers, link activation on both dies, bidirectional Raw
+#   Mode data transfer, and 100% Phase F coverage without holes.
 #
 # FLOW DIAGRAM
 #
-#                        make -C sim all
-#                              |
-#                              v
-#                   +----------------------+
-#                   |  compile (gate)      |
-#                   |  iverilog -g2012     |
-#                   |  -Wall, zero warn    |
-#                   +----------+-----------+
-#                              |
-#              +---------------+---------------+
-#              |                               |
-#              v                               v
-#     +------------------+           +--------------------+
-#     |  unit            |           |  loopback          |
-#     |  tb/unit/*.sv    |           |  tb/loopback/      |
-#     |  8 directed DUT  |           |  2x ucie_main      |
-#     |  testbenches     |           |  crossed die-to-die|
-#     +--------+---------+           +---------+----------+
-#              |                               |
-#              |  TEST PASSED <name>           |  LINK ACTIVE (die 0/1)
-#              |  *_evidence.json              |  RAW MODE TRANSFER OK
-#              |                               |  coverage.json
-#              +---------------+---------------+
-#                              |
-#                              v
-#                   +----------------------+
-#                   |  cov_report.py       |
-#                   |  merges both sources |
-#                   |  prints COVERAGE:    |
-#                   +----------------------+
+#                        make -C sim all (Final Integration Gate)
+#                                      |
+#                                      v
+#                            +----------------------+
+#                            |  compile (gate)      |
+#                            |  iverilog -g2012     |
+#                            |  -Wall, zero warn    |
+#                            +----------+-----------+
+#                                       |
+#                       +---------------+---------------+
+#                       |                               |
+#                       v                               v
+#              +------------------+           +--------------------+
+#              |  unit            |           |  loopback          |
+#              |  tb/unit/*.sv    |           |  tb/loopback/      |
+#              |  directed DUT    |           |  2x ucie_main      |
+#              |  testbenches     |           |  crossed die-to-die|
+#              +--------+---------+           +---------+----------+
+#                       |                               |
+#                       |  TEST PASSED <name>           |  LINK ACTIVE (die 0/1)
+#                       |  Phase F evidence fragments   |  RAW MODE TRANSFER OK
+#                       |  (*_evidence.json)            |  coverage.json (Phase F)
+#                       |                               |
+#                       +---------------+---------------+
+#                                       |
+#                                       v
+#                            +----------------------+
+#                            |  cov_report.py       |
+#                            |  merges both sources |
+#                            |  Phase F coverage    |
+#                            |  prints COVERAGE:    |
+#                            +----------------------+
+#                                       |
+#                                       v
+#                            +----------------------+
+#                            |  Final Integration   |
+#                            |  Gate: 100% PASS     |
+#                            +----------------------+
 #
 # TARGETS
-#   all       - compile + unit + loopback + coverage. The full gate.
+#   all       - Final integration gate: compile + unit + loopback + coverage.
+#               Verifies zero warnings, all unit PASS strings, active link on
+#               both dies, bidirectional Raw Mode streaming, and 100% coverage.
 #   compile   - Elaborate all RTL with -Wall. Fails on any warning.
-#   unit      - Build and run every tb/unit/*.sv testbench.
-#   loopback  - Build and run the two-die bring-up plus streaming test.
-#   coverage  - Run unit and loopback, then report merged coverage.
-#   clean     - Remove out/ and logs/.
+#   unit      - Build and run every tb/unit/*.sv testbench; clears stale
+#               evidence and produces Phase F unit evidence fragments.
+#   loopback  - Build and run the two-die bring-up plus streaming test;
+#               records LTSM/RDI states and Phase F event coverage.
+#   coverage  - Run unit and loopback, then report merged Phase F coverage
+#               via cov_report.py (requires 100% reachable states and events).
+#   clean     - Remove out/ and logs/. Purges compiled simulation binaries,
+#               run logs, and all Phase F evidence fragments for a pristine gate run.
 #
 # DIRECTORY LAYOUT
 #   ROOT   = ..                        repository root
@@ -111,7 +138,10 @@
 #     set a non-zero status. Warnings therefore cannot slip past the gate.
 #   - The unit target deletes stale *_evidence.json fragments before running,
 #     so a fragment can only exist because that test passed in THIS run. This
-#     is what stops a previous green run from faking coverage.
+#     is what stops a previous green run from faking coverage. Passing unit
+#     tests generate fresh Phase F event evidence fragments (such as
+#     stall_evidence.json and mapper_evidence.json) to prove paths that are
+#     inaccessible during nominal loopback.
 #   - Each unit test is verified by grepping for the literal string
 #     "TEST PASSED <name>" in the combined log. A test whose assertions were
 #     skipped still fails the gate because the line never appears.
@@ -119,11 +149,24 @@
 #     final "TEST PASSED". Checking the intermediate strings localises a
 #     failure: "no die0->die1 transfer" tells you bring-up worked but the
 #     forward datapath did not.
-#   - Coverage depends on BOTH unit and loopback. The loopback is x16-only and
-#     its PHY never asserts rdi_pl_stallreq, so the stall four-phase
-#     (spec 8.3.1), the x8 width-degrade halves and the byte reversal
-#     (spec 4.1.1) are observable only in the directed unit tests. The report
-#     needs both sources to reach 100%.
+#   - Coverage depends on BOTH unit and loopback (the Phase F two-source model).
+#     The loopback exercises end-to-end LTSM bring-up, RDI states, sideband
+#     packet/MsgCode traffic, and integrated Phase F functional events (PARAM
+#     roles, transaction classes, arbitration, fatal causes, TRAINERROR,
+#     LinkReset, Disabled, PMNAK, Active Entry, pre-Active block, scrambling,
+#     and framing fault). However, because loopback is x16-only and its PHY
+#     never asserts rdi_pl_stallreq, the stall four-phase handshake (spec 8.3.1),
+#     the x8 width-degrade halves (spec 4.3.7), and the byte reversal detection
+#     path (spec 4.1.1) are observable only in directed unit tests.
+#     cov_report.py merges loopback coverage.json and unit evidence fragments,
+#     enforcing that 100% of reachable states and all Phase F event counters
+#     are non-zero while keeping unsupported states (PHYRETRAIN, L1, L2) out
+#     of the denominator.
+#   - Final integration gate: `make -C sim clean && make -C sim all` is the
+#     authoritative exit proof. The build gate passes only when all RTL compiles
+#     with zero warnings, all unit tests pass, loopback achieves bidirectional
+#     Raw Mode data transfer, all Phase F event evidence fragments validate,
+#     and cov_report.py reports 100% reachable coverage.
 #   - Simulator performance is a deliberate design concern. The main-band
 #     forwarded clock runs at 2 GHz (Req.2), which is 16 million edges across
 #     the 4 ms RESET dwell it must observe (Req.1). Testbenches gate that clock
@@ -134,6 +177,7 @@
 #   v0.0.1  2025-XX-XX  Initial creation - compile, unit and loopback targets.
 #   v0.0.2  2026-09-22  Add the coverage target and cov_report.py integration.
 #   v0.0.3  2026-09-23  Documentation: expand header, add revision history.
+#   v0.0.4  2026-09-25  Document Phase F event evidence fragments and final integration gate.
 #
 # LICENSE
 #   SPDX-License-Identifier: Apache-2.0
@@ -163,6 +207,11 @@ FILTER  := cat
 
 .PHONY: all compile unit loopback coverage clean
 
+# ------------------------------------------------------------- all
+# Final integration gate. Executes the complete verification cascade:
+# compile -> unit -> loopback -> coverage. Requires zero compile warnings,
+# all unit PASS markers, link Active on both dies, bidirectional Raw Mode
+# transfers, and 100% merged Phase F coverage without holes.
 all: compile unit loopback coverage
 
 # ------------------------------------------------------------- compile
@@ -182,7 +231,15 @@ compile:
 	  else echo "COMPILE OK"; fi
 
 # ------------------------------------------------------------- unit tests
-# Each test prints TEST PASSED <name> on success.
+# Directed unit testbenches in tb/unit/*.sv.
+# Each test compiles with -Wall (zero warnings) and runs independently.
+# Every test must print the literal line "TEST PASSED <name>" on success.
+#
+# Before running, stale Phase F event evidence fragments (*_evidence.json)
+# and previous logs are deleted from $(LOGS). On passing, unit tests covering
+# paths unreachable in nominal loopback (e.g. ut_stall for 4-phase stall and
+# degrade, ut_mapper for x8 degrade halves and byte reversal) emit their
+# respective JSON evidence fragments into $(LOGS)/ for coverage merging.
 unit: compile
 	@mkdir -p $(OUT) $(LOGS)
 	@echo "== Unit tests"
@@ -234,14 +291,32 @@ loopback: compile
 	@echo "LOOPBACK OK"
 
 # ------------------------------------------------------------- coverage
-# Reads the JSON the loopback monitor wrote, plus a per-test evidence file
-# each unit test writes on success. The loopback is x16-only and its PHY
-# never asserts rdi_pl_stallreq, so the stall four-phase, the x8 degrade
-# and the byte reversal paths are observable only in the unit tests; the
-# report requires both sources.
+# Aggregates multi-source Phase F coverage via cov_report.py.
+#
+# Merges two distinct evidence sources:
+#   1. $(LOGS)/coverage.json written by the loopback monitor (cov_monitor.sv),
+#      tracking LTSM states, RDI states, sideband opcodes/MsgCodes, and Phase F
+#      functional events (PARAM roles, transaction classes, arbitration, fatal
+#      causes, TRAINERROR, LinkReset, Disabled, PMNAK, Active Entry, pre-Active
+#      block, scrambling, framing fault, raw transfer fwd/rev, raw mode adv).
+#   2. $(LOGS)/*_evidence.json written by directed unit tests on success
+#      (e.g., stall_evidence.json, mapper_evidence.json) to cover paths
+#      structurally unexercised by nominal x16 loopback (4-phase stall,
+#      width degrade halves, byte reversal).
+#
+# The script evaluates reachable states (00h-12h, 14h, 15h, plus TRAINERROR
+# 16h via evidence) and Phase F event counters. Documented unreachable
+# states (PHYRETRAIN 13h, L1L2 17h) are excluded from the denominator.
+# Fails unless coverage reaches 100% with all evidence fragments accounted for.
 coverage: unit loopback
 	@echo "== Coverage"
 	@$(PYTHON) $(ROOT)/sim/cov_report.py
 
+# ------------------------------------------------------------- clean
+# Removes compiled simulation binaries ($(OUT)) and all run logs and coverage
+# evidence fragments ($(LOGS)). Purging $(LOGS) removes all Phase F evidence
+# files (*_evidence.json) and coverage.json, guaranteeing that the final
+# integration gate (`make -C sim clean && make -C sim all`) starts from a
+# clean slate with no residual pass markers or stale evidence.
 clean:
 	rm -rf $(OUT) $(LOGS)

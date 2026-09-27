@@ -47,15 +47,18 @@
 //  |                                  |            |                     |
 //  |  +------------------+            v            v                     |
 //  |  | ucie_timer x 2   |        mb_tx_data   sideband pins             |
-//  |  +------------------+                                               |
+//  |  +------------------+    Active gate + per-byte TX/RX scramblers    |
 //  +--------------------------------------------------------------------+
 //
 // --------------------------------------------------------------------------
 // Data flow (simplified)
 // --------------------------------------------------------------------------
-//   TX path : adapter -> rdi_lp_data -> rdi_pl_data pass-through (loopback).
+//   TX path : adapter -> rdi_lp_data -> Active data gate -> per-byte
+//             scrambler -> TX gearbox -> mb_tx_data pins.
 //             During training: ltsm -> pattern_gen -> mb_tx_data pins.
-//   RX path : mb_rx_data pins -> (future CRC / scrambler) -> rdi_pl_data.
+//   RX path : mb_rx_data pins -> RX gearbox -> per-byte descrambler ->
+//             Active data gate -> rdi_pl_data.
+//             The RX gearbox also reports a private mainband framing fault.
 //   Sideband: ltsm (lclk) -> async mailbox -> sb_codec (sbclk) -> sideband
 //             pins. During RESET and SBINIT pattern phases, a raw sbclk
 //             waveform/CDC primitive owns the pins and keeps the codec reset.
@@ -95,14 +98,21 @@
 // --------------------------------------------------------------------------
 //   1. The byte_lane_mapper is instantiated but held disabled (enable=1'b0);
 //      the main-band TX data is driven entirely by pattern_gen during
-//      training, and loopback for the datapath.
+//      training, and by the gated Active data path otherwise.
 //   2. The CSR write/read path is stubbed to constants; the PHY CSR is
 //      reachable only through the csr_start_link_train output.
 //   3. Static RDI outputs (pl_lnk_cfg, pl_speedmode, pl_stallreq) are tied
 //      to the reduced-capability defaults: x16, 4 GT/s, no stall.
-//   4. The RDI datapath (rdi_pl_trdy, rdi_pl_valid, rdi_pl_data) is a
-//      pass-through from the adapter side, since the logical PHY does not
-//      terminate the streaming data in this model.
+//   4. User data flows only while the link is fully Active: the private gate
+//      requires the completed LTSM Active Entry result, the published RDI
+//      ACTIVE result, a settled LTSM ACTIVE level, and an inactive Adapter
+//      stall acknowledgement. TX data is scrambled before the TX gearbox and
+//      RX data is descrambled after the RX gearbox, with one independent
+//      per-byte scrambler array per direction and a common Active Entry seed.
+//   5. The RX gearbox reports a private mainband framing fault. This module
+//      synchronizes it into lclk and converts it into a one-cycle private
+//      event for the existing LTSM fatal policy. No public error port is
+//      added, so the top-level interface is unchanged.
 //
 // --------------------------------------------------------------------------
 // Revision history
@@ -144,6 +154,38 @@
   //                        the retained DATA64 payload to the LTSM.
   // v0.0.15 2026-09-25  Phase C: route private RDI request, fresh-event,
   //                        Active-entry result, and Start-copy-clear signals.
+  // v0.0.16 2026-09-25  Phase D: route the Adapter Start copy as an internal
+  //                        edge-triggered event, gate RDI Active on completed
+  //                        LTSM Active Entry, and remove peer-Active feedback.
+  // v0.0.17 2026-09-25  Complete Phase D construct documentation for SBINIT
+  //                        ownership, sideband codec mapping, and LTSM wiring.
+  // v0.0.18 2026-09-25  Correct Phase D construct header and specification
+  //                        subsection references.
+  // v0.0.19 2026-09-25  Phase E: gate user data on completed Active Entry,
+  //                        RDI Active, a settled LTSM ACTIVE level, and an
+  //                        inactive stall acknowledgement. Add independent
+  //                        per-byte TX/RX scrambler arrays seeded at Active
+  //                        Entry, scramble before the TX gearbox, descramble
+  //                        after the RX gearbox, and route the private RX
+  //                        framing fault into the LTSM fatal policy. Restore
+  //                        the RDI state-status driver and the lint use of the
+  //                        preserved adapter_active_req input.
+  // v0.0.20 2026-09-25  Phase E correctness: close the Active-data gate at
+  //                        private transition start, drain accepted registered
+  //                        words without masking their valid, flush the RX
+  //                        epoch at the first quiet transfer gap, and retain
+  //                        an unarmed framing-fault edge until LTSM policy
+  //                        can consume it.
+  // v0.0.21 2026-09-25  Phase E fault containment: clear pending TX/RX valid
+  //                        qualifiers when the Active-data gate closes and
+  //                        qualify both output valid signals with that gate.
+  //                        This prevents a registered word from leaking after
+  //                        a private framing fault or transition.
+  // v0.0.22 2026-09-25  Clarify the valid-register block comment for the
+  //                        synchronous gate-close flush.
+  // v0.0.23 2026-09-25  Include the current private framing-fault event in
+  //                        the Active-data gate while preserving recovery after
+  //                        the gearbox sticky history remains set.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -159,9 +201,9 @@ module logical_phy #(
   input  logic        mbclk,        // 2 GHz forwarded clock fCK (Req.2)
   input  logic        sbclk,
   input  logic        sbreset_n,
-  input  logic        start_link_train,
-  // ---------------------------------------------------------- RDI (Table 114)
-  input  rdi_req_t    rdi_lp_state_req,
+  input logic        start_link_train,
+  input logic        adapter_start_link_train,
+  input  rdi_req_t   rdi_lp_state_req,
   input  logic        rdi_lp_stallack,
   output rdi_sts_t    rdi_pl_state_sts,
   output logic        rdi_pl_inband_pres,
@@ -181,7 +223,6 @@ module logical_phy #(
   output logic        rdi_pl_stallreq,
   output logic        clear_start_link_train,
   input  logic        adapter_active_req,
-  // -------------------------------------------------- sideband to partner
   output logic [NC-1:0] sb_tx_data,
   output logic        sb_tx_valid,
   input  logic [NC-1:0] sb_rx_data,
@@ -203,6 +244,53 @@ module logical_phy #(
   // ------------------------------------------------- internal datapath
   logic [NBYTES-1:0][7:0] tx_bytes;
   logic [NLANES-1:0][7:0] lane_bytes;
+
+  // ------------------------------------------- Active data path (Phase E)
+  // Private control of the gated Active data path and of the two independent
+  // per-byte scrambler arrays. The construct blocks at the Active data path
+  // section below own the behavior: these lines only fix the names.
+  // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, 4.4.1, 8.1.6, and 8.3.1;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  logic        ltsm_active_entry_q;      // Active Entry result, previous lclk
+  logic        active_entry_seed_pulse;  // one-lclk scrambler seed strobe
+  logic [7:0]  ltsm_state_q;             // LTSM state, previous lclk
+  logic        ltsm_active_state_stable; // ACTIVE held for two lclk cycles
+  logic        ltsm_transition_active;   // private LTSM transition in progress
+  logic        user_data_enable;         // Active user-data gate, both paths
+  logic        tx_user_transfer;         // accepted TX transfer strobe
+  logic        rx_user_transfer;         // accepted RX transfer strobe
+  logic        tx_user_valid_q;          // TX valid stored with scramble word
+  logic        rx_user_valid_q;          // RX valid stored with descramble word
+  logic        tx_user_valid;            // stored TX valid, drained word beat
+  logic        rx_user_valid;            // stored RX valid, drained word beat
+  logic        rx_epoch_synced_q;        // RX epoch aligned to a quiet gap
+  logic [DATA_W-1:0] tx_user_word;       // scrambled 128-bit TX word
+  logic [DATA_W-1:0] rx_user_word;       // descrambled 128-bit RX word
+
+  // --------------------------------------- mainband framing fault (Phase E)
+  // The RX gearbox owns detection. This module owns the clock-domain crossing
+  // and the private event shape for the LTSM. The event path is re-armed per
+  // epoch: see the framing-fault section at the Active data path.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  logic        rx_framing_fault;         // rx_gearbox private fault (mbclk)
+  logic        rx_framing_fault_meta_q;  // lclk synchronizer stage 1
+  logic        rx_framing_fault_sync_q;  // lclk synchronizer stage 2
+  logic        rx_framing_fault_prev_q;  // edge-detect register
+  logic        rx_framing_fault_rise;    // fresh synchronized fault edge
+  logic        rx_framing_fault_pending_q; // edge held for the armed epoch
+  logic        ltsm_fatal_policy_armed;  // LTSM can consume fatal events
+  logic        ltsm_framing_fault_event; // one-lclk event to the LTSM
+
+  // ------------------------------------- mainband gearbox interface (4.1.1)
+  // Declared with the Active data path because the scramble stage reads the
+  // RX word and drives the TX word before the gearbox instantiations appear.
+  // Spec ref: UCIe 1.0 Sections 4.1.1 and 4.1.2;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  logic [DATA_W-1:0] tx_gearbox_word;    // word presented to the TX gearbox
+  logic              tx_gearbox_valid;   // framing valid for that word
+  logic [DATA_W-1:0] rx_gearbox_word;    // word reassembled by the RX gearbox
+  logic              rx_gearbox_valid;   // valid strobe for that word
 
   // ------------------------------------------------- LTSM <-> sideband CDC
   // The LTSM side uses lclk. The sb_codec side uses sbclk. Each direction
@@ -326,7 +414,7 @@ module logical_phy #(
   logic        tmr_expired;
   logic        rst_tmr_start;
   logic        rst_tmr_expired;
-  // ------------------------------------------------- LTSM <-> adapter
+  // ------------------------------------------------- LTSM <-> Start / RDI
   logic        csr_start_link_train;
   logic        ltsm_software_start_q;
   logic        ltsm_software_start_event;
@@ -379,6 +467,13 @@ module logical_phy #(
   // valid pulse are captured together, so a mismatch cannot be reordered with
   // a neighboring match. Well-formed iterations are 96 sbclk cycles apart,
   // which exceeds the mailbox acknowledgement round trip.
+  // ---------------------------------------------------------------------------
+  // Module instantiation: SBINIT RX result mailbox
+  //
+  // Transfers each raw-pattern match result from sbclk to lclk with its valid
+  // event. The mailbox preserves ordering across the asynchronous clock domains.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
   sb_cdc_mailbox #(.WIDTH(1)) u_sbinit_rx_result_cdc (
     .src_clk    (sbclk),
     .src_reset_n(sbreset_n),
@@ -391,10 +486,24 @@ module logical_phy #(
     .dst_valid  (sbinit_rx_iter_vld)
   );
 
+  // ---------------------------------------------------------------------------
+  // assign: SBINIT RX match payload
+  //
+  // Exposes the one-bit result captured by the RX mailbox. The valid pulse
+  // from the same mailbox qualifies when the LTSM consumes this value.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
   assign sbinit_rx_iter_match = raw_rx_result_l[0];
 
   // Independent local-completion mailbox. It reports every completed local
   // 96-UI waveform once and carries no phase, count, or completion policy.
+  // ---------------------------------------------------------------------------
+  // Module instantiation: SBINIT TX completion mailbox
+  //
+  // Transfers each completed raw transmit iteration from sbclk to lclk.
+  // The destination sees one completion pulse per accepted waveform.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
   sb_cdc_mailbox #(.WIDTH(1)) u_sbinit_tx_done_cdc (
     .src_clk    (sbclk),
     .src_reset_n(sbreset_n),
@@ -412,6 +521,13 @@ module logical_phy #(
   // A partner can already be partway through a repeated Out-of-Reset packet;
   // this boundary wait prevents that suffix from becoming a partial header.
   logic codec_packet_ready_s;
+  // ---------------------------------------------------------------------------
+  // always_ff: Boundary-safe codec release in sbclk
+  //
+  // Holds the packet codec in reset during raw SBINIT mode and releases it
+  // only after the synchronized raw receiver observes an idle boundary.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       codec_packet_ready_s <= 1'b0;
@@ -422,7 +538,21 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: Packet codec reset qualification
+  //
+  // Combines the sideband reset with the registered raw-to-packet boundary
+  // state, so the codec cannot observe a partial raw waveform.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
   assign codec_reset_n = sbreset_n && codec_packet_ready_s;
+  // ---------------------------------------------------------------------------
+  // always_ff: Synchronize codec release and raw TX idle
+  //
+  // Transfers the sbclk boundary state and raw transmitter idle indication
+  // into lclk before LTSM and SBINIT consume them.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_packet_ready_meta_q <= 1'b0;
@@ -437,11 +567,22 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: SBINIT transmit-idle indication
+  //
+  // Exposes the synchronized raw-pattern idle level to the SBINIT controller.
+  // The synchronizer prevents the lclk domain from sampling sbclk transitions.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
+  // ---------------------------------------------------------------------------
   assign sbinit_tx_idle = raw_tx_idle_sync_q;
 
   // Raw mode owns the public pins for the entire pattern phase, including its
   // 1 ms idle windows. Packet pins become visible only after the boundary-safe
   // mode change has reset and released the codec.
+  // Raw and packet valid are selected together, so data and framing cannot
+  // come from different sideband sources.
+  // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
   assign sb_tx_data  = raw_mode_active_s ? raw_sb_tx_data  :
                                            codec_sb_tx_data;
   assign sb_tx_valid = raw_mode_active_s ? raw_sb_tx_valid :
@@ -462,7 +603,7 @@ module logical_phy #(
   // is busy. The busy path synchronizes codec backpressure into lclk and
   // combines it with mailbox occupancy before the LTSM can issue another
   // request.
-  // ---------------------------------------------------------------------------
+  // Spec ref: UCIe 1.0 Chapter 6, Section 6.1.2, Tables 47, 53, 54, and 56.
   sb_cdc_mailbox #(.WIDTH(SB_TX_W)) u_sb_tx_cdc (
     .src_clk    (lclk),
     .src_reset_n(lreset_n),
@@ -488,6 +629,13 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   assign sb_tx_accepted = sb_tx_load && !sb_tx_cdc_busy;
 
+  // ---------------------------------------------------------------------------
+  // assign: Decode the sideband TX mailbox bundle
+  // Unpacks the stable mailbox payload for the sbclk-domain codec transmit
+  // fields. The mailbox handshake already qualifies the bundle for this
+  // combinational decode, so no additional state or event is created here.
+  //
+  // Spec ref: UCIe 1.0 Section 6.1.2; PLAN.md Section 15.3.
   assign {codec_tx_opcode, codec_tx_srcid, codec_tx_dstid, codec_tx_msginfo,
           codec_tx_msgcode, codec_tx_msgsubcode, codec_tx_be, codec_tx_tag,
           codec_tx_ep, codec_tx_addr, codec_tx_data_in, codec_tx_has_data} =
@@ -495,6 +643,13 @@ module logical_phy #(
 
   // Synchronize codec busy and packet-mode sideband presence into lclk.
   // Raw pattern valid is excluded from RDI in-band presence.
+  // ---------------------------------------------------------------------------
+  // always_ff: Synchronize codec busy and packet presence
+  //
+  // Transfers codec busy and packet-valid indications into lclk with two
+  // registers. Raw SBINIT traffic is excluded from packet presence reporting.
+  //
+  // Spec ref: UCIe 1.0 Section 6.1.2; PLAN.md Section 15.3.
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_busy_meta_q <= 1'b0;
@@ -536,9 +691,23 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: Combine sideband transaction busy sources
+  //
+  // Blocks a new packet while the mailbox, codec, in-flight tracker, or
+  // boundary-safe codec reset is still busy.
+  //
+  // Spec ref: UCIe 1.0 Section 6.1.2; PLAN.md Section 15.3.
   assign sb_tx_busy = sb_tx_cdc_busy | codec_tx_busy_sync_q |
                       codec_tx_inflight_q | !codec_packet_ready_sync_q;
 
+  // ---------------------------------------------------------------------------
+  // Module instantiation: Sideband packet codec
+  //
+  // Converts accepted lclk-domain packet fields into the sbclk-domain
+  // sideband stream and decodes received packets for the Logical PHY.
+  //
+  // Spec ref: UCIe 1.0 Chapter 6, Section 6.1.2, Tables 47, 53, 54, and 56.
   sb_codec u_sb_codec (
     .sbclk        (sbclk),
     .sbreset_n    (codec_reset_n),
@@ -637,43 +806,23 @@ module logical_phy #(
           sb_rx_payload} = sb_rx_cdc_data;
 
   // ---------------------------------------------------------------------------
-  // Link Training and Status Machine Instantiation  (u_ltsm)
-  // ---------------------------------------------------------------------------
-  // Spec reference : 4.5.3 (LTSM overview), 4.5.3.1-4.5.3.9 (per-state
-  //                  descriptions). See ltsm.sv header for the full
-  //                  state/sub-state progression diagram.
-  //
-  // The LTSM is the sole sideband master in this logical PHY. It sequences
-  // through RESET -> SBINIT -> MBINIT.* -> MBTRAIN.* -> LINKINIT -> ACTIVE,
-  // exchanging sideband messages with the partner at each sub-state boundary.
-  // On entry, it receives start_link_train from either the top-level pin or
-  // the CSR TRAIN_CTL write. On exit, it reports link_trained, train_error,
-  // and link_reset_out to the RDI state machine and the CSR block.
-  //
-  // The LTSM owns SBINIT phase and retry policy. It controls the raw
-  // primitive through stable levels and consumes atomic iteration events.
-  // It also controls the later main-band pattern generator. The 8 ms
-  // residency timer (u_resid_timer) provides timeout enforcement
-  // per spec 4.5.3. The 4 ms reset timer (u_reset_timer) enforces the
-  // minimum RESET duration requirement per spec 4.5.3.1.
-  // ---------------------------------------------------------------------------
-  // ---------------------------------------------------------------------------
   // always_ff: Private LTSM Start and RDI event sampling
   //
-  // Samples source levels so the LTSM receives one event for each software
-  // Start rising edge and each RDI NOP-to-Active transition. Held levels do
-  // not create a recovery trigger after RESET. The same RDI request levels
-  // select the Active, LinkReset, and Disabled Phase C exchanges.
+  // Samples the combined top-level, Adapter CSR, and PHY CSR Start level so
+  // the LTSM receives one event for the aggregate low-to-high transition.
+  // Held levels do not create a recovery trigger after RESET. The RDI request
+  // levels select the Active, LinkReset, and Disabled Phase C exchanges.
   //
-  // Spec ref: UCIe 1.0, Sections 8.1.6 and 8.3.2.5-.8;
-  //           PLAN.md Sections 15.4 and 15.9 Phase C.
+  // Spec ref: UCIe 1.0 Sections 8.1.6 and 8.3.2.8;
+  //           PLAN.md Sections 15.4 and 15.5.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       ltsm_software_start_q <= 1'b0;
       rdi_active_req_q      <= 1'b0;
     end else begin
-      ltsm_software_start_q <= start_link_train | csr_start_link_train;
+      ltsm_software_start_q <=
+        start_link_train | adapter_start_link_train | csr_start_link_train;
       rdi_active_req_q      <=
         (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE);
     end
@@ -682,18 +831,33 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   // assign: Private LTSM policy events
   //
-  // These wires translate existing local RDI levels into the LTSM private
-  // Phase C policy interface. The edge forms enforce the fresh-trigger rule.
-  // They do not alter the public RDI interface or the SBINIT raw boundary.
+  // These wires translate the combined Start edge and local RDI levels into
+  // the LTSM private policy interface. The edge forms enforce fresh triggers.
+  // Adapter CSR Start routing is part of Phase D and does not alter public RDI.
   //
-  // Spec ref: UCIe 1.0, Sections 8.1.6 and 8.3.2.8;
-  //           PLAN.md Sections 15.4 and 15.9 Phase C.
+  // Spec ref: UCIe 1.0 Sections 8.1.6 and 8.3.2.8;
+  //           PLAN.md Sections 15.4, 15.5, and 15.9.
   // ---------------------------------------------------------------------------
   assign ltsm_software_start_event =
-    (start_link_train | csr_start_link_train) && !ltsm_software_start_q;
+    (start_link_train | adapter_start_link_train | csr_start_link_train) &&
+    !ltsm_software_start_q;
   assign ltsm_rdi_active_event =
     (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE) && !rdi_active_req_q;
 
+  // ---------------------------------------------------------------------------
+  // Module instantiation: Link Training and Status Machine
+  //
+  // Owns LinkMgmt.RDI training, Active-entry completion, reset recovery,
+  // and sideband progression that feeds the RDI and FDI state machines.
+  // Its software start event combines the top-level Start pin, the private
+  // Adapter CSR Start event, and the PHY CSR Start event. The private
+  // framing_fault_event input carries the synchronized one-lclk mainband
+  // framing fault into the existing fatal policy; it is not a public port.
+  // The transition_active output is the private transition indication that
+  // closes the Active user-data gate on the transition start.
+  //
+  // Spec ref: UCIe 1.0 Sections 8.1.6, 8.3.2.8, 4.5.3, and 4.5.3.8;
+  //           PLAN.md Sections 15.4, 15.5, 15.6, and 15.9 Phase E.
   ltsm #(.NLANES(NLANES)) u_ltsm (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
@@ -702,6 +866,8 @@ module logical_phy #(
     .rdi_active_req  (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE),
     .rdi_linkreset_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_LINKRESET),
     .rdi_disabled_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_DISABLED),
+    .framing_fault_event(ltsm_framing_fault_event),
+    .transition_active(ltsm_transition_active),
     .active_entry_done(ltsm_active_entry_done),
     .clear_start_link_train(clear_start_link_train),
     .link_trained    (link_trained),
@@ -799,21 +965,25 @@ module logical_phy #(
   // Spec reference : 8.1.5 (RDI state transitions, Figure 111), 8.1.6
   //                  (Active-entry handshake).
   //
-  // The RDI state machine mediates between the D2D Adapter (which drives
-  // rdi_lp_state_req) and the physical layer (which reports link_trained,
-  // link_reset_out, train_error). Physical RESET and TRAINERROR preempt
-  // every adapter request per 8.1.5. The ACTIVE entry follows the three-way
-  // handshake of 8.1.6.
+  // The RDI state machine mediates between the D2D Adapter and the physical
+  // layer. RDI ACTIVE requires link_trained and the completed private LTSM
+  // Active Entry result, while RESET and TRAINERROR preempt adapter requests.
   //
   // In this build:
   //   - phy_retrain_req is derived from the adapter requesting RDI_REQ_RETRAIN.
   //   - phy_inband_pres mirrors sb_rx_valid (partner alive on sideband).
   //   - cerror, nferror, and stall_req are tied to zero.
+  //   - rdi_pl_state_sts is the registered RDI state and drives the public
+  //     status output directly, so the Adapter observes the published state.
+  //
+  // Spec ref: UCIe 1.0 Sections 8.1.5, 8.1.6, and 8.3.1;
+  //           PLAN.md Sections 15.5 and 15.9 Phase D.
   // ---------------------------------------------------------------------------
   rdi_state_machine u_rdi_sm (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
     .rdi_lp_state_req(rdi_lp_state_req),
+    .adapter_active_req(1'b0),
     .rdi_lp_stallack (rdi_lp_stallack),
     .rdi_pl_state_sts(rdi_pl_state_sts),
     .rdi_pl_inband_pres(rdi_pl_inband_pres),
@@ -823,6 +993,7 @@ module logical_phy #(
     .rdi_pl_nferror  (rdi_pl_nferror),
     .rdi_pl_trainerror(rdi_pl_trainerror),
     .phy_link_trained(link_trained),
+    .phy_active_entry_done(ltsm_active_entry_done),
     .phy_link_reset  (link_reset_out),
     .phy_retrain_req (rdi_lp_state_req == ucie_pkg::RDI_REQ_RETRAIN),
     .phy_train_error (train_error),
@@ -831,7 +1002,6 @@ module logical_phy #(
     .nferror         (1'b0),
     .stall_req       (1'b0),
     .stall_ack       (),
-    .adapter_active_req(adapter_active_req),
     .local_active_req(local_active_req)
   );
 
@@ -1000,33 +1170,355 @@ module logical_phy #(
   assign pl_cfg_vld = 1'b0;
   assign pl_cfg_crd = 1'b0;
 
+  // ===========================================================================
+  // Active Data Path and Private Framing Fault  (PLAN.md 15.6, 15.9 Phase E)
+  // ===========================================================================
+  // User data may reach the main band only while the link is fully up: the
+  // LTSM completed Active Entry, the RDI state machine published ACTIVE, the
+  // LTSM ACTIVE level is settled, and the Adapter stall handshake is not
+  // active. Training patterns keep their own path through the pattern
+  // generator and never enter these scramblers.
+  // ===========================================================================
+
+  // ---------------------------------------------------------------------------
+  // always_ff: Active Entry and LTSM state history
+  //
+  // Records the completed Active Entry result and the LTSM state of the
+  // previous lclk cycle. The seed strobe below needs the Active Entry edge,
+  // and the user-data gate needs to know that ACTIVE is a settled level, not
+  // a fresh entry.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.5.3.6 and 8.1.6;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      ltsm_active_entry_q <= 1'b0;
+      ltsm_state_q        <= LT_RESET;
+    end else begin
+      ltsm_active_entry_q <= ltsm_active_entry_done;
+      ltsm_state_q        <= ltsm_state;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // assign: Active Entry seed strobe
+  //
+  // One lclk cycle at the completed Active Entry. Both scrambler arrays
+  // reload their per-byte lane seeds on this strobe, so no training-pattern
+  // LFSR history and no earlier Active residency can reach the Active data
+  // path.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.1.6;
+  //           PLAN.md Sections 6.4, 15.6, and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign active_entry_seed_pulse = ltsm_active_entry_done &&
+                                   !ltsm_active_entry_q;
+
+  // ---------------------------------------------------------------------------
+  // assign: Settled LTSM ACTIVE qualification
+  //
+  // Requires the current and the previous LTSM state to be ACTIVE, so the gate
+  // opens only after an Active transition has settled and closes immediately
+  // on any transition out of ACTIVE.
+  //
+  // Spec ref: UCIe 1.0 Section 4.5.3.6; PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign ltsm_active_state_stable = (ltsm_state == LT_ACTIVE) &&
+                                    (ltsm_state_q == LT_ACTIVE);
+
+  // ---------------------------------------------------------------------------
+  // assign: Active user-data gate
+  //
+  // Single private gate for both directions. It combines the completed LTSM
+  // Active Entry result, the published RDI ACTIVE result, the settled LTSM
+  // ACTIVE level, an inactive Adapter stall acknowledgement, the private
+  // LTSM transition indication, and the current framing-fault event. A
+  // framing fault or any recovery clears the gate in the same cycle.
+  //
+  // The transition term closes the gate in the cycle the transition starts,
+  // not in the cycle after the state register commits. That matters for the
+  // fatal path: the LTSM keeps the registered ACTIVE state while the
+  // TRAINERROR Entry exchange runs, so a state-only gate would leave user data
+  // flowing into an aborted epoch for the whole exchange.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.5.3.6, 8.1.6, and 8.3.1;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign user_data_enable = ltsm_active_entry_done &&
+                            local_active_req &&
+                            ltsm_active_state_stable &&
+                            !rdi_lp_stallack &&
+                            !ltsm_transition_active &&
+                            !ltsm_framing_fault_event;
+
+  // ---------------------------------------------------------------------------
+  // assign: Accepted user-transfer strobes
+  //
+  // A transfer is accepted when the gate is open, the matching valid qualifier
+  // is high, and, for the receive direction, the receive epoch is aligned.
+  // These strobes advance the scramblers, so an idle, gated, or invalid cycle
+  // consumes no LFSR state and holds both arrays.
+  //
+  // The receive epoch qualification drops every word that arrives before the
+  // first quiet transfer gap of the new Active residency. The far die stops
+  // emitting its LINKINIT or other training pattern when it leaves LINKINIT,
+  // which can happen after this die already opened its gate, and its last
+  // training words are then still inside the receive path. Those words must
+  // never advance the Active descrambler: the far die's transmit scrambler
+  // counts only its own accepted Active words, so one extra descrambled word
+  // would shift the receive sequence and corrupt every later word.
+  //
+  // Because the two directions advance on their own accepted transfers, both
+  // ends must have an open gate before the first Active word reaches the
+  // receiver. The approved bring-up flow waits for both link-active
+  // indications before streaming, and every Active Entry re-seeds both
+  // arrays, so a receiver that starts accepting mid-stream only recovers
+  // after the next Active Entry.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
+  //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign tx_user_transfer = user_data_enable && rdi_lp_valid;
+  assign rx_user_transfer = user_data_enable && rx_gearbox_valid &&
+                            rx_epoch_synced_q;
+
+  // ---------------------------------------------------------------------------
+  // always_ff: Receive-epoch alignment register
+  //
+  // Cleared at every Active Entry, which is the start of one receive epoch.
+  // It sets on the first cycle in which the gate is open and the receive
+  // gearbox reports no framed transfer, that is, on the first quiet transfer
+  // gap of the epoch. The gap is the boundary between the far die's training
+  // stream and its Active stream, so from the following word onward every
+  // accepted receive word belongs to the same stream the far transmit
+  // scrambler counts.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
+  //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      rx_epoch_synced_q <= 1'b0;
+    end else if (active_entry_seed_pulse) begin
+      rx_epoch_synced_q <= 1'b0;
+    end else if (user_data_enable && !rx_gearbox_valid) begin
+      rx_epoch_synced_q <= 1'b1;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // always_ff: Valid qualifiers for the registered scramble words
+  //
+  // Both scrambler arrays register their output, so a scrambled or
+  // descrambled word appears one lclk cycle after its accepted transfer.
+  // These registers delay the valid qualifiers by exactly the same cycle, so
+  // valid and data always describe the same word. They also clear both
+  // qualifiers synchronously when the Active-data gate closes.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      tx_user_valid_q <= 1'b0;
+      rx_user_valid_q <= 1'b0;
+    end else if (!user_data_enable) begin
+      tx_user_valid_q <= 1'b0;
+      rx_user_valid_q <= 1'b0;
+    end else begin
+      tx_user_valid_q <= tx_user_transfer;
+      rx_user_valid_q <= rx_user_transfer;
+  end
+  end
+
+  // ---------------------------------------------------------------------------
+  // assign: Active-gated valid qualifiers
+  //
+  // The scrambler outputs and valid registers share one lclk pipeline stage.
+  // Clear the pending valid qualifiers whenever the Active gate closes, so a
+  // word accepted before a framing fault or private transition cannot appear
+  // after the gate closes.
+  //
+  // A new Active Entry reseeds both scramblers before user acceptance resumes.
+  // This prevents a discarded in-flight word from shifting the next recovery
+  // epoch.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2, 4.4.1, and 8.1.6;
+  //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign tx_user_valid = tx_user_valid_q && user_data_enable;
+  assign rx_user_valid = rx_user_valid_q && user_data_enable;
+
+  // ---------------------------------------------------------------------------
+  // generate: Independent per-byte TX and RX scrambler arrays
+  //
+  // Each byte position owns its own scrambler instance, so no other byte's
+  // LFSR state and no training-pattern state can influence it. Byte b of the
+  // word is carried on lane b (spec 4.1.1), so LANE_ID = b selects exactly
+  // that lane's seed, and instance b drives or reads bits [8*b +: 8] of the
+  // 128-bit word. Both arrays reseed on the Active Entry strobe, hold state
+  // while their enable is low, and advance only on an accepted valid transfer.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.1 and 4.4.1;
+  //           PLAN.md Sections 6.4, 15.6, and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  genvar b;
+  generate
+    for (b = 0; b < NBYTES; b = b + 1) begin : g_tx_scramble
+      scrambler #(.LANE_ID(b)) u_tx_scrambler (
+        .lclk      (lclk),
+        .lreset_n  (lreset_n),
+        .lfsr_reset(active_entry_seed_pulse),
+        .enable    (tx_user_transfer),
+        .data_in   (rdi_lp_data[8*b +: 8]),
+        .data_out  (tx_user_word[8*b +: 8]),
+        .state_obs ()
+      );
+    end
+    for (b = 0; b < NBYTES; b = b + 1) begin : g_rx_descramble
+      scrambler #(.LANE_ID(b)) u_rx_scrambler (
+        .lclk      (lclk),
+        .lreset_n  (lreset_n),
+        .lfsr_reset(active_entry_seed_pulse),
+        .enable    (rx_user_transfer),
+        .data_in   (rx_gearbox_word[8*b +: 8]),
+        .data_out  (rx_user_word[8*b +: 8]),
+        .state_obs ()
+      );
+    end
+  endgenerate
+
+  // ---------------------------------------------------------------------------
+  // always_ff: Private mainband framing-fault synchronizer
+  //
+  // The RX gearbox detects an invalid framing boundary on mbclk and holds its
+  // fault indication until lreset_n. Two lclk registers transfer that level
+  // into the policy clock domain, so the LTSM never samples an mbclk
+  // transition. The second stage is the safe lclk-domain fault level.
+  //
+  // Spec ref: UCIe 1.0 Section 4.1.2; PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      rx_framing_fault_meta_q <= 1'b0;
+      rx_framing_fault_sync_q <= 1'b0;
+    end else begin
+      rx_framing_fault_meta_q <= rx_framing_fault;
+      rx_framing_fault_sync_q <= rx_framing_fault_meta_q;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // always_ff: Framing-fault edge baseline
+  //
+  // The synchronized gearbox level is sticky until lreset_n. This register
+  // converts it to one fresh edge event and prevents a level-shaped input from
+  // keeping the LTSM fatal policy asserted across recovery.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) rx_framing_fault_prev_q <= 1'b0;
+    else           rx_framing_fault_prev_q <= rx_framing_fault_sync_q;
+  end
+
+  // ---------------------------------------------------------------------------
+  // assign: Fresh synchronized framing-fault edge
+  //
+  // The gearbox bit is a sticky observation, not a fatal level. A rising edge
+  // is the only fresh event, so an already-reported fault does not retrigger
+  // the recovered link when its gearbox bit remains high.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign rx_framing_fault_rise = rx_framing_fault_sync_q &&
+                                 !rx_framing_fault_prev_q;
+
+  // ---------------------------------------------------------------------------
+  // assign: LTSM fatal-policy arm level
+  //
+  // RESET and SBINIT intentionally do not consume post-SBINIT fatal events.
+  // The level mirrors the LTSM sideband-policy boundary without adding a
+  // public protocol or a second recovery state machine.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8;
+  //           PLAN.md Sections 15.4, 15.6, and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign ltsm_fatal_policy_armed = (ltsm_state != LT_RESET) &&
+                                    (ltsm_state != LT_SBINIT);
+
+  // ---------------------------------------------------------------------------
+  // always_ff: Epoch-qualified framing-fault retention
+  //
+  // A fresh fault edge that arrives while RESET or SBINIT cannot be consumed
+  // by the LTSM. Retain that one event until the first armed policy cycle,
+  // then clear it after one pulse. This private retention re-arms event
+  // delivery across LinkReset and Disabled recovery without clearing the
+  // gearbox sticky bit or adding a top-level error port. An edge consumed
+  // during an armed epoch is not retained, so its sticky residual does not
+  // retrigger the recovered link.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8;
+  //           PLAN.md Sections 15.4, 15.6, and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      rx_framing_fault_pending_q <= 1'b0;
+    end else if (rx_framing_fault_rise && !ltsm_fatal_policy_armed) begin
+      rx_framing_fault_pending_q <= 1'b1;
+    end else if (ltsm_fatal_policy_armed) begin
+      rx_framing_fault_pending_q <= 1'b0;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // assign: Private LTSM framing-fault event
+  //
+  // An edge reaches the existing fatal policy immediately when armed. A
+  // retained edge produces one pulse on the first armed epoch cycle. The
+  // event remains private and one-cycle shaped, so fatal recovery keeps its
+  // existing TRAINERROR Entry and LinkReset policy.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
+  assign ltsm_framing_fault_event = (rx_framing_fault_rise &&
+                                     ltsm_fatal_policy_armed) ||
+                                    rx_framing_fault_pending_q;
+
   // ---------------------------------------------------------------------------
   // Main-Band 4 GT/s DDR Gearboxes (spec 4.1.1 and 5.2)
   // ---------------------------------------------------------------------------
   // The TX gearbox bridges the 500 MHz 128-bit lclk word to eight UI slices
   // per lane. The RX gearbox reassembles eight received UIs into one lclk
-  // word for rdi_pl_data. The Phase A source mux below selects a LINKINIT
-  // diagnostic, a low immediate-success training state, or Adapter data.
+  // word for rdi_pl_data. The source mux below selects a LINKINIT diagnostic,
+  // a low immediate-success training state, or the gated Active user word.
+  // The RX gearbox additionally reports a private mainband framing fault.
+  // The four gearbox interface signals are declared with the Active data path
+  // section above, because the scramble stage already uses them.
   //
-  // Spec ref: UCIe 1.0, Section 4.1.1, Section 5.2, and Section 8.1.2.
+  // Spec ref: UCIe 1.0, Section 4.1.1, Section 4.1.2, Section 5.2, and
+  //           Section 8.1.2.
   // ---------------------------------------------------------------------------
-  logic [DATA_W-1:0] tx_gearbox_word;
-  logic              tx_gearbox_valid;
-  logic [DATA_W-1:0] rx_gearbox_word;
-  logic              rx_gearbox_valid;
 
-  // always_comb: Phase A mainband source and idle gate
+  // always_comb: Mainband source and Active user-data gate
   //
   // Routes a selected LINKINIT diagnostic pattern to the TX gearbox when
   // pat_enable is high. During immediate-success MBINIT and MBTRAIN states,
-  // it drives a zero word with framing low. This prevents Adapter traffic
-  // from bypassing the disabled pattern generator during skipped electrical
-  // actions. All other states retain the existing Adapter data route.
+  // it drives a zero word with framing low. The final branch carries the
+  // scrambled Active user word only while its gated valid qualifier is high;
+  // every other state drives a zero word with framing low, so no Adapter
+  // traffic can reach the main band before the link is fully Active.
   //
-  // Phase E replaces the final Adapter branch with completed-Active gating.
-  // This Phase A gate does not add an electrical pattern-count engine.
+  // The training-pattern branch is unchanged by Phase E: patterns never enter
+  // the data scramblers. The MBINIT/MBTRAIN guard is retained as an explicit
+  // Phase A guarantee even though the Active gate now blocks those states.
   //
-  // Spec ref: UCIe 1.0, Section 4.5.3.3, 4.5.3.4; PLAN.md §15.2 Phase A.
+  // Spec ref: UCIe 1.0, Sections 4.1.2, 4.4.1, 4.5.3.3, 4.5.3.4, and 4.5.3.6;
+  //           PLAN.md Sections 15.2 Phase A, 15.6, and 15.9 Phase E.
   // -------------------------------------------------------------------------
   always_comb begin
     if (pat_enable) begin
@@ -1036,11 +1528,26 @@ module logical_phy #(
                  (ltsm_state <= LT_MB_REPAIR)) begin
       tx_gearbox_word  = '0;
       tx_gearbox_valid = 1'b0;
+    end else if (tx_user_valid) begin
+      tx_gearbox_word  = tx_user_word;
+      tx_gearbox_valid = 1'b1;
     end else begin
-      tx_gearbox_word  = rdi_lp_data;
-      tx_gearbox_valid = rdi_lp_valid;
+      tx_gearbox_word  = '0;
+      tx_gearbox_valid = 1'b0;
     end
   end
+
+  // ---------------------------------------------------------------------------
+  // Module instantiation: TX gearbox
+  //
+  // Serialises one 128-bit lclk word into eight DDR UI slices per lane. The
+  // word and its framing valid come from the source mux above, so the training
+  // pattern path and the scrambled Active user word share one serializer and
+  // never interleave within a word.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2;
+  //           PLAN.md Sections 15.2 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
   tx_gearbox #(
     .NBYTES(NBYTES),
     .NLANES(NLANES)
@@ -1055,17 +1562,29 @@ module logical_phy #(
     .mb_tx_valid(mb_tx_valid)
   );
 
+  // ---------------------------------------------------------------------------
+  // Module instantiation: RX gearbox
+  //
+  // Reassembles the received DDR UI slices into one 128-bit lclk word and
+  // reports an invalid mainband framing boundary as a private fault. The
+  // fault is synchronized and shaped into the LTSM event above; it is not a
+  // public error output.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
   rx_gearbox #(
     .NBYTES(NBYTES),
     .NLANES(NLANES)
   ) u_rx_gearbox (
-    .lclk       (lclk),
-    .lreset_n   (lreset_n),
-    .mbclk      (mbclk),
-    .mb_rx_data (mb_rx_data),
-    .mb_rx_valid(mb_rx_valid),
-    .rx_word    (rx_gearbox_word),
-    .rx_word_vld(rx_gearbox_valid)
+    .lclk        (lclk),
+    .lreset_n    (lreset_n),
+    .mbclk       (mbclk),
+    .mb_rx_data  (mb_rx_data),
+    .mb_rx_valid (mb_rx_valid),
+    .rx_word     (rx_gearbox_word),
+    .rx_word_vld (rx_gearbox_valid),
+    .framing_fault(rx_framing_fault)
   );
 
   // ---------------------------------------------------------------------------
@@ -1079,26 +1598,30 @@ module logical_phy #(
   //   rdi_pl_trdy  - transmit ready. The PHY is always ready in this
   //                  simplified endpoint, so trdy simply mirrors the protocol
   //                  layer's irdy. There is no flow-control state to model
-  //                  because the loopback never backpressures.
+  //                  because the loopback never backpressures. trdy is not
+  //                  gated: the Active data gate above, not trdy, is what
+  //                  keeps user traffic off the main band.
   //
-  //   rdi_pl_valid - receive valid. Driven directly by the receive gearbox
-  //                  framing output. It pulses once per reassembled 128-bit
-  //                  word, which is once per lclk cycle while data flows.
-  //                  This is the framing boundary of spec 4.1.2: valid marks
-  //                  the cycle on which rdi_pl_data carries a complete word.
+  //   rdi_pl_valid - receive valid. Qualified by the Active user-data gate, so
+  //                  it marks only a descrambled word that the far die sent
+  //                  while the link was fully Active. This is the framing
+  //                  boundary of spec 4.1.2: valid marks the cycle on which
+  //                  rdi_pl_data carries a complete word. The valid register
+  //                  inside the scramble stage delays this qualifier by the
+  //                  same lclk cycle as the descrambled data.
   //
-  //   rdi_pl_data  - receive data. The reassembled word straight from the
-  //                  receive gearbox, with no intervening register, so that
-  //                  valid and data always describe the same word. Adding a
-  //                  register here would delay data but not the valid pulse
-  //                  and silently corrupt the pairing.
+  //   rdi_pl_data  - receive data. The descrambled word that rides with
+  //                  rdi_pl_valid, and zero whenever that qualifier is low, so
+  //                  valid and data always describe the same word and no
+  //                  pre-Active or stale word can reach the adapter.
   //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing; Section 8.1 - Raw
-  // Die-to-Die Interface (RDI); Table 114 - RDI Signal List.
+  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing; Section 4.4.1 -
+  // Scrambling; Section 8.1 - Raw Die-to-Die Interface (RDI);
+  // Table 114 - RDI Signal List. PLAN.md Sections 15.6 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
   assign rdi_pl_trdy  = rdi_lp_irdy;
-  assign rdi_pl_valid = rx_gearbox_valid;
-  assign rdi_pl_data  = rx_gearbox_word;
+  assign rdi_pl_valid = rx_user_valid;
+  assign rdi_pl_data  = rx_user_valid ? rx_user_word : {DATA_W{1'b0}};
 
   // ---------------------------------------------------------------------------
   // Lint Suppression: `unused` (continuous assign)
@@ -1117,12 +1640,18 @@ module logical_phy #(
   // synthesis discards it entirely. It is a deliberate, documented suppression
   // rather than a hidden one.
   //
+  // adapter_active_req is the public Adapter Active copy. Phase D keeps the
+  // RDI Active policy independent of it, so it is consumed here for lint only
+  // and never changes behavior. local_active_req left this list in Phase E,
+  // where it became the RDI half of the Active user-data gate.
+  //
   // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism (the
   //           pl_stallreq / lp_stallack handshake). lp_state_req is a
   //           separate state request specified in Section 8.3.2.
+  //           PLAN.md Sections 15.5 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
   logic unused;
-  assign unused = local_active_req | adapter_active_req | csr_rdata_vld |
+  assign unused = adapter_active_req | csr_rdata_vld |
                   csr_rdata[0] | phy_retrain_done | sb_msg_timeout |
                   sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |
                   raw_rx_result_busy | raw_tx_done_busy |

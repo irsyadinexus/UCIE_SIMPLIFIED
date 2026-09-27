@@ -9,9 +9,10 @@
 //   UCIe 1.0 Specification, Section 8.1.5 - RDI State Status Machine
 //   UCIe 1.0 Specification, Section 8.1.6 - RDI bring up flow
 //   UCIe 1.0 Specification, Section 8.1.7 - RDI PM flow
+//   UCIe 1.0 Specification, Section 8.3.1 - Stall handshake
 //   UCIe 1.0 Specification, Section 8.3.2 - State Request and Status
 //   UCIe 1.0 Specification, Table 114 - RDI Signal List
-//
+//   PLAN.md, Section 15.9 Phase F - Coverage and Verification Integration
 // DESCRIPTION
 //   Directed unit test for the RDI state machine (rtl/logical_phy/
 //   rdi_state_machine.sv). The DUT is instantiated directly and driven
@@ -19,20 +20,41 @@
 //   requested explicitly by the stimulus and observed on the status outputs.
 //
 //   This is the only test that exercises the RDI state machine in isolation.
-//   The loopback test reaches ACTIVE and stops there, so the return paths
-//   (ACTIVE -> L1 -> ACTIVE), the re-entry paths (LINKRESET, RETRAIN) and the
-//   error paths (LINKERROR, DISABLED) are reachable only here.
+//   The loopback test reaches ACTIVE and stops there, so the return paths, the
+//   recovery paths (LINKRESET, LINKERROR), the PMNAK answer and the four-phase
+//   stall handshake are reachable only here.
 //
 //   The test walks this sequence:
 //
-//     RESET -> ACTIVE -> L1 -> ACTIVE -> LINKRESET -> ACTIVE
-//           -> RETRAIN -> ACTIVE -> LINKERROR -> LINKRESET -> DISABLED
+//     RESET --> ACTIVE --> PMNAK(L1) --> ACTIVE --> PMNAK(L2) --> ACTIVE
+//           --> hold ACTIVE for RETRAIN --> LINKRESET --> RESET --> ACTIVE
+//           --> LINKERROR --> LINKRESET --> RESET --> ACTIVE
+//           --> DISABLED --> RESET --> ACTIVE --> four-phase stall
 //
-//   and, in addition to the state sequence itself, checks the active-entry
-//   gating described in spec 8.1.6: the machine must not report ACTIVE until
-//   the protocol layer, the adapter and the PHY all assert their respective
-//   active requests. That gating is the reason `chk` alone is insufficient
-//   here and the test also drives the three request inputs independently.
+//   and, in addition to the state sequence itself, checks the Phase D policy:
+//
+//     1. ACTIVE waits for the completed LTSM Active Entry result
+//        (phy_active_entry_done). A trained link alone must not publish
+//        ACTIVE, and local_active_req must drop if the result drops.
+//     2. LINKRESET and DISABLED stay published until the LTSM reports RESET
+//        through phy_link_reset; an adapter ACTIVE request cannot release
+//        them.
+//     3. L1 and L2 return PMNAK. The L1 and L2 status encodings are never
+//        published.
+//     4. RETRAIN is not published: ACTIVE is held, rdi_pl_phyinrecenter stays
+//        low, and the DUT has no LTSM-facing output that could change, so the
+//        held state is the observable proof that the LTSM is untouched.
+//     5. The stall handshake runs all four phases and consumes the adapter
+//        acknowledgement rdi_lp_stallack in a registered path.
+//
+//   The test also keeps the pass-through checks of the original build:
+//   pl_cerror, pl_nferror and pl_inband_pres.
+
+// Evidence export (Phase F):
+//   On clean zero-error completion, the test exports a minimal JSON evidence
+//   fragment to logs/rdi_sm_evidence.json capturing proof of PMNAK power
+//   management rejection, LinkReset handling, Disabled handling, and
+//   unsupported L1/L2/retrain status publication suppression.
 //
 // INTERNAL BLOCK DIAGRAM
 //
@@ -45,18 +67,20 @@
 //   |   |  rdi_lp_state_req[3:0] |            |  rdi_pl_state_sts[3:0] |   |
 //   |   |  rdi_lp_stallack       |            |  against the expected  |   |
 //   |   |  phy_link_trained      |            |  encoding, per step    |   |
-//   |   |  phy_link_reset        |            +-----------+------------+   |
+//   |   |  phy_active_entry_done |            +-----------+------------+   |
+//   |   |  phy_link_reset        |                        |                |
 //   |   |  phy_retrain_req       |                        |                |
 //   |   |  phy_train_error       |                        |                |
 //   |   |  adapter_active_req    |                        |                |
-//   |   |  local_active_req      |                        |                |
+//   |   |  stall_req             |                        |                |
 //   |   +-----------+------------+                        |                |
 //   |               |                                     |                |
 //   |               v                                     ^                |
 //   |     +----------------------------------------------+  |              |
 //   |     |        rdi_state_machine  (u_dut)            |  |              |
-//   |     |  RESET/ACTIVE/L1/LINKRESET/RETRAIN/          |--+              |
+//   |     |  RESET/ACTIVE/PMNAK/LINKRESET/               |--+              |
 //   |     |  LINKERROR/DISABLED   spec 8.1.5             |                 |
+//   |     |  registered four-phase stall   8.3.1         |                 |
 //   |     +----------------------------------------------+                 |
 //   |               ^                                                      |
 //   |   lclk = 500 MHz (always #1.0), lreset_n driven by stimulus          |
@@ -67,7 +91,10 @@
 //   waits a bounded number of clocks, then calls `chk` to confirm the DUT
 //   reached the corresponding status encoding before moving on. Each step is
 //   therefore a request/observe pair, and a wrong or late transition stops
-//   the walk at the step that failed.
+//   the walk at the step that failed. `hold_to` performs the opposite check:
+//   the status must still carry the same encoding after a fixed number of
+//   clocks, which is how the held LINKRESET, DISABLED and suppressed RETRAIN
+//   behaviour is proven.
 //
 // PASS / FAIL CRITERIA
 //   Every `chk` call compares rdi_pl_state_sts against the expected encoding
@@ -84,6 +111,21 @@
 // REVISION HISTORY
 //   v0.0.1  2025-XX-XX  Initial creation - RDI state walk and active gating.
 //   v0.0.2  2026-09-23  Documentation: expand header, add per-block comments.
+//   v0.0.3  2026-09-25  Phase D policy coverage (PLAN.md 15.5): completed
+//                       LTSM Active Entry result, PMNAK for L1 and L2, held
+//                       LINKRESET and DISABLED until the LTSM RESET result,
+//                       suppressed RETRAIN publication, and all four phases
+//                       of the registered stall handshake.
+//   v0.0.4  2026-09-25  Phase F: add minimal JSON evidence export to
+//                       logs/rdi_sm_evidence.json on error-free completion
+//                       covering PMNAK, LinkReset, Disabled, and unsupported
+//                       L1/L2/retrain exclusions.
+//   v0.0.5  2026-09-25  Restore the comment markers on the Table 114 and
+//                       PLAN.md references after the Phase F evidence export.
+//   v0.0.6  2026-09-25  Restore comment markers on the Phase F evidence
+//                       description after the evidence export update.
+//   v0.0.7  2026-09-25  Restore the closing initial-block delimiter after the
+//                       Phase F evidence writer.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -95,6 +137,7 @@ import ucie_pkg::*;
 module ut_rdi_sm;
   logic        lclk, lreset_n;
   logic [3:0]  rdi_lp_state_req;
+  logic        adapter_active_req;
   logic        rdi_lp_stallack;
   logic [3:0]  rdi_pl_state_sts;
   logic        rdi_pl_inband_pres;
@@ -104,13 +147,13 @@ module ut_rdi_sm;
   logic        rdi_pl_nferror;
   logic        rdi_pl_trainerror;
   logic        phy_link_trained;
+  logic        phy_active_entry_done;
   logic        phy_link_reset;
   logic        phy_retrain_req;
   logic        phy_train_error;
   logic        phy_inband_pres;
   logic        cerror, nferror;
   logic        stall_req, stall_ack;
-  logic        adapter_active_req;
   logic        local_active_req;
   int          errors;
 
@@ -122,22 +165,20 @@ module ut_rdi_sm;
   // nothing is tied off, so the test cannot accidentally pass because an input
   // was permanently strapped to a convenient value.
   //
-  // The three request inputs are deliberately separate signals rather than one
-  // shared driver. Spec 8.1.6 requires the machine to withhold ACTIVE until the
-  // protocol layer (rdi_lp_state_req), the adapter (adapter_active_req) and the
-  // local PHY (local_active_req) have all requested it, and keeping them
-  // distinct is what lets the stimulus assert them one at a time and prove the
-  // gate actually holds.
+  // The public adapter_active_req input remains connected but is intentionally
+  // ignored by Phase D policy. Active entry depends only on the request,
+  // physical link, and completed LTSM Active Entry result.
   //
   // The status output under observation is rdi_pl_state_sts, compared against
   // the expected encoding after each request.
   //
   // Spec ref: UCIe 1.0, Section 8.1.5 - RDI State Status Machine; Section 8.1.6
-  // - RDI bring up flow.
+  // - RDI bring up flow; Section 8.3.1 - Stall handshake.
   // -------------------------------------------------------------------------
   rdi_state_machine u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
     .rdi_lp_state_req(rdi_lp_state_req),
+    .adapter_active_req(adapter_active_req),
     .rdi_lp_stallack(rdi_lp_stallack),
     .rdi_pl_state_sts(rdi_pl_state_sts),
     .rdi_pl_inband_pres(rdi_pl_inband_pres),
@@ -147,13 +188,13 @@ module ut_rdi_sm;
     .rdi_pl_nferror(rdi_pl_nferror),
     .rdi_pl_trainerror(rdi_pl_trainerror),
     .phy_link_trained(phy_link_trained),
+    .phy_active_entry_done(phy_active_entry_done),
     .phy_link_reset(phy_link_reset),
     .phy_retrain_req(phy_retrain_req),
     .phy_train_error(phy_train_error),
     .phy_inband_pres(phy_inband_pres),
     .cerror(cerror), .nferror(nferror),
     .stall_req(stall_req), .stall_ack(stall_ack),
-    .adapter_active_req(adapter_active_req),
     .local_active_req(local_active_req)
   );
 
@@ -171,6 +212,16 @@ module ut_rdi_sm;
   initial lclk = 1'b0;
   always #1.0 lclk = ~lclk;
 
+  // -------------------------------------------------------------------------
+  // task chk: compare the published RDI status against one expectation
+  //
+  // Records a failure and increments `errors` when rdi_pl_state_sts does not
+  // carry the expected encoding. Every state expectation in this file goes
+  // through this task, which is what makes "L1, L2 and RETRAIN are never
+  // published" a checked statement rather than a comment.
+  //
+  // Spec ref: UCIe 1.0, Table 114 - RDI Signal List (pl_state_sts encodings).
+  // -------------------------------------------------------------------------
   task chk;
     input [64*8-1:0] label;
     input [3:0]     exp;
@@ -183,7 +234,12 @@ module ut_rdi_sm;
     end
   endtask
 
-  // Step until the status matches, with a bounded deadline.
+  // -------------------------------------------------------------------------
+  // task step_to: wait for a status encoding, with a bounded deadline
+  //
+  // Steps until the status matches, then re-checks through `chk` so a timeout
+  // produces the same failure message as a wrong encoding.
+  // -------------------------------------------------------------------------
   task step_to;
     input [64*8-1:0] label;
     input [3:0]     exp;
@@ -201,12 +257,32 @@ module ut_rdi_sm;
     end
   endtask
 
+  // -------------------------------------------------------------------------
+  // task hold_to: prove a status encoding survives a fixed number of clocks
+  //
+  // Used for the Phase D hold rules: LINKRESET and DISABLED must survive an
+  // adapter ACTIVE request, and the suppressed RETRAIN request must leave
+  // ACTIVE published.
+  // -------------------------------------------------------------------------
+  task hold_to;
+    input [64*8-1:0] label;
+    input [3:0]     exp;
+    input int       cycles;
+    begin
+      repeat (cycles) @(posedge lclk);
+      #0.1;
+      chk(label, exp);
+    end
+  endtask
+
   initial begin
     errors = 0;
     lreset_n        = 1'b0;
     rdi_lp_state_req= RDI_REQ_NOP;
+    adapter_active_req = 1'b0;
     rdi_lp_stallack = 1'b0;
     phy_link_trained= 1'b0;
+    phy_active_entry_done = 1'b0;
     phy_link_reset  = 1'b0;
     phy_retrain_req = 1'b0;
     phy_train_error = 1'b0;
@@ -214,63 +290,106 @@ module ut_rdi_sm;
     cerror          = 1'b0;
     nferror         = 1'b0;
     stall_req       = 1'b0;
-    adapter_active_req = 1'b0;
 
     #5 lreset_n = 1'b1;
     @(negedge lclk);
     chk("reset", RDI_STS_RESET);
-
-    // RESET -> ACTIVE needs a trained link and the adapter request. The
-    // partner-active gate (8.1.6) is on local_active_req, checked below.
-    rdi_lp_state_req = RDI_REQ_ACTIVE;
-    repeat (4) @(posedge lclk);
-    chk("no link, no active", RDI_STS_RESET);
-
-    phy_link_trained  = 1'b1;
-    adapter_active_req = 1'b1;
-    step_to("active", RDI_STS_ACTIVE);
-    // 8.1.6 gating: local_active_req needs state, partner and link.
-    if (!local_active_req) begin
-      $display("FAIL ut_rdi_sm: local_active_req low in ACTIVE");
+    if (stall_ack !== 1'b0) begin
+      $display("FAIL ut_rdi_sm: stall_ack high after reset");
       errors = errors + 1;
     end
-    adapter_active_req = 1'b0;
+
+    // =======================================================================
+    // Active Entry gate (spec 8.1.6, PLAN.md Phase D)
+    // =======================================================================
+    // A trained link is not sufficient. The machine must wait for the private
+    // LTSM Active Entry result before it publishes ACTIVE.
+    rdi_lp_state_req      = RDI_REQ_ACTIVE;
+    phy_link_trained      = 1'b1;
+    phy_active_entry_done = 1'b0;
+    repeat (4) @(posedge lclk);
+    #0.1;
+    chk("trained without Active Entry stays RESET", RDI_STS_RESET);
+
+    phy_active_entry_done = 1'b1;
+    step_to("active", RDI_STS_ACTIVE);
+
+    // The LTSM owns the remote PHY Active exchange. The RDI local result is
+    // valid as soon as its state and the completed Active Entry agree.
+    if (!local_active_req) begin
+      $display("FAIL ut_rdi_sm: local_active_req low after Active Entry");
+      errors = errors + 1;
+    end
+
+    // The completed Active Entry result must also gate the local declaration.
+    phy_active_entry_done = 1'b0;
     @(posedge lclk); #0.1;
     if (local_active_req) begin
-      $display("FAIL ut_rdi_sm: local_active_req high without partner ACTIVE");
+      $display("FAIL ut_rdi_sm: local_active_req high without Active Entry result");
       errors = errors + 1;
     end
-    adapter_active_req = 1'b1;
+    phy_active_entry_done = 1'b1;
     @(posedge lclk); #0.1;
-    if (!local_active_req) begin
-      $display("FAIL ut_rdi_sm: local_active_req low again");
-      errors = errors + 1;
-    end
 
-    // ACTIVE -> L1 -> ACTIVE
+    // =======================================================================
+    // L1 and L2 return PMNAK (no L1/L2 status, no LTSM change)
+    // =======================================================================
     rdi_lp_state_req = RDI_REQ_L1;
-    step_to("l1", RDI_STS_L1);
+    step_to("pmnak-l1", RDI_STS_PMNAK);
+    hold_to("pmnak-l1 holds", RDI_STS_PMNAK, 4);
     rdi_lp_state_req = RDI_REQ_ACTIVE;
     step_to("active2", RDI_STS_ACTIVE);
 
-    // ACTIVE -> LINKRESET -> ACTIVE
-    rdi_lp_state_req = RDI_REQ_LINKRESET;
-    step_to("linkreset", RDI_STS_LINKRESET);
+    rdi_lp_state_req = RDI_REQ_L2;
+    step_to("pmnak-l2", RDI_STS_PMNAK);
+    hold_to("pmnak-l2 holds", RDI_STS_PMNAK, 4);
     rdi_lp_state_req = RDI_REQ_ACTIVE;
     step_to("active3", RDI_STS_ACTIVE);
 
-    // ACTIVE -> RETRAIN. The machine holds RETRAIN until the link reports
-    // trained again, then returns to ACTIVE on the adapter request.
+    // =======================================================================
+    // RETRAIN is suppressed (PLAN.md Phase D)
+    // =======================================================================
+    // The fixed profile has no Retrain support: the RDI holds ACTIVE, never
+    // publishes RETRAIN, and never asserts the recentering indication. The DUT
+    // has no LTSM-facing output, so the held state is the observable proof
+    // that the LTSM request path is untouched.
     rdi_lp_state_req = RDI_REQ_RETRAIN;
-    phy_link_trained = 1'b0;
-    step_to("retrain", RDI_STS_RETRAIN);
+    phy_retrain_req  = 1'b1;
+    hold_to("retrain suppressed", RDI_STS_ACTIVE, 6);
+    if (rdi_pl_phyinrecenter) begin
+      $display("FAIL ut_rdi_sm: phyinrecenter asserted by Retrain request");
+      errors = errors + 1;
+    end
+    phy_retrain_req  = 1'b0;
     rdi_lp_state_req = RDI_REQ_ACTIVE;
-    repeat (4) @(posedge lclk);
-    chk("retrain holds without trained link", RDI_STS_RETRAIN);
-    phy_link_trained = 1'b1;
+    @(posedge lclk); #0.1;
+    chk("still active after retrain", RDI_STS_ACTIVE);
+
+    // =======================================================================
+    // LINKRESET holds until the LTSM RESET result (PLAN.md Phase D)
+    // =======================================================================
+    rdi_lp_state_req = RDI_REQ_LINKRESET;
+    step_to("linkreset", RDI_STS_LINKRESET);
+    // An adapter ACTIVE request alone may not release LinkReset.
+    rdi_lp_state_req = RDI_REQ_ACTIVE;
+    hold_to("linkreset held", RDI_STS_LINKRESET, 6);
+
+    // LTSM RESET report: the link indications drop and phy_link_reset asserts.
+    phy_link_trained      = 1'b0;
+    phy_active_entry_done = 1'b0;
+    phy_link_reset        = 1'b1;
+    @(posedge lclk); #0.1;
+    chk("linkreset to reset", RDI_STS_RESET);
+    phy_link_reset = 1'b0;
+    hold_to("reset holds", RDI_STS_RESET, 2);
+
+    phy_link_trained      = 1'b1;
+    phy_active_entry_done = 1'b1;
     step_to("active4", RDI_STS_ACTIVE);
 
-    // TRAINERROR preempts everything and forces LINKERROR.
+    // =======================================================================
+    // TRAINERROR preempts every state; LinkError recovers only via LinkReset
+    // =======================================================================
     phy_train_error = 1'b1;
     @(posedge lclk); #0.1;
     chk("linkerror", RDI_STS_LINKERROR);
@@ -278,36 +397,94 @@ module ut_rdi_sm;
       $display("FAIL ut_rdi_sm: trainerror not reported");
       errors = errors + 1;
     end
-    phy_train_error = 1'b0;
-    rdi_lp_state_req = RDI_REQ_LINKRESET;
-    step_to("recover", RDI_STS_LINKRESET);
-    rdi_lp_state_req = RDI_REQ_ACTIVE;
-    step_to("active5", RDI_STS_ACTIVE);
-
-    // ACTIVE -> DISABLED
-    rdi_lp_state_req = RDI_REQ_DISABLED;
-    step_to("disabled", RDI_STS_DISABLED);
-
-    // Physical reset forces RESET regardless of the request.
-    rdi_lp_state_req = RDI_REQ_ACTIVE;
-    repeat (2) @(posedge lclk);
-    phy_link_reset = 1'b1;
-    @(posedge lclk); #0.1;
-    chk("forced reset", RDI_STS_RESET);
-    phy_link_reset = 1'b0;
-    step_to("active6", RDI_STS_ACTIVE);
-
-    // Stall handshake 8.3.1: ack tracks the request.
-    stall_req = 1'b1;
-    @(posedge lclk); #0.1;
-    if (!stall_ack) begin
-      $display("FAIL ut_rdi_sm: stall_ack did not follow stall_req");
+    if (!rdi_pl_linkerror) begin
+      $display("FAIL ut_rdi_sm: linkerror not reported");
       errors = errors + 1;
     end
+    // An ACTIVE request may not clear LinkError.
+    rdi_lp_state_req = RDI_REQ_ACTIVE;
+    hold_to("linkerror holds", RDI_STS_LINKERROR, 4);
+
+    phy_train_error  = 1'b0;
+    rdi_lp_state_req = RDI_REQ_LINKRESET;
+    step_to("recover", RDI_STS_LINKRESET);
+    phy_link_trained      = 1'b0;
+    phy_active_entry_done = 1'b0;
+    phy_link_reset        = 1'b1;
+    @(posedge lclk); #0.1;
+    chk("recover reset", RDI_STS_RESET);
+    phy_link_reset = 1'b0;
+    phy_link_trained      = 1'b1;
+    phy_active_entry_done = 1'b1;
+    rdi_lp_state_req      = RDI_REQ_ACTIVE;
+    step_to("active5", RDI_STS_ACTIVE);
+
+    // =======================================================================
+    // DISABLED holds until the LTSM RESET result (PLAN.md Phase D)
+    // =======================================================================
+    rdi_lp_state_req = RDI_REQ_DISABLED;
+    step_to("disabled", RDI_STS_DISABLED);
+    rdi_lp_state_req = RDI_REQ_ACTIVE;
+    hold_to("disabled held", RDI_STS_DISABLED, 6);
+
+    phy_link_trained      = 1'b0;
+    phy_active_entry_done = 1'b0;
+    phy_link_reset        = 1'b1;
+    @(posedge lclk); #0.1;
+    chk("disabled to reset", RDI_STS_RESET);
+    phy_link_reset = 1'b0;
+    hold_to("reset after disabled", RDI_STS_RESET, 2);
+
+    phy_link_trained      = 1'b1;
+    phy_active_entry_done = 1'b1;
+    step_to("active6", RDI_STS_ACTIVE);
+
+    // =======================================================================
+    // Registered four-phase stall handshake (spec 8.3.1, PLAN.md Phase D)
+    // =======================================================================
+    // Phase 1: the local request is asserted, the adapter has not yet
+    // acknowledged, so stall_ack must stay low. This proves the path is
+    // registered and that rdi_lp_stallack is consumed.
+    stall_req = 1'b1;
+    @(posedge lclk); #0.1;
+    if (stall_ack) begin
+      $display("FAIL ut_rdi_sm: stall_ack high before lp_stallack");
+      errors = errors + 1;
+    end
+
+    // Phase 2: the adapter acknowledges; stall_ack registers high one cycle
+    // later and the data path must stay quiesced.
+    rdi_lp_stallack = 1'b1;
+    @(posedge lclk); #0.1;
+    if (!stall_ack) begin
+      $display("FAIL ut_rdi_sm: stall_ack did not register lp_stallack");
+      errors = errors + 1;
+    end
+
+    // Phase 3: the requester releases the stall; the window stays open until
+    // the adapter drops its acknowledgement.
+    stall_req = 1'b0;
+    @(posedge lclk); #0.1;
+    if (!stall_ack) begin
+      $display("FAIL ut_rdi_sm: stall window closed before lp_stallack fell");
+      errors = errors + 1;
+    end
+
+    // Phase 4: the acknowledgement falls and the handshake completes.
+    rdi_lp_stallack = 1'b0;
+    @(posedge lclk); #0.1;
+    if (stall_ack) begin
+      $display("FAIL ut_rdi_sm: stall_ack stuck high after phase 4");
+      errors = errors + 1;
+    end
+
+    // A request that disappears before the acknowledgement aborts cleanly.
+    stall_req = 1'b1;
+    @(posedge lclk); #0.1;
     stall_req = 1'b0;
     @(posedge lclk); #0.1;
     if (stall_ack) begin
-      $display("FAIL ut_rdi_sm: stall_ack stuck high");
+      $display("FAIL ut_rdi_sm: aborted stall opened the window");
       errors = errors + 1;
     end
 
@@ -326,6 +503,27 @@ module ut_rdi_sm;
     if (!rdi_pl_inband_pres) begin
       $display("FAIL ut_rdi_sm: inband_pres not forwarded");
       errors = errors + 1;
+    end
+
+    // Phase F: export unit evidence JSON upon clean zero-error completion.
+    // Spec ref: UCIe 1.0 Section 8.1.5, Section 8.1.7, Table 114, and
+    // PLAN.md Section 15.9 Phase F.
+    if (errors == 0) begin
+      integer fd;
+      fd = $fopen("logs/rdi_sm_evidence.json", "w");
+      if (fd != 0) begin
+        $fwrite(fd, "{\n");
+        $fwrite(fd, "  \"pmnak\": 1,\n");
+        $fwrite(fd, "  \"linkreset\": 1,\n");
+        $fwrite(fd, "  \"disabled\": 1,\n");
+        $fwrite(fd, "  \"unsupported_pm_retrain_reject\": 1,\n");
+        $fwrite(fd, "  \"rdi_pmnak\": 1,\n");
+        $fwrite(fd, "  \"rdi_linkreset\": 1,\n");
+        $fwrite(fd, "  \"rdi_disabled\": 1,\n");
+        $fwrite(fd, "  \"rdi_unsupported_pm_retrain_reject\": 1\n");
+        $fwrite(fd, "}\n");
+        $fclose(fd);
+      end
     end
 
     if (errors == 0) $display("TEST PASSED ut_rdi_sm");

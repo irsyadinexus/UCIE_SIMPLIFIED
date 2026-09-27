@@ -11,7 +11,8 @@
 // Revision history
 // ----------------
 //   v0.0.1  2026-09-24  Add direct SBINIT waveform and event-mailbox checks.
-// ============================================================================
+//   v0.0.2  2026-09-25  Connect the Phase D private Adapter Start input with
+//                       a zero tie-off. Preserve this direct SBINIT proof.
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
@@ -46,6 +47,7 @@ module ut_sbinit;
     .sbclk(sbclk),
     .sbreset_n(sbreset_n),
     .start_link_train(1'b0),
+    .adapter_start_link_train(1'b0),
     .rdi_lp_state_req(4'h0),
     .rdi_lp_stallack(1'b0),
     .rdi_pl_state_sts(),

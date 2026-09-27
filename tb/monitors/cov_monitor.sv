@@ -53,6 +53,24 @@
 //      Spec ref: Section 4.5 - Link Initialization and Training (events),
 //                Section 8.1.5 - RDI State Status Machine (link_active).
 //
+//   5. Phase F functional event counters – Explicit event counters for the
+//      Phase F coverage model covering:
+//        - MBINIT.PARAM request and response roles (Section 4.5.3.3.1, Table 56)
+//        - Phase B training and Phase C management transaction classes
+//          (Section 4.5.3, Table 53, Table 56; PLAN.md Section 15.3)
+//        - Transmit priority arbitration (Section 6.1.3; PLAN.md Section 15.3)
+//        - Fatal causes and triggers (Section 4.5.3.8; PLAN.md Section 15.4)
+//        - TRAINERROR state and entry exchange (Section 4.5.3.8)
+//        - LinkReset recovery exchange and dwell (Section 4.5.3.1, 8.1.5, 8.3.2.8)
+//        - Disabled recovery exchange and dwell (Section 4.5.3.1, 8.1.5)
+//        - PMNAK status on unsupported PM requests (Section 8.1.5, Table 114)
+//        - Active Entry sequence completion (Section 8.1.6; PLAN.md Section 15.4)
+//        - Pre-Active user data blocking verification (Section 8.1.6; PLAN.md 15.6)
+//        - Active data scrambling and descrambling (Section 4.4.1; PLAN.md 15.6)
+//        - Mainband framing boundary fault detection (Section 4.1.2; PLAN.md 15.6)
+//      Each event uses robust one-shot / edge-detection sampling on posedge lclk
+//      so verified functional behaviors record non-zero counts without
+//      inflating denominator semantics into multi-cycle dwell times.
 // -------------------------------------------------------------------------
 // JSON export
 // -------------------------------------------------------------------------
@@ -102,6 +120,19 @@
 //     raw_mode_adv              – Raw Mode bit set in advertised caps.
 //     crc_off_adv               – No-CRC advertisement observed.
 //
+//   Phase F event observables:
+//     param_roles               – PARAM request and response roles exercised.
+//     transaction_classes       – Phase B training and Phase C management seen.
+//     arbitration               – Transmit priority arbitration observed.
+//     fatal_causes              – Fatal error trigger event observed.
+//     trainerror                – TRAINERROR state or exchange observed.
+//     linkreset                 – LinkReset recovery exchange observed.
+//     disabled                  – Disabled recovery exchange observed.
+//     pmnak                     – PMNAK status observed upon unsupported PM req.
+//     active_entry              – Active Entry sequence completion observed.
+//     pre_active_block          – Pre-Active user-data blocking verified.
+//     scrambling                – Active user-data scrambler/descrambler active.
+//     framing_fault             – Mainband framing boundary fault observed.
 // -------------------------------------------------------------------------
 // Block diagram – signal tapping
 // -------------------------------------------------------------------------
@@ -135,6 +166,18 @@
 //                   |  c_raw_transfer_fwd/rev     |
 //                   |  c_raw_mode_adv             |
 //                   |  c_crc_off_adv              |
+//                   |  c_param_roles              |
+//                   |  c_transaction_classes      |
+//                   |  c_arbitration              |
+//                   |  c_fatal_causes             |
+//                   |  c_trainerror               |
+//                   |  c_linkreset                |
+//                   |  c_disabled                 |
+//                   |  c_pmnak                    |
+//                   |  c_active_entry             |
+//                   |  c_pre_active_block         |
+//                   |  c_scrambling               |
+//                   |  c_framing_fault            |
 //                   +----------------------------+
 //                               |
 //                               v
@@ -166,7 +209,14 @@
 //                                 sampling text from the port documentation.
 //   0.0.7 2026-09-24  -           Add per-die SBINIT phase/order and received
 //                                 message-subcode evidence.
-//
+//   0.0.8 2026-09-25  -           Phase F: add explicit event inputs and
+//                                 counters for Phase F contract keys
+//                                 (param_roles, transaction_classes, arbitration,
+//                                 fatal_causes, trainerror, linkreset, disabled,
+//                                 pmnak, active_entry, pre_active_block,
+//                                 scrambling, framing_fault); implement robust
+//                                 one-shot lclk sampling and export all keys
+//                                 to coverage JSON.
 // ============================================================================
 `ifndef CovMonitor_SV
 `define CovMonitor_SV
@@ -208,7 +258,21 @@ module cov_monitor #(
   input logic        width_degrade, // lnk_cfg observed x8
   input logic        lane_reversal, // byte reversal observed on the mapper
   input logic        raw_mode_adv,  // Raw_Mode bit seen in advertised caps
-  input logic        crc_off_adv    // no-CRC advertisement seen
+  input logic        crc_off_adv,   // no-CRC advertisement seen
+
+  // Phase F event observables (spec 4.4.1, 4.5.3, 6.1.3, 8.1.5, 8.1.6; PLAN.md 15.7, 15.9)
+  input logic        param_roles,         // PARAM request and response roles seen
+  input logic        transaction_classes, // Phase B and Phase C transaction classes seen
+  input logic        arbitration,         // Response-over-request arbitration seen
+  input logic        fatal_causes,        // Fatal error trigger event seen
+  input logic        trainerror,          // TRAINERROR state/exchange seen
+  input logic        linkreset,           // LinkReset recovery exchange seen
+  input logic        disabled,            // Disabled recovery exchange seen
+  input logic        pmnak,               // PMNAK status/response seen
+  input logic        active_entry,        // Active Entry handshake completion seen
+  input logic        pre_active_block,    // Pre-Active user-data blocking verified
+  input logic        scrambling,          // Active user-data scrambling/descrambling seen
+  input logic        framing_fault        // Mainband framing boundary fault seen
 );
 
   // ------------------------------------------------------- counters
@@ -231,7 +295,31 @@ module cov_monitor #(
   logic [31:0] c_raw_transfer_rev;
   logic [31:0] c_raw_mode_adv;
   logic [31:0] c_crc_off_adv;
+  logic [31:0] c_param_roles;
+  logic [31:0] c_transaction_classes;
+  logic [31:0] c_arbitration;
+  logic [31:0] c_fatal_causes;
+  logic [31:0] c_trainerror;
+  logic [31:0] c_linkreset;
+  logic [31:0] c_disabled;
+  logic [31:0] c_pmnak;
+  logic [31:0] c_active_entry;
+  logic [31:0] c_pre_active_block;
+  logic [31:0] c_scrambling;
+  logic [31:0] c_framing_fault;
 
+  logic        param_roles_q;
+  logic        transaction_classes_q;
+  logic        arbitration_q;
+  logic        fatal_causes_q;
+  logic        trainerror_q;
+  logic        linkreset_q;
+  logic        disabled_q;
+  logic        pmnak_q;
+  logic        active_entry_q;
+  logic        pre_active_block_q;
+  logic        scrambling_q;
+  logic        framing_fault_q;
   initial begin
     ltsm_state_hits      = '0;
     sbinit_phase_hits_0  = '0;
@@ -255,6 +343,30 @@ module cov_monitor #(
     c_raw_transfer_rev       = 32'd0;
     c_raw_mode_adv           = 32'd0;
     c_crc_off_adv            = 32'd0;
+    c_param_roles            = 32'd0;
+    c_transaction_classes    = 32'd0;
+    c_arbitration            = 32'd0;
+    c_fatal_causes           = 32'd0;
+    c_trainerror             = 32'd0;
+    c_linkreset              = 32'd0;
+    c_disabled               = 32'd0;
+    c_pmnak                  = 32'd0;
+    c_active_entry           = 32'd0;
+    c_pre_active_block       = 32'd0;
+    c_scrambling             = 32'd0;
+    c_framing_fault          = 32'd0;
+    param_roles_q            = 1'b0;
+    transaction_classes_q    = 1'b0;
+    arbitration_q            = 1'b0;
+    fatal_causes_q           = 1'b0;
+    trainerror_q             = 1'b0;
+    linkreset_q              = 1'b0;
+    disabled_q               = 1'b0;
+    pmnak_q                  = 1'b0;
+    active_entry_q           = 1'b0;
+    pre_active_block_q       = 1'b0;
+    scrambling_q             = 1'b0;
+    framing_fault_q          = 1'b0;
   end
 
 // -----------------------------------------------------------------------
@@ -383,6 +495,62 @@ module cov_monitor #(
     if (crc_off_adv)       c_crc_off_adv            <= c_crc_off_adv           + 1'b1;
   end
 
+// -----------------------------------------------------------------------
+// Phase F Functional Event Coverage Sampling
+// -----------------------------------------------------------------------
+// This always block runs on the positive edge of lclk (500 MHz) and samples
+// the Phase F event observables using robust one-shot (rising-edge) behavior.
+// Edge detection prevents level-sensitive signals (such as sticky recovery
+// evidence or persistent holds) from incrementing continuously on every
+// clock cycle, ensuring each verified functional event registers as a
+// non-zero count without inflating denominator semantics.
+//
+// Spec ref: UCIe 1.0 Section 4.4.1 (Scrambling), Section 4.5.3 (LTSM),
+//           Section 4.5.3.3.1 (MBINIT.PARAM), Section 4.5.3.8 (TRAINERROR),
+//           Section 6.1.3 (Arbitration), Section 8.1.5 (RDI States & PMNAK),
+//           Section 8.1.6 (Active Entry & Gating);
+//           PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9 Phase F.
+// -----------------------------------------------------------------------
+  always @(posedge lclk) begin
+    param_roles_q         <= param_roles;
+    transaction_classes_q <= transaction_classes;
+    arbitration_q         <= arbitration;
+    fatal_causes_q        <= fatal_causes;
+    trainerror_q          <= trainerror;
+    linkreset_q           <= linkreset;
+    disabled_q            <= disabled;
+    pmnak_q               <= pmnak;
+    active_entry_q        <= active_entry;
+    pre_active_block_q    <= pre_active_block;
+    scrambling_q          <= scrambling;
+    framing_fault_q       <= framing_fault;
+
+    if (param_roles && !param_roles_q)
+      c_param_roles <= c_param_roles + 1'b1;
+    if (transaction_classes && !transaction_classes_q)
+      c_transaction_classes <= c_transaction_classes + 1'b1;
+    if (arbitration && !arbitration_q)
+      c_arbitration <= c_arbitration + 1'b1;
+    if (fatal_causes && !fatal_causes_q)
+      c_fatal_causes <= c_fatal_causes + 1'b1;
+    if (trainerror && !trainerror_q)
+      c_trainerror <= c_trainerror + 1'b1;
+    if (linkreset && !linkreset_q)
+      c_linkreset <= c_linkreset + 1'b1;
+    if (disabled && !disabled_q)
+      c_disabled <= c_disabled + 1'b1;
+    if (pmnak && !pmnak_q)
+      c_pmnak <= c_pmnak + 1'b1;
+    if (active_entry && !active_entry_q)
+      c_active_entry <= c_active_entry + 1'b1;
+    if (pre_active_block && !pre_active_block_q)
+      c_pre_active_block <= c_pre_active_block + 1'b1;
+    if (scrambling && !scrambling_q)
+      c_scrambling <= c_scrambling + 1'b1;
+    if (framing_fault && !framing_fault_q)
+      c_framing_fault <= c_framing_fault + 1'b1;
+  end
+
   // ------------------------------------------------------- JSON export
   // Written once, when the testbench decides to stop.
   task export_json;
@@ -455,7 +623,31 @@ module cov_monitor #(
       $fwrite(fd, "  \"raw_transfer_fwd\": %0d,\n", c_raw_transfer_fwd);
       $fwrite(fd, "  \"raw_transfer_rev\": %0d,\n", c_raw_transfer_rev);
       $fwrite(fd, "  \"raw_mode_adv\": %0d,\n", c_raw_mode_adv);
-      $fwrite(fd, "  \"crc_off_adv\": %0d\n", c_crc_off_adv);
+      $fwrite(fd, "  \"crc_off_adv\": %0d,\n", c_crc_off_adv);
+      $fwrite(fd, "  \"param_roles\": %0d,\n", c_param_roles);
+      $fwrite(fd, "  \"param_roles_done\": %0d,\n", c_param_roles);
+      $fwrite(fd, "  \"transaction_classes\": %0d,\n", c_transaction_classes);
+      $fwrite(fd, "  \"transaction_classes_done\": %0d,\n", c_transaction_classes);
+      $fwrite(fd, "  \"arbitration\": %0d,\n", c_arbitration);
+      $fwrite(fd, "  \"arbitration_done\": %0d,\n", c_arbitration);
+      $fwrite(fd, "  \"fatal_causes\": %0d,\n", c_fatal_causes);
+      $fwrite(fd, "  \"fatal_causes_done\": %0d,\n", c_fatal_causes);
+      $fwrite(fd, "  \"trainerror\": %0d,\n", c_trainerror);
+      $fwrite(fd, "  \"trainerror_done\": %0d,\n", c_trainerror);
+      $fwrite(fd, "  \"linkreset\": %0d,\n", c_linkreset);
+      $fwrite(fd, "  \"linkreset_done\": %0d,\n", c_linkreset);
+      $fwrite(fd, "  \"disabled\": %0d,\n", c_disabled);
+      $fwrite(fd, "  \"disabled_done\": %0d,\n", c_disabled);
+      $fwrite(fd, "  \"pmnak\": %0d,\n", c_pmnak);
+      $fwrite(fd, "  \"pmnak_done\": %0d,\n", c_pmnak);
+      $fwrite(fd, "  \"active_entry\": %0d,\n", c_active_entry);
+      $fwrite(fd, "  \"active_entry_done\": %0d,\n", c_active_entry);
+      $fwrite(fd, "  \"pre_active_block\": %0d,\n", c_pre_active_block);
+      $fwrite(fd, "  \"pre_active_block_done\": %0d,\n", c_pre_active_block);
+      $fwrite(fd, "  \"scrambling\": %0d,\n", c_scrambling);
+      $fwrite(fd, "  \"scrambling_done\": %0d,\n", c_scrambling);
+      $fwrite(fd, "  \"framing_fault\": %0d,\n", c_framing_fault);
+      $fwrite(fd, "  \"framing_fault_done\": %0d\n", c_framing_fault);
       $fwrite(fd, "}\n");
       $fclose(fd);
     end

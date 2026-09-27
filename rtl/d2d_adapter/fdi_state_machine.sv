@@ -18,10 +18,13 @@
 //   from the Logical PHY (below, Table 114). Its responsibilities:
 //
 //     1. Track the FDI link state in a registered state variable (fdi_q)
-//        that mirrors the RDI state transitions reported by rdi_state_sts.
-//        The FDI state space reuses the same 4-bit encoding as the RDI:
-//          F_RESET(0), F_ACTIVE(1), F_PMNAK(3), F_L1(4), F_L2(8),
-//          F_LINKRESET(9), F_LINKERROR(A), F_RETRAIN(B), F_DISABLED(C).
+//        that mirrors the supported RDI state transitions reported by
+//        rdi_state_sts. The FDI state space reuses the same 4-bit encoding
+//        as the RDI:
+//          F_RESET(0), F_ACTIVE(1), F_PMNAK(3),
+//          F_LINKRESET(9), F_LINKERROR(A), F_DISABLED(C).
+//        The unsupported encodings L1(4), L2(8), and RETRAIN(B) are not part
+//        of the FDI state space, because this build never publishes them.
 //
 //     2. Implement the four-way Active handshake (spec 8.2.6):
 //        - The Protocol Layer asserts lp_state_req == FDI_REQ_ACTIVE.
@@ -32,15 +35,28 @@
 //        NOT gated on F_ACTIVE, to avoid a deadlock where the Protocol
 //        Layer waits for pl_rx_active_req before asserting lp_rx_active_sts.
 //
-//     3. Forward the Protocol Layer's state request to the RDI via
-//        fdi_state_req_out, after applying the Active gating. Non-Active
-//        requests (LinkReset, Retrain, L1, L2, Disabled) pass through
-//        unconditionally.
+//     3. Forward only the supported Protocol Layer state requests to the RDI
+//        on fdi_state_req_out / fdi_state_req_vld:
+//          - Active    : the request level is forwarded when requested. Its
+//                        valid qualifier asserts after lp_rx_active_sts.
+//          - LinkReset : forwarded unconditionally.
+//          - Disabled  : forwarded unconditionally.
+//          - L1, L2, and Retrain are suppressed (RDI_REQ_NOP, vld low), so
+//            an unsupported request cannot move the RDI or the LTSM.
 //
-//     4. Drive all FDI status and indication outputs to the Protocol Layer:
+//     4. Hold the current supported state while the RDI reports an
+//        unsupported status. RETRAIN is the case that matters: the FDI
+//        keeps publishing its last supported state for the whole report.
+//
+//     5. Drive all FDI status and indication outputs to the Protocol Layer:
 //        pl_state_sts, pl_inband_pres, pl_error, pl_cerror, pl_nferror,
 //        pl_trainerror, pl_phyinrecenter, pl_protocol, pl_protocol_flitfmt,
 //        pl_rx_active_req, pl_stream.
+//
+//   Active handshake ownership:
+//     The FDI observes the RDI status after the PHY LTSM completes its
+//     LinkMgmt.RDI Active exchange. The adapter_active_req port remains for
+//     public interface stability, but it does not affect FDI policy.
 //
 //   This module operates in Streaming-only mode:
 //     pl_protocol       = 111b (PROTO_STREAMING)
@@ -56,30 +72,34 @@
 //   F_RESET        | LINKERROR                        | F_LINKERROR
 //   F_RESET        | DISABLED                         | F_DISABLED
 //   F_RESET        | ACTIVE && lp_rx_active_sts       | F_ACTIVE
+//   F_RESET        | anything else                    | F_RESET (hold)
+//   F_ACTIVE       | RESET                            | F_RESET
 //   F_ACTIVE       | PMNAK                            | F_PMNAK
 //   F_ACTIVE       | LINKRESET                        | F_LINKRESET
-//   F_ACTIVE       | RETRAIN                          | F_RETRAIN
-//   F_ACTIVE       | L1                               | F_L1
-//   F_ACTIVE       | L2                               | F_L2
 //   F_ACTIVE       | LINKERROR                        | F_LINKERROR
 //   F_ACTIVE       | DISABLED                         | F_DISABLED
-//   F_ACTIVE       | != ACTIVE (catch-all)            | F_RESET
-//   F_PMNAK        | ACTIVE                           | F_ACTIVE
-//   F_PMNAK        | LINKRESET / LINKERROR / DISABLED | respective
-//   F_L1           | RETRAIN / LINKRESET / ACTIVE /   | respective
-//                  | LINKERROR                        |
-//   F_L2           | RETRAIN / LINKRESET / LINKERROR  | respective
+//   F_ACTIVE       | ACTIVE / RETRAIN / L1 / L2       | F_ACTIVE (hold)
+//   F_PMNAK        | RESET / ACTIVE / LINKRESET /     | respective
+//                  | LINKERROR / DISABLED             |
+//   F_PMNAK        | anything else                    | F_PMNAK (hold)
 //   F_LINKRESET    | RESET / ACTIVE / LINKERROR       | respective
-//   F_RETRAIN      | RESET / ACTIVE / LINKERROR       | respective
+//   F_LINKRESET    | anything else                    | hold
 //   F_LINKERROR    | RESET / LINKRESET                | respective
+//   F_LINKERROR    | anything else                    | hold
 //   F_DISABLED     | RESET / LINKRESET                | respective
+//   F_DISABLED     | anything else                    | hold
+//
+//   RETRAIN, L1, and L2 are absent from the table on purpose. The RDI of
+//   this build never publishes them, and the FDI never publishes them
+//   either: a report of an unsupported status leaves the current supported
+//   state unchanged. That hold is the approved Retrain policy.
 //
 // PORTS
 //   See Table 115 for the FDI port definitions. RDI-side inputs are named
 //   rdi_* and carry the Logical PHY's status. Adapter-internal ports
 //   (adapter_active_req, adapter_state_req_vld, adapter_state_req,
 //   fdi_active_req, fdi_state_req_out, fdi_state_req_vld) connect to
-//   d2d_adapter and adapter_sb_if for the Active handshake coordination.
+//   d2d_adapter. adapter_active_req is intentionally policy-inert.
 //
 // CLOCK / RESET
 //   lclk      - Main link clock (500 MHz).
@@ -93,6 +113,17 @@
 //   v0.0.4  2026-09-23  Documentation: correct the Rx_active_req/Sts and FDI
 //                        Bring up flow citations in the header. Normalize the
 //                        Section 8.2 citation for pl_inband_pres.
+//   v0.0.5  2026-09-25  Phase D policy: forward only Active, LinkReset, and
+//                        Disabled requests; suppress L1, L2, and Retrain.
+//                        Hold the supported state for an unsupported RDI
+//                        status and drop the unreachable L1/L2/Retrain
+//                        states. Remove the stale peer-Active gate from the
+//                        Active request path; fdi_active_req now reports an
+//                        Active request only. F_PMNAK now mirrors RDI RESET
+//                        so the FDI cannot stay stuck in PMNAK.
+//   v0.0.6  2026-09-25  Keep the public adapter_active_req port unchanged
+//                        while documenting and enforcing its policy-inert
+//                        Phase D behavior.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -130,8 +161,9 @@ module fdi_state_machine (
   input  logic        rdi_cerror,
   input  logic        rdi_nferror,
 
-  // Adapter-internal sideband link management (to/from adapter_sb_if)
-  input  logic        adapter_active_req,     // partner Adapter wants Active
+  // Peer-Active compatibility input. Phase D removes it from policy logic,
+  // but the public module interface remains unchanged per PLAN.md §15.1.
+  input  logic        adapter_active_req,
   input  logic        adapter_state_req_vld,
   input  logic [3:0]  adapter_state_req,
   output logic        fdi_active_req,
@@ -148,16 +180,17 @@ module fdi_state_machine (
   // a simple equality comparison between the FDI and RDI states is meaningful.
   // Each state is a 4-bit value matching the pl_state_sts / lp_state_req
   // encoding defined in the UCIe 1.0 specification.
+  //
+  // The unsupported encodings L1 (4'h4), L2 (4'h8), and RETRAIN (4'hB) are
+  // deliberately absent: this build's RDI never reports them and the FDI must
+  // never publish them, so they are not part of the state space.
   // --------------------------------------------------------------------------
   typedef enum logic [3:0] {
     F_RESET    = 4'h0,
     F_ACTIVE   = 4'h1,
     F_PMNAK    = 4'h3,
-    F_L1       = 4'h4,
-    F_L2       = 4'h8,
     F_LINKRESET= 4'h9,
     F_LINKERROR= 4'hA,
-    F_RETRAIN  = 4'hB,
     F_DISABLED = 4'hC
   } fdi_state_t;
 
@@ -200,9 +233,11 @@ module fdi_state_machine (
   // agreement.
   //
   // This registered flag is used in the outputs always_comb to gate the
-  // fdi_state_req_vld for Active: the Active request is only forwarded to
-  // the RDI when both local_active_req (this latch) AND adapter_active_req
-  // (partner's request, from adapter_sb_if) are asserted.
+  // fdi_state_req_vld for Active: the Active request is only presented as
+  // valid once the local Protocol Layer has completed its half of the four-
+  // way handshake. The partner Adapter's Active request is NOT part of this
+  // decision; that agreement is owned by the LTSM and observed through
+  // rdi_state_sts.
   //
   // Spec ref: UCIe 1.0, Section 8.1.6 step 6 (four-way Active handshake).
   // -------------------------------------------------------------------------
@@ -254,11 +289,20 @@ module fdi_state_machine (
   //     as the first arm of the four-way handshake and NOT gated on F_ACTIVE
   //     to avoid deadlock.
   //
-  // State-request forwarding: FDI_REQ_ACTIVE sets fdi_active_req and forwards
-  // only when local_active_req AND adapter_active_req are both asserted
-  // (spec 8.1.6 step 6); LinkReset/Retrain/Disabled/L1/L2 pass straight
-  // through with vld=1; default drives RDI_REQ_NOP.
-  // Spec ref: 8.2 (FDI), 8.2.6 (Rx Active), 8.1.6 step 6, Table 115.
+  // State-request forwarding: only Active, LinkReset, and Disabled reach the
+  // RDI, and every other request leaves RDI_REQ_NOP with vld low.
+  //   - Active    : request level presented as soon as the Protocol Layer
+  //                 asks, with fdi_state_req_vld qualified by local_active_req
+  //                 (the local half of the four-way handshake). The request
+  //                 level itself is NOT gated by the validity flag, because
+  //                 the RDI and the LTSM observe that level to start training.
+  //                 The partner Adapter's Active request is not consulted
+  //                 here: that policy lives in the LTSM.
+  //   - LinkReset : forwarded with vld=1.
+  //   - Disabled  : forwarded with vld=1.
+  //   - L1, L2, Retrain, NOP: suppressed (RDI_REQ_NOP, vld=0).
+  // fdi_active_req reports an Active request from the Protocol Layer only.
+  // Spec ref: 8.2 (FDI), 8.2.6 (Rx Active), Table 115.
   // -------------------------------------------------------------------------
   always_comb begin
     pl_protocol        = PROTO_STREAMING;
@@ -275,25 +319,26 @@ module fdi_state_machine (
 
     // Request forwarding to the RDI state machine.
     fdi_active_req     = 1'b0;
-    fdi_state_req_out  = lp_state_req;
+    fdi_state_req_out  = RDI_REQ_NOP;
     fdi_state_req_vld  = 1'b0;
 
     case (lp_state_req)
       FDI_REQ_ACTIVE: begin
-        // Active requires the local Protocol Layer and the partner Adapter both
-        // to have requested it (spec 8.1.6 step 6, FDI mirror).
+        // Forward the Active request level immediately. Qualify its valid
+        // pulse after the local Rx-active handshake (spec 8.2.6).
         fdi_active_req    = 1'b1;
         fdi_state_req_out = FDI_REQ_ACTIVE;
-        fdi_state_req_vld = local_active_req && adapter_active_req;
+        fdi_state_req_vld = local_active_req;
       end
-      FDI_REQ_LINKRESET, FDI_REQ_RETRAIN, FDI_REQ_DISABLED,
-      FDI_REQ_L1, FDI_REQ_L2: begin
-        fdi_active_req    = 1'b1;
+      FDI_REQ_LINKRESET, FDI_REQ_DISABLED: begin
         fdi_state_req_out = lp_state_req;
         fdi_state_req_vld = 1'b1;
       end
       default: begin
+        // FDI_REQ_L1, FDI_REQ_L2, FDI_REQ_RETRAIN, and FDI_REQ_NOP are
+        // suppressed: the RDI keeps seeing no request and no valid request.
         fdi_state_req_out = RDI_REQ_NOP;
+        fdi_state_req_vld = 1'b0;
       end
     endcase
   end
@@ -302,17 +347,17 @@ module fdi_state_machine (
   // always_comb: FDI State Transition Logic
   //
   // Computes next FDI state (fdi_d) from fdi_q and rdi_state_sts, per the
-  // spec 8.2 FDI LSM (Streaming-only simplification):
+  // spec 8.2 FDI LSM (Streaming-only simplification). Only the supported RDI
+  // statuses are mirrored. An unsupported status (RETRAIN, L1, L2) or an
+  // undefined encoding leaves the current state unchanged, so the FDI never
+  // publishes a state that the RDI of this build cannot report:
   //   F_RESET    -> Active needs RDI Active AND lp_rx_active_sts (the second
   //                 arm of the four-way handshake); LinkError/Disabled win.
-  //   F_ACTIVE   -> mirrors any RDI change; PMNAK while the partner has not
-  //                 finished its own Active request; unknown -> RESET.
-  //   F_PMNAK    -> Active when RDI Active; else LinkReset/LinkError/Disabled.
-  //   F_L1/F_L2  -> L1 exits to Retrain/LinkReset/Active/LinkError; L2 lacks a
-  //                 direct return to Active (spec 8.2 low-power behaviour).
+  //   F_ACTIVE   -> mirrors PMNAK, LinkReset, LinkError, Disabled, and Reset;
+  //                 a RETRAIN report holds F_ACTIVE (approved Retrain policy).
+  //   F_PMNAK    -> Active when the RDI accepts a retry, Reset when the link
+  //                 is torn down; LinkReset/LinkError/Disabled mirror through.
   //   F_LINKRESET-> Reset / Active / LinkError.
-  //   F_RETRAIN  -> re-enters bring-up: LTSM passes Reset to SBINIT, reports
-  //                 Active once training completes.
   //   F_LINKERROR-> only Reset (Exit-Link-Error) or LinkReset.
   //   F_DISABLED -> only Reset or LinkReset.
   //   default    -> F_RESET (defensive).
@@ -321,8 +366,8 @@ module fdi_state_machine (
   always_comb begin
     case (fdi_q)
       F_RESET: begin
-        // The four-way handshake: adapter offers Active, Protocol Layer answers
-        // with lp_rx_active_sts, then FDI reports Active.
+        // RDI reports Active, the Protocol Layer answers with
+        // lp_rx_active_sts, then FDI reports Active.
         if (rdi_state_sts == RDI_STS_LINKERROR)  fdi_d = F_LINKERROR;
         else if (rdi_state_sts == RDI_STS_DISABLED) fdi_d = F_DISABLED;
         else if (rdi_state_sts == RDI_STS_ACTIVE && lp_rx_active_sts)
@@ -330,63 +375,42 @@ module fdi_state_machine (
         else                                    fdi_d = F_RESET;
       end
       F_ACTIVE: begin
-        // Active.PMNAK is reported while the partner has not completed its own
-        // Active request.
-        if (rdi_state_sts == RDI_STS_PMNAK)      fdi_d = F_PMNAK;
+        // PMNAK reports that the PHY NAKed a power-management request. The
+        // final else also covers an ACTIVE report and, per the approved
+        // Retrain hold, the unsupported RETRAIN/L1/L2 reports.
+        if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
+        else if (rdi_state_sts == RDI_STS_PMNAK)     fdi_d = F_PMNAK;
         else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
-        else if (rdi_state_sts == RDI_STS_RETRAIN)   fdi_d = F_RETRAIN;
-        else if (rdi_state_sts == RDI_STS_L1)        fdi_d = F_L1;
-        else if (rdi_state_sts == RDI_STS_L2)        fdi_d = F_L2;
         else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
         else if (rdi_state_sts == RDI_STS_DISABLED)  fdi_d = F_DISABLED;
-        else if (rdi_state_sts != RDI_STS_ACTIVE)    fdi_d = F_RESET;
-        else                                         fdi_d = F_ACTIVE;
+        else                                         fdi_d = fdi_q;
       end
       F_PMNAK: begin
-        if (rdi_state_sts == RDI_STS_ACTIVE)     fdi_d = F_ACTIVE;
+        // PMNAK is a transient NAK: it ends when the RDI reports Active after
+        // an accepted retry, or Reset when the link is torn down.
+        if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
+        else if (rdi_state_sts == RDI_STS_ACTIVE)    fdi_d = F_ACTIVE;
         else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
         else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
         else if (rdi_state_sts == RDI_STS_DISABLED)  fdi_d = F_DISABLED;
-        else                                     fdi_d = F_PMNAK;
-      end
-      F_L1: begin
-        // L1 exits via Retrain or LinkReset from either side.
-        if (rdi_state_sts == RDI_STS_RETRAIN)    fdi_d = F_RETRAIN;
-        else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
-        else if (rdi_state_sts == RDI_STS_ACTIVE)    fdi_d = F_ACTIVE;
-        else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
-        else                                     fdi_d = F_L1;
-      end
-      F_L2: begin
-        if (rdi_state_sts == RDI_STS_RETRAIN)    fdi_d = F_RETRAIN;
-        else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
-        else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
-        else                                     fdi_d = F_L2;
+        else                                         fdi_d = fdi_q;
       end
       F_LINKRESET: begin
-        if (rdi_state_sts == RDI_STS_RESET)      fdi_d = F_RESET;
-        else if (rdi_state_sts == RDI_STS_ACTIVE) fdi_d = F_ACTIVE;
+        if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
+        else if (rdi_state_sts == RDI_STS_ACTIVE)    fdi_d = F_ACTIVE;
         else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
-        else                                     fdi_d = F_LINKRESET;
-      end
-      F_RETRAIN: begin
-        // Retrain re-enters the bring-up path: the LTSM returns to RESET on the
-        // way back to SBINIT, then reports Active when training completes.
-        if (rdi_state_sts == RDI_STS_RESET)      fdi_d = F_RESET;
-        else if (rdi_state_sts == RDI_STS_ACTIVE) fdi_d = F_ACTIVE;
-        else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
-        else                                     fdi_d = F_RETRAIN;
+        else                                         fdi_d = fdi_q;
       end
       F_LINKERROR: begin
         // LinkError exits only through Reset, per spec 8.1.5 Exit-Link-Error.
-        if (rdi_state_sts == RDI_STS_RESET)      fdi_d = F_RESET;
+        if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
         else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
-        else                                     fdi_d = F_LINKERROR;
+        else                                         fdi_d = fdi_q;
       end
       F_DISABLED: begin
-        if (rdi_state_sts == RDI_STS_RESET)      fdi_d = F_RESET;
+        if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
         else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
-        else                                     fdi_d = F_DISABLED;
+        else                                         fdi_d = fdi_q;
       end
       default: fdi_d = F_RESET;
     endcase

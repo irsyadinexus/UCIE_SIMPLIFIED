@@ -26,7 +26,7 @@
 //     2. TRANSMIT PATH (pl_cfg / pl_cfg_vld):
 //        Serialises a 64-bit tx_hdr into NC-bit-per-UI chunks. tx_ui_q
 //        counts 0-7 during transmission. A 32-UI inter-packet gap
-//        (SB_GAP_UI) is enforced by gap_q, per spec 4.5.x framing rules.
+//        (SB_GAP_UI) is enforced by gap_q, per Chapter 6 sideband framing.
 //
 //     3. CREDIT ACCOUNTING (spec 6.1.3):
 //        - FDI credit loop (crd_fdi_q): credits owed to the local FDI
@@ -37,14 +37,14 @@
 //          Returned by the Cr bit in received completion packets.
 //
 //     4. REDUCED-MODEL MONITOR TIMERS:
-//        - 8 ms message timeout (C_SB_MSG cycles via ucie_timer): reduced-
-//          model response watchdog monitoring crd_remote_q != 0 (spec 6.1).
-//        - 4 ms stall keep-alive (C_STALL cycles via ucie_timer): reduced-
-//          model stall-cadence monitor hook (spec 6.1).
-//     5. LINK MANAGEMENT MESSAGE DECODING:
-//        - LinkMgmt.RDI.Req.Active (MC_LM_RDI_REQ / MS_LM_ACTIVE): sets
-//          adapter_active_req, indicating the partner die wants Active.
-//        - LinkMgmt.RDI.Req.LinkReset/Disable: clears adapter_active_req.
+//        - 8 ms message timeout (C_SB_MSG cycles via ucie_timer): dormant
+//          monitor hook in this reduced endpoint (spec 6.1).
+//        - 4 ms stall keep-alive (C_STALL cycles via ucie_timer): dormant
+//          monitor hook in this reduced endpoint (spec 6.1).
+//     5. LINK MANAGEMENT REQUEST TRANSPORT:
+//        - Preserve CSR decoding and the reduced generic state-request channel.
+//        - Do not own peer Active policy. The PHY LTSM owns the sideband
+//          LinkMgmt.RDI Active exchange and its completion result.
 //
 //     6. CSR ACCESS PATH:
 //        Sideband CfgRd/CfgWr packets addressed to SRCID_ADAPT (dstid =
@@ -69,11 +69,7 @@
 // PORTS
 //   lp_cfg / lp_cfg_vld / lp_cfg_crd  - FDI sideband from Protocol Layer.
 //   pl_cfg / pl_cfg_vld / pl_cfg_crd  - FDI sideband to Protocol Layer.
-//   partner_active_req                - external Active indication (tied to
-//                                       1'b0 at top level; the module itself
-//                                       latches Active from the packet stream).
-//   adapter_active_req                - to fdi_state_machine: partner wants Active.
-//   adapter_state_req_vld/req         - general state request channel (reduced scope).
+//   adapter_state_req_vld/req         - generic state request transport.
 //   csr_wr/rd/addr/wdata/rdata/vld    - CSR access bus to adapter_regfile.
 //   sb_credit_returned                - monitor: credit-return packet received.
 //   sb_stall_sent                     - monitor: stall keep-alive fired.
@@ -97,6 +93,11 @@
 //   v0.0.5  2026-09-23  Documentation: distinguish the local CP mask from
 //                        the Table 52 completion rule and remove the unrelated
 //                        FDI bring-up citation from message decoding.
+//   v0.0.6  2026-09-25  Phase D: remove peer-Active state policy. Keep this
+//                        block as CSR and generic request transport while the
+//                        Logical PHY LTSM owns LinkMgmt.RDI Active policy.
+//   v0.0.7  2026-09-25  Document dormant timer hooks and reduced credit
+//                        accounting after the Phase D policy cutover.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -118,9 +119,7 @@ module adapter_sb_if (
   output logic          pl_cfg_vld,
   output logic          pl_cfg_crd,
 
-  // Link management indication from the partner, decoded by logical_phy.
-  input  logic          partner_active_req,
-  output logic          adapter_active_req,   // to fdi_state_machine
+  // Adapter request transport remains separate from PHY-owned Active policy.
   output logic          adapter_state_req_vld,
   output logic [3:0]    adapter_state_req,
 
@@ -143,17 +142,12 @@ module adapter_sb_if (
   // --------------------------------------------------------------------------
   // Credit Accounting Registers
   // --------------------------------------------------------------------------
-  // Per spec 6.1.3, the sideband credit model uses two independent loops:
+  // Per spec 6.1.3, these registers retain the reduced endpoint credit state.
   //
-  //   crd_fdi_q (2 bits): credits owed to the local FDI (Protocol Layer).
-  //     Replenished by Nop.Crd messages from the remote die that carry
-  //     1-4 credits in MsgInfo[2:0]. Consumed when the adapter accepts
-  //     a sideband packet from the Protocol Layer.
-  //
-  //   crd_remote_q (3 bits): outstanding credits consumed by messages sent
-  //     to the remote die. Capped at SB_CRD_MAX (4) per spec 6.1.3.
-  //     Incremented when the adapter sends a message; decremented when
-  //     the Cr (credit return) bit is set in a received packet.
+  //   crd_fdi_q (2 bits) tracks credits reported by received Nop.Crd packets.
+  //   crd_remote_q (3 bits) tracks received credit-return information.
+  //   The Phase D endpoint does not initiate autonomous credit-consuming
+  //   requests, so these registers do not drive adapter state policy.
   //
   //   crd_return_pending: flag indicating a credit return is queued.
   // --------------------------------------------------------------------------
@@ -181,18 +175,13 @@ module adapter_sb_if (
   logic       stall_timer_expired;
 
   // -------------------------------------------------------------------------
-  // Module Instantiation: ucie_timer - 8 ms Message Timeout
+  // Module Instantiation: ucie_timer - dormant 8 ms monitor
   //
-  // Generic countdown timer parameterised with C_SB_MSG (4,000,000 lclk
-  // cycles at 500 MHz = 8 ms). Starts on msg_timer_start, counts down while
-  // msg_timer_run is high, and asserts msg_timer_expired when the count
-  // reaches zero.
+  // Instantiates the standard timer with C_SB_MSG for the reduced endpoint.
+  // Phase D ties its start and run controls low because the LTSM owns active
+  // sideband request tracking. The timer output remains a dormant monitor hook.
   //
-  // The timer starts whenever there are outstanding remote credits
-  // (crd_remote_q != 0) and no credit-return packet has just arrived.
-  // It runs as long as there are outstanding credits.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1 - Protocol specification (8 ms timeout).
+  // Spec ref: UCIe 1.0 Section 6.1; PLAN.md Sections 15.5 and 15.9.
   // -------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_SB_MSG)) u_msg_timer (
     .clk(lclk), .reset_n(lreset_n),
@@ -201,19 +190,13 @@ module adapter_sb_if (
   );
 
   // -------------------------------------------------------------------------
-  // Module Instantiation: ucie_timer - 4 ms Stall Keep-Alive
+  // Module Instantiation: ucie_timer - dormant 4 ms monitor
   //
-  // Generic countdown timer parameterised with C_STALL (2,000,000 lclk
-  // cycles at 500 MHz = 4 ms). Starts on stall_timer_start (which is
-  // triggered by msg_timer_expired), counts down while stall_timer_run
-  // is high, and asserts stall_timer_expired when the count reaches zero.
+  // Instantiates the standard timer with C_STALL for the reduced endpoint.
+  // Phase D ties its start and run controls low because this block does not
+  // generate autonomous stall keep-alive packets.
   //
-  // The stall keep-alive ensures the remote partner does not interpret a
-  // long silence as a link error while the adapter is waiting for a
-  // delayed response.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1 - Protocol specification (4 ms Stall
-  //           response interval).
+  // Spec ref: UCIe 1.0 Section 6.1; PLAN.md Sections 15.5 and 15.9.
   // -------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_STALL)) u_stall_timer (
     .clk(lclk), .reset_n(lreset_n),
@@ -469,42 +452,6 @@ module adapter_sb_if (
   assign sb_credit_returned = rx_pkt_vld && (rx_cr ||
                             (rx_opcode == SB_OP_MSG_NODATA && rx_msgcode == MC_NOP_CRD));
 
-  // --------------------------------------------------------------------------
-  // Link Management Message Decoding
-  // --------------------------------------------------------------------------
-
-  // -------------------------------------------------------------------------
-  // always_ff: Partner Active Request Latch
-  //
-  // Decodes LinkMgmt.RDI.Req messages from the remote die's Adapter:
-  //
-  //   - LinkMgmt.RDI.Req.Active (msgcode MC_LM_RDI_REQ, subcode MS_LM_ACTIVE):
-  //     Sets adapter_active_req = 1, indicating the partner die wants the
-  //     link to enter Active. This flag is consumed by fdi_state_machine
-  //     as one arm of this reduced endpoint's Active-entry logic.
-  //
-  //   - LinkMgmt.RDI.Req.LinkReset or .Disable (subcodes MS_LM_LINKRESET,
-  //     MS_LM_DISABLE): Clears adapter_active_req = 0, cancelling any
-  //     prior Active agreement because the partner is requesting a
-  //     non-Active state.
-  //
-  // All decoded messages must have opcode SB_OP_MSG_NODATA (message without
-  // data payload) per Table 47.
-  // On reset, adapter_active_req is cleared (no partner request pending).
-  // Spec ref: UCIe 1.0, Tables 53-56 - Message Encodings.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      adapter_active_req <= 1'b0;
-    end else if (rx_pkt_vld && rx_opcode == SB_OP_MSG_NODATA &&
-                 rx_msgcode == MC_LM_RDI_REQ && rx_subcode == MS_LM_ACTIVE) begin
-      adapter_active_req <= 1'b1;
-    end else if (rx_pkt_vld && rx_opcode == SB_OP_MSG_NODATA &&
-                 rx_msgcode == MC_LM_RDI_REQ &&
-                 (rx_subcode == MS_LM_LINKRESET || rx_subcode == MS_LM_DISABLE)) begin
-      adapter_active_req <= 1'b0;
-    end
-  end
 
   // -------------------------------------------------------------------------
   // always_ff: Adapter State Request Channel (Reduced Scope)

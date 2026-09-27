@@ -184,6 +184,10 @@
 //   v0.0.9  2026-09-25  Phase C: verify TRAINERROR timeout and LinkError
 //                        hold, LinkReset recovery, RESET dwell, and fresh
 //                        Start-trigger behavior.
+//   v0.0.10 2026-09-25  Phase E: tie the new private framing_fault_event
+//                        input low. The nominal walk never injects the
+//                        mainband framing fault; the fatal-cause check for
+//                        that event lives in ut_ltsm_policy.sv.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -316,6 +320,10 @@ module ut_ltsm;
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
     .degrade_lanes(degrade_lanes),
+    // Phase E private fatal source. This test proves the nominal walk, so
+    // the mainband framing fault stays inactive: the fatal-cause check for
+    // the event is in ut_ltsm_policy.sv.
+    .framing_fault_event(1'b0),
     .sb_tx_load(sb_tx_load), .sb_tx_opcode(sb_tx_opcode),
     .sb_tx_srcid(sb_tx_srcid), .sb_tx_dstid(sb_tx_dstid),
     .sb_tx_msginfo(sb_tx_msginfo), .sb_tx_msgcode(sb_tx_msgcode),

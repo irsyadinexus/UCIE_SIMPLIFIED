@@ -33,19 +33,16 @@
 //     FDI -> RDI (Transmit direction):
 //       lp_data/lp_valid/lp_irdy from the Protocol Layer are registered into
 //       tx_data_q/tx_valid_q, then driven onto rdi_lp_data/rdi_lp_valid/
-//       rdi_lp_irdy. The valid qualify is gated by stall_active: while the
-//       stall handshake is in progress, no new data enters the pipeline.
+//       rdi_lp_irdy. Valid and ready are gated by stall_active so no buffered
+//       beat is visible during ACKED or RELEASED stall phases.
 //       When the link has degraded to x8 (rdi_lnk_is_x8), the upper half
 //       of rdi_lp_data (bytes 8-15, bits [127:64]) is zeroed so that only
-//       lanes 0-7 carry data. This keeps the scoreboard's byte-for-byte
-//       comparison clean.
+//       lanes 0-7 carry data.
 //
 //     RDI -> FDI (Receive direction):
 //       rdi_pl_data/rdi_pl_valid from the Logical PHY are registered into
 //       rx_data_q/rx_valid_q, then driven onto pl_data/pl_valid.
-//       pl_trdy reflects rdi_pl_trdy gated by stall_active.
-//       pl_stream is a pass-through of lp_stream (the Protocol Layer's
-//       stream identifier).
+//       pl_trdy is gated by stall_active, and pl_stream passes through.
 //
 //   BYTE / VALID FRAMING (spec 4.1.x):
 //     In Raw Mode Format 1, the entire NBYTES*8-bit data bus is valid when
@@ -85,8 +82,10 @@
 //                        Width degrade is Section 4.3.7, not 4.3.4 (which is
 //                        Clock and Track Lane remapping).
 //   v0.0.5  2026-09-23  Documentation: use the canonical Table 115 title
-//                        before the lp_stallack signal description.
-//
+//   v0.0.6  2026-09-25  Phase D: gate the registered transmit valid output
+//                        during both acknowledged and release stall phases.
+//   v0.0.7  2026-09-25  Clarify that data registers continue to capture while
+//                        output valid and ready gates block stalled transfers.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -154,10 +153,9 @@ module adapter_datapath #(
   //
   //   tx_data_q  <= lp_data
   //   tx_valid_q <= lp_valid && lp_irdy && !stall_active
-  //     The conjunction requires (a) valid Protocol Layer data, (b) Protocol
-  //     Layer ready, and (c) the stall handshake inactive. While the PHY is
-  //     stalled, lp_valid/lp_irdy are held low by the Protocol Layer
-  //     (spec 8.3.1), so the register simply stops moving.
+  //     The conjunction requires valid data, Protocol Layer ready, and an
+  //     inactive stall gate. The data registers still capture source values
+  //     while stalled, but output valid and ready prevent transfer.
   //   rx_data_q  <= rdi_pl_data ; rx_valid_q <= rdi_pl_valid
   //
   // Spec ref: 8.1 (pipeline stage), 4.1.x (byte/valid framing),
@@ -170,8 +168,8 @@ module adapter_datapath #(
       rx_data_q  <= {NBYTES*8{1'b0}};
       rx_valid_q <= 1'b0;
     end else begin
-      // While the PHY is stalled, lp_valid and lp_irdy are held low by the
-      // Protocol Layer, so the register simply stops moving.
+      // Data registers continue to capture source values while stalled.
+      // Output valid and ready gates prevent transfer in ACKED or RELEASED.
       tx_data_q  <= lp_data;
       tx_valid_q <= lp_valid && lp_irdy && !stall_active;
       rx_data_q  <= rdi_pl_data;
@@ -185,14 +183,9 @@ module adapter_datapath #(
   // Single combinational driver for every datapath output, so there are no
   // multi-driver conflicts.
   //
-  // FDI -> RDI: rdi_lp_irdy = lp_irdy && !stall_active (the PHY must not see
-  //   irdy during a stall); rdi_lp_valid = tx_valid_q; rdi_lp_data = tx_data_q.
-  //   Width degrade (spec 4.3.7): when rdi_lnk_is_x8, the upper half
-  //   [NBYTES*8-1:NBYTES*4] is forced to zero so only lanes 0-7 (bytes 0-7)
-  //   carry data; the explicit zeroing gives the scoreboard a clean compare.
-  // RDI -> FDI: pl_valid = rx_valid_q; pl_data = rx_data_q;
-  //   pl_trdy = rdi_pl_trdy && !stall_active (Protocol Layer must not see
-  //   trdy during a stall); pl_stream = lp_stream pass-through.
+  // FDI -> RDI: rdi_lp_irdy and rdi_lp_valid are both suppressed while the
+  // registered Adapter stall handshake is ACKED or RELEASED.
+  // RDI -> FDI: pl_trdy is also suppressed during both phases.
   //
   // Spec ref: 4.1.1 (Byte to Lane Mapping), 4.1.2 (Valid Framing),
   //           4.3.7 (Width Degrade in Standard Package Interfaces),
@@ -201,12 +194,10 @@ module adapter_datapath #(
   always_comb begin
     // FDI -> RDI
     rdi_lp_irdy  = lp_irdy && !stall_active;
-    rdi_lp_valid = tx_valid_q;
+    rdi_lp_valid = tx_valid_q && !stall_active;
     rdi_lp_data  = tx_data_q;
 
-    // x8 width degrade narrows the usable byte field to lanes 0-7 (bytes 0-7).
-    // Bytes 8-15 carry no data in that mode and are driven to zero so the
-    // scoreboard can verify a clean byte-for-byte compare.
+    // x8 width degrade narrows the usable byte field to lanes 0-7.
     if (rdi_lnk_is_x8) begin
       rdi_lp_data[NBYTES*8-1:NBYTES*4] = {NBYTES*4{1'b0}};
     end

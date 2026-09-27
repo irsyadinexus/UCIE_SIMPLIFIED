@@ -127,10 +127,9 @@
 //  |  |  | (lp_cfg / pl_cfg)  |  | lp_cfg_crd        | |(4.4)   | | |
 //  |  |  +---------------------+  | pl_cfg_vld        | +--------+ | |
 //  |  |                           | pl_cfg_crd        |            | |
-//  |  |  link_active_obs -------->| adapter_active_req| +--------+ | |
-//  |  |  (gates RDI Active        |                   | |ByteLane| | |
-//  |  |   entry, spec 8.1.6)     |                   | | Mapper | | |
-//  |  +---------------------------+                   | |(4.1.1) | | |
+//  |  |  Start copies -------->| private event wiring  | |ByteLane| | |
+//  |  |  (Adapter and PHY CSR) | clear after Active    | | Mapper | | |
+//  |  +------------------------+ Entry, spec 8.1.6     | |(4.1.1) | | |
 //  |                                                  | +--------+ | |
 //  |                                                  |            | |
 //  |                                                  | +--------+ | |
@@ -161,15 +160,13 @@
 //      through the cfg-sideband (lp_cfg/pl_cfg) tunnelled over the RDI and
 //      then serialised by the Logical PHY's sideband codec.
 //
-//  (c) The adapter_active_req / link_active_obs signal gates the RDI ACTIVE
-//      entry in the PHY (spec 8.1.6, "The Adapter sets the request to
-//      Active ... the Physical Layer observes this and proceeds").  The
-//      partner's LinkMgmt.RDI.Req.Active sideband message is decoded inside
-//      the adapter; this net forwards the decoded result.
+//  (c) The LTSM owns the PHY-side LinkMgmt.RDI Active exchange. The Adapter
+//      and PHY CSR Start copies cross only as private edge-triggered events.
+//      The completed Active Entry result clears both sticky copies.
 //
-//  (d) start_link_train is fanned out to both blocks so either the top-level
-//      testbench or a CSR write inside phy_csr can trigger LTSM RESET exit
-//      (spec 4.5.3.1).
+//  (d) start_link_train remains a top-level trigger. Adapter CSR Start and
+//      PHY CSR Start use private wiring, so public ports and topology remain
+//      unchanged (PLAN.md Section 15.5).
 //
 // ============================================================================
 //
@@ -251,6 +248,10 @@
   // v0.0.6    2026-09-25    Phase C: wire the private LTSM Active-entry Start
   //                                        clear from logical_phy to the
   //                                        Adapter register copy.
+  // v0.0.7    2026-09-25    Phase D: route Adapter Start as a private event
+  //                                        and remove stale peer-Active feedback.
+  // v0.0.8    2026-09-25    Preserve the public adapter_active_req input
+  //                                        with a low policy-inert tie-off.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -360,44 +361,20 @@ module ucie_main #(
   logic          pl_cfg_crd;
 
   // ==========================================================================
-  // Adapter Active Request Forwarding -- Spec 8.1.6
+  // Private Start-event wiring -- PLAN.md Sections 15.5 and 15.9
   // ==========================================================================
+  // The Adapter and PHY CSR each own a sticky Start copy. The Adapter output
+  // below is an internal level, not a public port. logical_phy edge-detects
+  // both copies before sending one training event to the LTSM.
   //
-  // The D2D Adapter decodes the partner die's LinkMgmt.RDI.Req.Active
-  // sideband message (spec 6.1.2, Table 53) and asserts link_active_obs
-  // when the link has reached the ACTIVE state.  This observation is
-  // forwarded to the Logical PHY as adapter_active_req so that the RDI
-  // state machine inside the PHY can gate its own transition into the
-  // ACTIVE state (spec 8.1.6: "The Adapter sets the request to Active ...
-  // the Physical Layer observes this and proceeds with RDI ACTIVE entry").
+  // The completed Active Entry result clears both copies through the existing
+  // private clear path. No peer-Active feedback crosses this boundary because
+  // the LTSM owns the PHY-side LinkMgmt.RDI Active exchange.
   //
-  // This is a simple combinational alias -- no transformation, just a
-  // semantic rename to clarify the direction: the adapter *observes* the
-  // link becoming active, and the PHY *receives* an active *request*.
+  // Spec refs: UCIe 1.0 Sections 7.5 and 8.1.6; PLAN.md Section 15.5.
   // ==========================================================================
-  logic        adapter_active_req;
-  logic        link_active_obs;
-  // Private Phase C clear from the Logical PHY Active Entry result.
+  logic        adapter_start_link_train;
   logic        clear_start_link_train;
-
-
-  // --------------------------------------------------------------------------
-  // assign : adapter_active_req forwarding
-  //
-  // Spec reference : UCIe 1.0, section 8.1.6, "RDI bring up flow".
-  //
-  // Purpose: Forward the adapter's link-active observation to the Logical
-  // PHY's adapter_active_req input.  The RDI state machine inside the PHY
-  // uses this signal to decide when to transition pl_state_sts from RESET
-  // to ACTIVE.  The assign is purely combinational: the adapter publishes
-  // the observation on its link_active_obs output and the PHY consumes it
-  // on the same lclk cycle with no pipeline delay.
-  //
-  // The partner die's Active request arrives as a sideband message, is
-  // decoded by the adapter's sideband interface (adapter_sb_if.sv), and
-  // the result surfaces here as link_active_obs.
-  // --------------------------------------------------------------------------
-  assign adapter_active_req = link_active_obs;
 
   // ==========================================================================
   // D2D Adapter Instantiation  --  Spec 1.1.2, Chapter 3, Sections 8.1 / 8.2
@@ -469,8 +446,8 @@ module ucie_main #(
     .pl_cfg_vld      (pl_cfg_vld),
     .start_link_train(start_link_train),
     .clear_start_link_train(clear_start_link_train),
-    .ltsm_state_obs  (),
-    .link_active_obs (link_active_obs)
+    .adapter_start_link_train(adapter_start_link_train),
+    .ltsm_state_obs  ()
   );
 
   // ==========================================================================
@@ -486,9 +463,9 @@ module ucie_main #(
   //   - phy_csr (spec 7.5.3): electrical parameters and training control CSRs.
   //
   // Ports:
-  //   Clocks/reset (lclk, sbclk), start_link_train, RDI bus (rdi_lp_*/rdi_pl_*),
-  //   external sideband (sb_tx_*/sb_rx_*), external mainband (mb_tx/mb_rx),
-  //   configuration sideband (lp_cfg/pl_cfg), and adapter_active_req.
+  //   Clocks/reset, local and Adapter Start events, RDI bus, external
+  //   sideband/mainband, and configuration sideband. Start events remain
+  //   internal to the existing two-block topology.
   // ==========================================================================
   logical_phy #(.NBYTES(NBYTES), .NLANES(NLANES)) u_lphy (
     .lclk            (lclk),
@@ -497,6 +474,7 @@ module ucie_main #(
     .sbclk           (sbclk),
     .sbreset_n       (sbreset_n),
     .start_link_train(start_link_train),
+    .adapter_start_link_train(adapter_start_link_train),
     .rdi_lp_state_req(rdi_lp_state_req),
     .rdi_lp_stallack (rdi_lp_stallack),
     .rdi_pl_state_sts(rdi_pl_state_sts),
@@ -534,8 +512,7 @@ module ucie_main #(
     .pl_cfg          (),
     .pl_cfg_vld      (),
     .pl_cfg_crd      (),
-    // partner active
-    .adapter_active_req(adapter_active_req)
+    .adapter_active_req(1'b0)
   );
 
   // --------------------------------------------------------------------------

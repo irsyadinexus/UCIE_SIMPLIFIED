@@ -56,7 +56,26 @@
 //       and then the 19h done transaction. A done response that arrives
 //       while the 15h start transaction is still outstanding is fatal.
 //
-// STIMULUS
+//   8.  Recovery Policy
+//       A malformed packet starts TRAINERROR Entry, the public error hold
+//       reports LinkError, LinkReset is the only accepted recovery request,
+//       and both LinkReset and Disabled recoveries require the RESET dwell
+//       plus a fresh Start trigger.
+//
+//   9.  Private Mainband Framing Fault
+//       One lclk pulse of the Phase E framing_fault_event input is a fatal
+//       mainband error: it must start the existing TRAINERROR Entry
+//       exchange and hold LinkError. RESET ignores the event, and the link
+//       must recover through LinkReset plus a fresh Start trigger without
+//       the cleared event re-firing.
+
+// Phase F Evidence Export
+// -----------------------
+// Upon clean, zero-error completion of all scenarios, the test exports a minimal
+// JSON evidence fragment to logs/ltsm_policy_evidence.json. This fragment proves
+// successful validation of PARAM role separation, sideband arbitration, fatal
+// defect escalation to TRAINERROR, PARAM compatibility, LinkReset recovery,
+// Disabled recovery, and mainband framing fault recovery.
 // --------
 // The test bypasses CDC and codec paths. It drives sideband RX packets
 // directly at lclk and observes the LTSM state transitions and the packets
@@ -96,9 +115,12 @@
 //     Section 4.5.3.2 — SBINIT
 //     Section 4.5.3.3 — MBINIT (PARAM)
 //     Section 4.5.3.4 — MBTRAIN (LINKSPEED)
+//     Section 4.5.3.8 — TRAINERROR
+//     Section 8.1.5   — RDI State Status Machine
+//     Section 8.3.2   — State Request and Status
+//     Table 47        — Sideband Packet Types
 //     Table 56        — MBINIT.PARAM DATA64 request and response
-//
-// REVISION HISTORY
+//     PLAN.md         — Section 15.9 Phase F (Evidence Export)
 // ----------------
 //   v0.0.1  2026-09-24  Initial creation. Phase B policy verification.
 //   v0.0.2  2026-09-25  Reconcile with the final Phase B contract. Drive
@@ -118,6 +140,21 @@
 //   v0.0.3  2026-09-25  Phase C: add LinkReset and Disabled recovery,
 //                        TRAINERROR timeout, LinkError hold, RESET dwell,
 //                        and fresh Start-trigger coverage.
+//   v0.0.4  2026-09-25  Phase E: connect and drive the private
+//                        framing_fault_event input. Add the scenario that
+//                        proves the one-lclk event enters the existing
+//                        TRAINERROR Entry exchange, that RESET ignores it,
+//                        and that the cleared event does not block the
+//                        approved LinkReset recovery.
+//   v0.0.5  2026-09-25  Phase F: add minimal JSON evidence export to
+//                        logs/ltsm_policy_evidence.json on error-free completion
+//                        covering PARAM roles, arbitration, fatal causes,
+//                        TRAINERROR, PARAM compatibility, LinkReset, Disabled,
+//                        and framing fault.
+//   v0.0.6  2026-09-25  Restore comment markers on the Phase F evidence
+//                        description and revision entry.
+//   v0.0.7  2026-09-25  Restore comment markers on the MBTRAIN and TRAINERROR
+//                        specification references.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -168,6 +205,10 @@ module ut_ltsm_policy;
   // local_req_requested stays outstanding. This lets a test hold a request
   // unaccepted without suppressing the request itself.
   logic        tx_grant;
+
+  // Phase E private fatal source. It is a one-lclk pulse, so the test drives
+  // it for a single cycle and then clears it again.
+  logic        framing_fault_event;
 
   // ---- pattern counter (LINKINIT pat_done stand-in)
   logic [13:0] pat_ui;
@@ -226,6 +267,8 @@ module ut_ltsm_policy;
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
     .degrade_lanes(degrade_lanes),
+    // Phase E private fatal source: the mainband framing fault event.
+    .framing_fault_event(framing_fault_event),
     .sb_tx_load(sb_tx_load), .sb_tx_opcode(sb_tx_opcode),
     .sb_tx_srcid(sb_tx_srcid), .sb_tx_dstid(sb_tx_dstid),
     .sb_tx_msginfo(sb_tx_msginfo), .sb_tx_msgcode(sb_tx_msgcode),
@@ -456,6 +499,7 @@ module ut_ltsm_policy;
       adapter_active_req   = 1'b0;
       rdi_linkreset_req    = 1'b0;
       rdi_disabled_req     = 1'b0;
+      framing_fault_event  = 1'b0;
       sb_rx_pkt_vld        = 1'b0;
       sbinit_rx_iter_vld   = 1'b0;
       sbinit_rx_iter_match = 1'b0;
@@ -1273,6 +1317,131 @@ module ut_ltsm_policy;
   endtask
 
   // =========================================================================
+  // Scenario 9: Private Mainband Framing Fault
+  //
+  // The Phase E framing_fault_event input is a one-lclk pulse in lclk that
+  // represents a receive-gearbox boundary violation. It must join the
+  // existing fatal policy:
+  //   - RESET ignores it, because the physical layer is not running yet.
+  //   - After SBINIT, one pulse starts the TRAINERROR Entry exchange and the
+  //     link holds LinkError.
+  //   - The cleared pulse must not block the approved LinkReset recovery or
+  //     re-enter TRAINERROR afterwards.
+  // =========================================================================
+  task test_framing_fault;
+    int errs;
+    begin
+      errs = 0;
+      $display("--- Scenario 9: Private Mainband Framing Fault ---");
+
+      // RESET must ignore the private event. The reset prologue mirrors
+      // run_to_mbinit_param so the LTSM starts from a known RESET epoch.
+      sb_tx_busy          = 1'b0;
+      tx_grant            = 1'b1;
+      start_link_train    = 1'b0;
+      adapter_active_req  = 1'b0;
+      rdi_linkreset_req   = 1'b0;
+      rdi_disabled_req    = 1'b0;
+      sb_rx_pkt_vld       = 1'b0;
+      sbinit_rx_iter_vld  = 1'b0;
+      sbinit_rx_iter_match = 1'b0;
+      sbinit_tx_iter_done = 1'b0;
+      sbinit_tx_idle      = 1'b1;
+      framing_fault_event = 1'b0;
+      lreset_n = 1'b0;
+      repeat (5) @(posedge lclk);
+      lreset_n = 1'b1;
+      repeat (5) @(posedge lclk);
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL framing_fault: reset prologue did not start in RESET");
+        errs = errs + 1;
+      end
+
+      @(negedge lclk);
+      framing_fault_event = 1'b1;
+      @(posedge lclk);
+      @(negedge lclk);
+      framing_fault_event = 1'b0;
+
+      // Let the short RESET interval complete. If the event had armed a
+      // RESET exit, the LTSM would leave RESET when the minimum expires; a
+      // still-RESET state after the expiry proves it was ignored.
+      wait (rst_tmr_expired);
+      repeat (4) @(posedge lclk);
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL framing_fault: RESET reacted to the private event");
+        errs = errs + 1;
+      end else begin
+        $display("  PASS: RESET ignores the framing-fault event");
+      end
+
+      // The fatal case runs from MBINIT.PARAM, where the sideband policy is
+      // active. One pulse must start TRAINERROR Entry without any packet.
+      run_to_mbinit_param(1'b1);
+      repeat (10) @(posedge lclk);
+      if (ltsm_state != LT_MBINIT_PARAM) begin
+        $display("FAIL framing_fault: did not reach MBINIT.PARAM");
+        errs = errs + 1;
+      end
+
+      @(negedge lclk);
+      framing_fault_event = 1'b1;
+      @(posedge lclk);
+      @(negedge lclk);
+      framing_fault_event = 1'b0;
+
+      // expect_fatal answers the TRAINERROR Entry request and waits for the
+      // public hold, which is exactly the fatal-policy obligation.
+      expect_fatal();
+      if ((ltsm_state != LT_TRAINERROR) || !train_error) begin
+        $display("FAIL framing_fault: event did not hold TRAINERROR");
+        errs = errs + 1;
+      end else begin
+        $display("  PASS: framing-fault event entered TRAINERROR");
+      end
+
+      // The cleared one-lclk event must not block the approved recovery.
+      rdi_linkreset_req = 1'b1;
+      await_tx_code(MC_LM_RDI_REQ);
+      if (cap_sub != MS_LM_LINKRESET) begin
+        $display("FAIL framing_fault: missing LinkReset request");
+        errs = errs + 1;
+      end
+      drive_nodata(MC_LM_RDI_RSP, MS_LM_LINKRESET);
+      rdi_linkreset_req = 1'b0;
+      wait_state_bounded(LT_RESET, C_DEADLINE);
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL framing_fault: LinkReset did not enter RESET");
+        errs = errs + 1;
+      end
+
+      // Full RESET dwell equivalent, then a fresh Start must leave RESET.
+      wait (rst_tmr_expired);
+      repeat (2) @(posedge lclk);
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL framing_fault: RESET did not hold after LinkReset");
+        errs = errs + 1;
+      end
+      @(negedge lclk);
+      start_link_train = 1'b1;
+      @(posedge lclk);
+      @(negedge lclk);
+      start_link_train = 1'b0;
+      wait_state_bounded(LT_SBINIT, C_DEADLINE);
+      if (ltsm_state != LT_SBINIT) begin
+        $display("FAIL framing_fault: cleared event blocked recovery");
+        errs = errs + 1;
+      end else begin
+        $display("  PASS: cleared event allows LinkReset and fresh Start recovery");
+      end
+
+      total_errors = total_errors + errs;
+      if (errs == 0)
+        $display("  PASS: framing fault joins the existing fatal policy");
+    end
+  endtask
+
+  // =========================================================================
   // Main test sequence
   // =========================================================================
   initial begin
@@ -1280,6 +1449,7 @@ module ut_ltsm_policy;
     tx_grant     = 1'b1;
     rdi_linkreset_req = 1'b0;
     rdi_disabled_req  = 1'b0;
+    framing_fault_event = 1'b0;
     test_role_separation();
     test_invalid_packets();
     test_duplicate_replay();
@@ -1288,6 +1458,28 @@ module ut_ltsm_policy;
     test_param_compatibility();
     test_linkspeed_outcomes();
     test_recovery_policy();
+    test_framing_fault();
+
+    // Phase F: export unit evidence JSON upon clean zero-error completion.
+    // Spec ref: UCIe 1.0 Section 4.5.3, Section 4.5.3.8, Table 56, and
+    // PLAN.md Section 15.9 Phase F.
+    if (total_errors == 0) begin
+      integer fd;
+      fd = $fopen("logs/ltsm_policy_evidence.json", "w");
+      if (fd != 0) begin
+        $fwrite(fd, "{\n");
+        $fwrite(fd, "  \"param_roles\": 1,\n");
+        $fwrite(fd, "  \"arbitration\": 1,\n");
+        $fwrite(fd, "  \"fatal_causes\": 1,\n");
+        $fwrite(fd, "  \"trainerror\": 1,\n");
+        $fwrite(fd, "  \"param_compatibility\": 1,\n");
+        $fwrite(fd, "  \"linkreset\": 1,\n");
+        $fwrite(fd, "  \"disabled\": 1,\n");
+        $fwrite(fd, "  \"framing_fault\": 1\n");
+        $fwrite(fd, "}\n");
+        $fclose(fd);
+      end
+    end
 
     $display("");
     if (total_errors == 0)

@@ -24,6 +24,16 @@
 //               request/response obligations and the common 8 ms timer.
 //               Priority is LinkError, Disabled, LinkReset, then normal work.
 //
+//               Phase E adds one private fatal source: the mainband framing
+//               fault. The receive gearbox in mb_gearbox.sv reports a
+//               qualifier change inside a four-mbclk-cycle word boundary as
+//               a sticky level, the logical PHY synchronises that level into
+//               lclk and reduces it to one fresh event, and this module
+//               treats the event exactly like a LinkError request. It needs
+//               no new public port and no new state: the existing TRAINERROR
+//               Entry exchange, LinkReset, Disabled, and RESET dwell carry
+//               the recovery.
+//
 // Spec refs   : UCIe 1.0 spec section 4.5.3 (LTSM), with per-state
 //               references to 4.5.3.1 through 4.5.3.9.
 //
@@ -190,10 +200,13 @@
 // --------------------------------------------------------------------------
 //   Adapter/RDI : software_start_event, rdi_active_event, rdi_active_req,
 //                 rdi_linkreset_req, rdi_disabled_req, active_entry_done,
-//                 clear_start_link_train, link_trained, train_error,
-//                 link_reset_out, phy_retrain_done,
+//                 transition_active, clear_start_link_train, link_trained,
+//                 train_error, link_reset_out, phy_retrain_done,
 //                 ltsm_state (8-bit state encoding for Error Log 0),
 //                 lnk_is_x8, degrade_lanes.
+//   Framing     : framing_fault_event, the private mainband framing fault
+//                 from the logical PHY receive gearbox. It is one fresh
+//                 event of at least one lclk cycle, not a port of ucie_main.
 //   Sideband    : Full TX field set (sb_tx_load..sb_tx_has_data) driving
 //                 the packet CDC, and full RX field set (sb_rx_pkt_vld..
 //                 sb_rx_dp_err) from the packet CDC.
@@ -276,6 +289,17 @@
 //                        exchange, full recovery RESET dwell, and fresh
 //                        software or RDI triggers. Enforce LinkError over
 //                        Disabled over LinkReset over normal transactions.
+//   v0.0.15 2026-09-25  Phase E: add the private `framing_fault_event` input,
+//                        one fresh synchronised lclk event, and include it in
+//                        the existing fatal trigger. The event reuses the
+//                        TRAINERROR Entry exchange, the LinkReset and
+//                        Disabled exchanges, and the full recovery RESET
+//                        dwell. No public port changes.
+//   v0.0.16 2026-09-25  Phase E correctness: add the private
+//                        `transition_active` level. It closes the logical
+//                        PHY Active-data gate when a private transition
+//                        starts, including the TRAINERROR Entry exchange
+//                        before the registered state leaves ACTIVE.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -296,6 +320,7 @@ module ltsm #(
   input  logic        rdi_linkreset_req,    // current local LinkReset request
   input  logic        rdi_disabled_req,     // current local Disabled request
   output logic        active_entry_done,    // completed Active Entry result
+  output logic        transition_active,    // private transition in progress
   output logic        clear_start_link_train, // one-cycle Start-copy clear
   output logic        link_trained,         // LTSM reached ACTIVE
   output logic        train_error,          // unrecoverable failure
@@ -305,6 +330,8 @@ module ltsm #(
   output logic        lnk_is_x8,            // negotiated x8 degrade
   output logic [1:0]  degrade_lanes,        // which half survives
 
+  // ---- private physical-layer fatal input (PLAN.md Section 15.9 Phase E)
+  input  logic        framing_fault_event,  // fresh mainband framing fault
   // ---- lclk-facing sideband CDC endpoint (the LTSM is the only master)
   output logic        sb_tx_load,
   output logic [4:0]  sb_tx_opcode,
@@ -970,7 +997,15 @@ module ltsm #(
   wire post_sbinit_rx_fatal = post_sbinit_rx_event &&
                               !post_sbinit_packet_valid;
   wire local_packet_fatal = post_sbinit_rx_fatal;
-  wire fatal_trigger_event = local_packet_fatal || rx_linkerror_req;
+  // Phase E adds the private mainband framing fault. The logical PHY derives
+  // one fresh event from the sticky receive-gearbox level, so the LTSM needs
+  // no edge detector of its own. This term is combinational and feeds
+  // start_trainerror_exchange directly, which the phase C next-state logic
+  // consumes on the same rising lclk edge, so a single-cycle event is enough.
+  // One event starts one fatal entry; a second event during the TRAINERROR
+  // Entry exchange only joins the local obligation beside an existing one.
+  wire fatal_trigger_event = local_packet_fatal || rx_linkerror_req ||
+                             framing_fault_event;
 
   // =========================================================================
   // Phase C transition triggers and 8 ms timeout classes
@@ -980,8 +1015,13 @@ module ltsm #(
   // local fatal events. A TRAINERROR timeout enters the public error hold.
   // SBINIT keeps its separate direct timeout path because Section 4.5.3.8
   // exempts SBINIT from the TRAINERROR Entry handshake.
+  // Phase E adds the private mainband framing fault to fatal_trigger_event.
+  // It is not a new class: internal_fatal_event applies the same
+  // post-SBINIT and non-TRAINERROR gating to it as to every other fatal
+  // cause, so RESET and SBINIT ignore it and TRAINERROR does not restart its
+  // own exchange for it.
   // Spec refs: UCIe 1.0 Sections 4.5, 4.5.3.8, and 8.3.2.8;
-  //            PLAN.md Sections 15.4 and 15.9 Phase C.
+  //            PLAN.md Sections 15.4, 15.6, and 15.9 Phase C and Phase E.
   // =========================================================================
   wire normal_timed_state = (state_q != LT_RESET) &&
                             (state_q != LT_ACTIVE) &&
@@ -1031,6 +1071,23 @@ module ltsm #(
   wire phase_c_exchange_start = start_trainerror_exchange ||
                                 start_disabled_exchange ||
                                 start_linkreset_exchange;
+  // -------------------------------------------------------------------------
+  // assign: Private transition indication for the logical PHY
+  //
+  // A Phase C exchange starts before the registered public state changes.
+  // Keep the indication high in that start cycle and for the registered
+  // exchange residency. Include direct state changes for the other private
+  // LTSM transitions. The logical PHY uses this level to stop accepting
+  // Active data before a transition can commit.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.5.3 and 8.1.6;
+  //            PLAN.md Sections 15.4, 15.6, and 15.9 Phase E.
+  // -------------------------------------------------------------------------
+  wire transition_start_event = phase_c_exchange_start ||
+                                (state_d != state_q);
+  assign transition_active = transition_start_event ||
+                             (phase_c_mode_q != PC_NONE);
+
   wire normal_transaction_allowed = (phase_c_mode_q == PC_NONE) &&
                                     !phase_c_exchange_start;
 

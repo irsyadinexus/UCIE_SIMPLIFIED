@@ -55,16 +55,41 @@
 //        `posedge mbclk` assembler scatters it plus the low-phase lane vector
 //        into the word. Both are single-edge flops.
 //
+// VALID FRAMING AND THE PRIVATE FAULT (spec 4.1.2, PLAN.md 6.2)
+// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+// Valid is asserted for the FIRST FOUR UI of each eight-UI transfer. One
+// mbclk cycle carries two UI (high phase = UI 2c, low phase = UI 2c+1), so
+// the legal per-cycle framing pattern of a transfer window is
+//
+//   mbclk cycle : 0    1    2    3
+//   UI          : 0,1  2,3  4,5  6,7
+//   valid       : 1    1    0    0      (word in flight)
+//   valid       : 0    0    0    0      (idle)
+//
+// The transmitter asserts mb_tx_valid only in cycles 0 and 1 of a window that
+// carries a real beat. rx_gearbox checks the same pattern: it latches the
+// qualifier level of cycle 0 as the window reference and requires cycles 1, 2
+// and 3 to carry 1, 0 and 0. Any other level is a framing violation - an
+// early transition (the qualifier falls inside the valid window or rises in
+// the middle of an idle window), a late transition (the qualifier is still
+// high after the fourth UI), or a receive window that is not a transfer
+// window at all. The receiver then rejects the assembled word, so no
+// rx_word_vld pulse is produced, and the sticky `framing_fault` output records
+// the condition. It is private: only the logical PHY reads it, it holds until
+// lreset_n, and no public port exposes it.
+//
 // Port Summary
 // ~~~~~~~~~~~~
 //   tx_gearbox : lclk, lreset_n, mbclk, tx_word[127:0], tx_valid, tx_load,
 //                mb_tx_data[15:0], mb_tx_valid
 //   rx_gearbox : lclk, lreset_n, mbclk, mb_rx_data[15:0], mb_rx_valid,
-//                rx_word[127:0], rx_word_vld
+//                rx_word[127:0], rx_word_vld, framing_fault
 //
 // Spec References
 // ~~~~~~~~~~~~~~~
 //   4.1.1  - lane and width definitions, byte-to-lane mapping, DDR transfer
+//   4.1.2  - valid framing: valid asserted for the first four UI of each
+//            eight-UI transfer
 //   5.2    - main band signalling, forwarded clock (fCK)
 //   8.1.2  - lclk = fCK/4 at 4 GT/s with NBYTES = 16
 //
@@ -81,13 +106,28 @@
 //                                    keeps the 2 GHz event queue small.
 //   0.0.3 2026-09-23  -           Documentation: add per-construct comment
 //                                    blocks with spec references.
+//   0.0.4 2026-09-25  Phase E: add the private sticky `framing_fault`
+//                                    output to rx_gearbox and its four-cycle
+//                                    valid-framing boundary monitor. No
+//                                    public port changes.
+//   0.0.5 2026-09-25  Phase E: assert mb_tx_valid in mbclk cycles 0 and 1
+//                                    only, that is the first four UI of the
+//                                    eight-UI transfer (PLAN.md 6.2), and
+//                                    require the same 1100 pattern in the
+//                                    rx boundary monitor. The monitor now
+//                                    rejects early, late, or malformed
+//                                    framing, suppresses the word strobe for
+//                                    a rejected window, and keeps the fault
+//                                    sticky until lreset_n. No public port
+//                                    changes.
 // ============================================================================
 `ifndef MbGearbox_SV
 `define MbGearbox_SV
 `include "ucie_pkg.sv"
 
 // ===========================================================================
-// tx_gearbox: parallel 128-bit lclk word -> per-lane DDR slices on mbclk.
+// tx_gearbox: parallel 128-bit lclk word -> per-lane DDR slices on mbclk,
+//             with the four-UI valid-framing qualifier.
 // ===========================================================================
 `timescale 1ns/1ps
 module tx_gearbox #(
@@ -102,12 +142,18 @@ module tx_gearbox #(
   input  logic                 tx_valid,    // current word is a real beat
   input  logic                 tx_load,     // 1-cycle strobe: sample word
   output logic [NLANES-1:0]    mb_tx_data,  // DDR output, 1 bit/lane/edge
-  output logic                 mb_tx_valid  // framing bit, per mbclk edge
+  output logic                 mb_tx_valid  // framing qualifier: high in
+                                            // mbclk cycles 0 and 1, low in
+                                            // cycles 2 and 3 (first four UI)
 );
 
   localparam int unsigned NCYC  = NSLICE / 2;   // 4 mbclk cycles per word
   localparam int unsigned CYC_W = 2;            // 0..3 cycle counter
   localparam logic [CYC_W-1:0] LAST_CYC = CYC_W'(NCYC-1);
+  // Last mbclk cycle whose two UI lie inside the four-UI valid window
+  // (spec 4.1.2, PLAN.md 6.2): UI 0..3 of an eight-UI transfer are the two UI
+  // of cycle 0 and the two UI of cycle 1, so valid is high for cycles 0 and 1.
+  localparam logic [CYC_W-1:0] LAST_VALID_CYC = CYC_W'(NSLICE/4 - 1);
 
   // -------------------------------------------------------------------------
   // always_ff: lclk Domain Word and Framing Registers
@@ -119,7 +165,9 @@ module tx_gearbox #(
   //
   // valid_q is set only when both tx_load and tx_valid are asserted in
   // the same cycle; otherwise it clears, ensuring the framing bit on
-  // the mainband deasserts during idle lclk cycles.
+  // the mainband deasserts during idle lclk cycles. The mbclk framing
+  // generator below additionally limits the qualifier to the first four UI
+  // of the transfer (spec 4.1.2, PLAN.md 6.2).
   //
   // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing.
   // -------------------------------------------------------------------------
@@ -142,7 +190,8 @@ module tx_gearbox #(
   // Runs on posedge mbclk (2 GHz forwarded clock, spec Section 5.2).
   // Maintains three registers:
   //   ser_q     — 128-bit word snapshot used by the phase-gather mux.
-  //   ser_val_q — framing-valid snapshot, driven to mb_tx_valid.
+  //   ser_val_q — framing-valid snapshot; mb_tx_valid gates it with the
+  //               four-UI valid window of the mbclk cycle counter.
   //   cyc_q     — 2-bit cycle counter (0..3), one count per mbclk cycle.
   //
   // Single-edge-flop snapshot discipline: ser_q and ser_val_q are
@@ -254,19 +303,30 @@ module tx_gearbox #(
   // -------------------------------------------------------------------------
   // assign: Main-Band TX Valid / Framing Output
   //
-  // Drives the framing-valid indicator for the main-band transmit bus.
-  // ser_val_q is the mbclk-domain snapshot of valid_q (lclk domain),
-  // preloaded at the last mbclk cycle so it remains stable for all four
-  // cycles of the word.  The receiver uses this bit to determine
-  // whether the data on the mainband lanes constitutes a valid beat.
+  // Drives the framing qualifier of the main-band transmit bus from the mbclk
+  // cycle counter and the valid snapshot for the word in ser_q:
   //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing.
+  //   cyc_q       : 0    1    2    3
+  //   UI          : 0,1  2,3  4,5  6,7
+  //   mb_tx_valid : 1    1    0    0      (ser_val_q = 1)
+  //   mb_tx_valid : 0    0    0    0      (ser_val_q = 0, idle)
+  //
+  // Valid framing asserts the qualifier for the FIRST FOUR UI of each eight-UI
+  // transfer (spec 4.1.2, PLAN.md 6.2), and one mbclk cycle carries two UI, so
+  // the AND with `cyc_q <= LAST_VALID_CYC` produces the legal pattern for a
+  // real beat and a constant low while idle. The level changes only at the
+  // half-transfer boundary or at a word boundary, never inside a phase, so the
+  // receiver sees one unchanged level per mbclk cycle.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
+  //           PLAN.md Section 6.2 - Valid framing.
   // -------------------------------------------------------------------------
-  assign mb_tx_valid = ser_val_q;
+  assign mb_tx_valid = ser_val_q && (cyc_q <= LAST_VALID_CYC);
 endmodule
 
 // ===========================================================================
-// rx_gearbox: per-lane DDR slices on mbclk -> parallel 128-bit lclk word.
+// rx_gearbox: per-lane DDR slices on mbclk -> parallel 128-bit lclk word,
+//             with the private sticky framing-pattern fault monitor.
 // ===========================================================================
 `timescale 1ns/1ps
 module rx_gearbox #(
@@ -278,14 +338,20 @@ module rx_gearbox #(
   input  logic                 lreset_n,
   input  logic                 mbclk,
   input  logic [NLANES-1:0]    mb_rx_data,  // DDR input, 1 bit/lane/edge
-  input  logic                 mb_rx_valid, // framing bit, per mbclk edge
+  input  logic                 mb_rx_valid, // framing qualifier: 1,1,0,0 per
+                                            // eight-UI transfer window
   output logic [NBYTES*8-1:0]  rx_word,     // assembled word, lclk domain
-  output logic                 rx_word_vld  // 1-cycle strobe: rx_word valid
+  output logic                 rx_word_vld, // 1-cycle strobe: rx_word valid
+  output logic                 framing_fault // private sticky boundary fault
 );
 
   localparam int unsigned NCYC  = NSLICE / 2;
   localparam int unsigned CYC_W = 2;
   localparam logic [CYC_W-1:0] LAST_CYC = CYC_W'(NCYC-1);
+  // Last mbclk cycle whose two UI lie inside the four-UI valid window
+  // (spec 4.1.2, PLAN.md 6.2): the legal framing pattern of a transfer window
+  // is high in cycles 0 and 1 and low in cycles 2 and 3.
+  localparam logic [CYC_W-1:0] LAST_VALID_CYC = CYC_W'(NSLICE/4 - 1);
 
   // -------------------------------------------------------------------------
   // always_ff (negedge mbclk): High-Phase Lane Capture Register
@@ -321,8 +387,10 @@ module rx_gearbox #(
   //   asm_q[8*L + 2*c+1] <= mb_rx_data[L]   (odd UI)
   //
   // On the last cycle (cyc_q == LAST_CYC = 3), the fully assembled
-  // word is copied into word_hold_q and asm_val_q captures the framing
-  // valid.  word_hold_q is a complete, non-tearing snapshot: it
+  // word is copied into word_hold_q.  The word-valid strobe asm_val_q is
+  // produced by the framing monitor below, which decides whether the window
+  // carried the legal framing pattern.  word_hold_q is a complete,
+  // non-tearing snapshot: it
   // explicitly builds each byte from the current pair (bits 7:6) plus
   // the six bits already accumulated in asm_q, so the lclk domain
   // never reads a partially assembled buffer.
@@ -333,16 +401,17 @@ module rx_gearbox #(
   logic [NBYTES*8-1:0] asm_q;
   logic [NBYTES*8-1:0] word_hold_q;
   logic [CYC_W-1:0]    cyc_q;
-  logic                asm_val_q;
+  logic                asm_val_q;   // written by the framing monitor below
 
-  // One single-edge process owns asm_q, word_hold_q, cyc_q and asm_val_q, so
-  // no two blocks write slices of the same vector.
+  // One single-edge process owns asm_q, word_hold_q and cyc_q, so no two
+  // blocks write slices of the same vector. asm_val_q keeps a single writer
+  // as well: the framing monitor below. It is declared here because the lclk
+  // output register samples it together with word_hold_q.
   always_ff @(posedge mbclk or negedge lreset_n) begin
     if (!lreset_n) begin
       asm_q       <= {NBYTES*8{1'b0}};
       word_hold_q <= {NBYTES*8{1'b0}};
       cyc_q       <= {CYC_W{1'b0}};   // phase 0: matches the TX phase
-      asm_val_q   <= 1'b0;
     end else begin
       for (int l = 0; l < NLANES; l = l + 1) begin
         case (cyc_q)
@@ -362,8 +431,82 @@ module rx_gearbox #(
                                     asm_q[8*l +: 6]};
         end
       end
-      if (cyc_q == LAST_CYC) asm_val_q <= mb_rx_valid;
       cyc_q <= (cyc_q == LAST_CYC) ? {CYC_W{1'b0}} : cyc_q + 1'b1;
+    end
+  end
+
+  // -------------------------------------------------------------------------
+  // always_ff (posedge mbclk): Word-Boundary Framing Monitor and Word Strobe
+  //
+  // Valid framing (spec 4.1.2, PLAN.md 6.2) asserts the qualifier for the
+  // first four UI of an eight-UI transfer. One mbclk cycle carries two UI
+  // (high phase = UI 2c, low phase = UI 2c+1), so the legal per-cycle pattern
+  // of a transfer window is
+  //
+  //   cyc_q       : 0    1    2    3
+  //   UI          : 0,1  2,3  4,5  6,7
+  //   mb_rx_valid : 1    1    0    0     (word in flight)
+  //   mb_rx_valid : 0    0    0    0     (idle)
+  //
+  // A posedge reads the level that was stable during the cycle that ends at
+  // that edge, so the capture at the cycle 0 edge is the window reference.
+  // frame_ref_q holds that reference; on the cycle 1, 2 and 3 edges the level
+  // must be frame_ref_q, 0 and 0, which frame_exp_w states as one equation.
+  // Any mismatch is a framing violation:
+  //
+  //   - an early transition: the qualifier falls inside the valid window, or
+  //     rises in the middle of an idle window, so the receive boundary is not
+  //     the transfer boundary;
+  //   - a late transition: the qualifier is still high after the fourth UI;
+  //   - a malformed pattern: the level changes and returns inside one window,
+  //     which is caught because every cycle is compared, not just the last.
+  //
+  // frame_ok_q carries the verdict of the window so far, so a rejected window
+  // cannot produce a word strobe. framing_fault is sticky: the first violation
+  // sets it and it holds until lreset_n, because after a bad boundary the
+  // assembled words can no longer be trusted. The comparison uses the raw pin
+  // level rather than a snapshot, so it does not miss a level that changes and
+  // returns inside the window.
+  //
+  // This process keeps a single writer for every register it drives:
+  // frame_ref_q, frame_ok_q, asm_val_q and framing_fault. asm_val_q is the
+  // word-valid strobe - a window carries a word only when its reference was
+  // high, cycles 1 and 2 matched, and cycle 3 is the fourth low UI - so an
+  // idle or rejected window never strobes. framing_fault is private to the
+  // logical PHY, which synchronises it into lclk and forwards it to the LTSM
+  // fatal policy.
+  //
+  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
+  //           PLAN.md Sections 6.2, 15.6 and 15.9 Phase E.
+  // -------------------------------------------------------------------------
+  logic frame_ref_q;    // cycle-0 qualifier level of the window in progress
+  logic frame_ok_q;     // window matches the legal pattern so far
+
+  // Level that the cycle ending at this mbclk edge must carry. frame_ref_q is
+  // the cycle-0 level, so a window with a word requires 1, 1, 0, 0 and an
+  // idle window requires 0, 0, 0, 0.
+  logic frame_exp_w;
+  assign frame_exp_w = frame_ref_q && (cyc_q <= LAST_VALID_CYC);
+
+  always_ff @(posedge mbclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      frame_ref_q   <= 1'b0;
+      frame_ok_q    <= 1'b0;
+      asm_val_q     <= 1'b0;
+      framing_fault <= 1'b0;
+    end else if (cyc_q == {CYC_W{1'b0}}) begin
+      frame_ref_q <= mb_rx_valid;         // cycle 0 sets the window reference
+      frame_ok_q  <= 1'b1;                // legal pattern so far
+    end else begin
+      if (mb_rx_valid != frame_exp_w) begin
+        frame_ok_q    <= 1'b0;            // reject the word of this window
+        framing_fault <= 1'b1;            // sticky until lreset_n
+      end
+      if (cyc_q == LAST_CYC) begin
+        // Window complete: cycle 0 was high, cycles 1 and 2 matched, and
+        // cycle 3 must be low for the word to be valid.
+        asm_val_q <= frame_ref_q && frame_ok_q && !mb_rx_valid;
+      end
     end
   end
 
@@ -377,8 +520,10 @@ module rx_gearbox #(
   // always samples a fully assembled 128-bit word.
   //
   // rx_word_vld acts as a one-cycle strobe indicating that rx_word
-  // contains a valid received beat.  Downstream RDI logic uses this as
-  // the rdi_pl_valid qualifier.
+  // contains a valid received beat.  It follows asm_val_q, which the framing
+  // monitor sets at the end of a window that carried the legal 1100 pattern,
+  // so an idle window or a window rejected for bad framing produces no beat.
+  // Downstream RDI logic uses this as the rdi_pl_valid qualifier.
   //
   // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
   //           Section 8.1.2 - Interface clocking requirements.

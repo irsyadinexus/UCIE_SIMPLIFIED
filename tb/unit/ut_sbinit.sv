@@ -34,8 +34,9 @@ module ut_sbinit;
   integer rx_event_count;
   logic   rx_event_match [0:3];
 
-  // The public logical-PHY interface stays unchanged. Hierarchical force is
-  // limited to the two private LTSM control levels so this unit can exercise
+  // The logical_phy module is instantiated with scalar physical sideband pins
+  // (sb_tx_clk/data, sb_rx_clk/data) and adapter sideband ports. Hierarchical force
+  // is limited to the two private LTSM control levels so this unit can exercise
   // the embedded raw primitive without waiting for the 4 ms RESET policy.
   logical_phy #(
     .NBYTES(NBYTES),
@@ -112,8 +113,8 @@ module ut_sbinit;
     forever #0.625 sbclk = ~sbclk;
   end
 
-  // Capture each mailbox destination pulse with its payload in the same lclk
-  // sample. A duplicate pulse or a dropped payload changes the event counts.
+  // Capture each mailbox destination pulse and its 1-bit atomic event flag in the
+  // same lclk sample. A duplicate pulse or a dropped flag changes the event counts.
   always @(posedge lclk) begin
     #0.01;
     if (!lreset_n) begin

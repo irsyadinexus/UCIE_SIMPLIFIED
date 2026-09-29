@@ -158,9 +158,9 @@
 //      This opacity is by design (spec 3.4, Figure 34).
 //
 //  (b) Sideband and main-band physical pins exit only from the Logical PHY.
-//      The adapter communicates with the partner die's adapter exclusively
-//      through the cfg-sideband (lp_cfg/pl_cfg) tunnelled over the RDI and
-//      then serialised by the Logical PHY's sideband codec.
+//      The adapter communicates with the partner die through private typed
+//      packet client ports (adapter_sb_*) arbitrated and routed through
+//      the Logical PHY's typed CDC mailbox and scalar sideband codec.
 //
 //  (c) The LTSM owns the PHY-side LinkMgmt.RDI Active exchange. The Adapter
 //      and PHY CSR Start copies cross only as private edge-triggered events.
@@ -359,9 +359,9 @@ module ucie_main #(
   //   - Link configuration outputs (pl_lnk_cfg, pl_speedmode) advertised
   //     by the PHY after training completes.
   //   - Stall handshake (rdi_pl_stallreq / rdi_lp_stallack) per spec 8.3.1.
-  //   - Configuration sideband (lp_cfg / pl_cfg with valid and credit) for
-  //     the adapter to reach PHY registers through the sideband channel
-  //     (spec 6.1.4).
+  //   - Dedicated PHY CSR channel (phy_csr_*) and typed sideband packet ports
+  //     (adapter_sb_*) between Adapter and Logical PHY for configuration and
+  //     packet routing (Sections 6.1, 7.5).
   // ==========================================================================
   rdi_req_t    rdi_lp_state_req;
   logic        rdi_lp_stallack;
@@ -535,7 +535,7 @@ module ucie_main #(
   // Sub-blocks inside logical_phy.sv:
   //   - rdi_state_machine (spec 8.1.5): manages RDI state transitions.
   //   - ltsm (spec 4.5.3): link training sequencer across 24 spec states.
-  //   - sb_codec (spec 6.1): 800 MHz 64-bit sideband packet codec with CP/DP.
+  //   - sb_codec (spec 6.1): 800 MHz sideband codec (64-bit header, optional payload) with CP/DP.
   //   - pattern_gen (spec 4.4): training patterns (Lane-ID, VALTRAIN, LFSR).
   //   - byte_lane_mapper (spec 4.1.1): byte-to-lane mapping and degrade modes.
   //   - phy_csr (spec 7.5.3): electrical parameters and training control CSRs.

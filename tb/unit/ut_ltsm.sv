@@ -32,29 +32,26 @@
 //         MBTRAIN.DATAVREF1 [0E,0F,10] → MBTRAIN.RXDESKEW [11,12] →
 //         MBTRAIN.DATACENTER2 [13,14] → MBTRAIN.LINKSPEED [15,19] →
 //         LINKINIT → ACTIVE
-//       MBTRAIN.REPAIR is unsupported and is never visited. LINKSPEED exits
-//       to LINKINIT only after the 15h start and 19h done transactions.
+//       MBTRAIN.REPAIR and PHYRETRAIN are unvisited in this fixed profile walk.
+//       LINKSPEED exits to LINKINIT only after the 15h start and 19h done transactions.
 //       After reaching ACTIVE the walk_check block confirms every state
 //       was visited in order.
 //
-//   2.  Sideband Timeout → TRAINERROR Path
+//   2.  Sideband Timeout -> TRAINERROR Path
 //       The partner responder is disabled, the LTSM is reset and
-//       re-started.  It enters SBINIT and waits for a sideband response
-// Direct lclk packet injection controls the SBINIT response ordering. After
-// SBINIT, a partner sb_codec deserializes local messages and the responder
-// answers each request with its matching response: the same sequence
-// subcode, the paired response message code, zero MsgInfo, and the immutable
-// PARAM_RSP_DATA payload for the DATA64 MBINIT.PARAM exchange. Both packet
-// codecs remain behind the asynchronous mailboxes.
-//         • The LTSM transitions to TRAINERROR on the very next posedge.
+//       re-started. It enters SBINIT and waits for a sideband response.
+//       When no remote response arrives, the C_RESIDENCY countdown timer
+//       expires and the LTSM transitions to TRAINERROR on the very next posedge.
 //
 // STIMULUS
 // --------
 // Direct lclk packet injection controls the SBINIT response ordering. After
 // SBINIT, a partner sb_codec deserializes local messages and the responder
-// maps each later training request to its matching response. Both packet
-// codecs remain behind the asynchronous mailboxes.
-//
+// answers each request with its matching response: the same sequence
+// subcode, the paired response message code, zero MsgInfo, and the immutable
+// PARAM_RSP_DATA payload for the DATA64 MBINIT.PARAM exchange. Only the local
+// codec u_loc sits behind asynchronous CDC mailboxes; the partner codec runs
+// directly in sbclk.
 // A simple 14-bit counter replaces the real LFSR pattern generator.
 // When the counter reaches LFSR_PATTERN_UI-1, the pat_done flag is
 // asserted, signalling the LTSM that the pattern phase has completed

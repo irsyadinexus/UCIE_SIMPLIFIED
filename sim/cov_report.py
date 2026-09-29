@@ -56,7 +56,7 @@ A human-readable report on stdout, grouped as LTSM state coverage, RDI state
 coverage, sideband MsgCode coverage, and event coverage. The final line is
 either
 
-  COVERAGE: 100%  (22/22 reachable states, all event counters non-zero)
+  COVERAGE: 100%  (21/21 reachable states, all event counters non-zero)
 
 or
 
@@ -75,9 +75,9 @@ Not every enumerated state in ucie_pkg is reachable in this configuration:
     entry transition. A repair request is converted to a fatal event, so the
     state itself is not a reachable coverage bin.
   * LT_PHYRETRAIN (13h) and LT_L1L2 (17h) have no entry transition in
-    ltsm.sv. Retraining and L1/L2 entry are negotiated through the adapter
-    sideband, which this PoC does not transport, so those states are defined
-    for Error Log 0 reporting only.
+    ltsm.sv. The fixed profile handles retrain and L1/L2 requests through
+    explicit error or PMNAK responses, so those states remain outside the
+    reachable coverage denominator.
   * TRAINERROR (16h) is reachable and exercised through residency timeout,
     sideband protocol fault escalation, and mainband framing fault recovery.
     It is included in REACHABLE_STATES and verified both in loopback bring-up
@@ -130,9 +130,10 @@ Flow
 
 Design notes
 ------------
-  * REACHABLE_STATES is written as an explicit literal list of 22 states,
+  * REACHABLE_STATES is written as an explicit literal list of 21 states,
     including TRAINERROR (16h).
-  * UNREACHABLE_STATES contains only PHYRETRAIN (13h) and L1/L2 (17h).
+  * UNREACHABLE_STATES contains MBTRAIN.REPAIR (12h), PHYRETRAIN (13h), and
+    L1/L2 (17h).
   * Counter lookups are guarded so a JSON file missing a key reports a
     coverage hole deterministically instead of throwing KeyError or IndexError.
   * Every planned Phase F event key is required to be non-zero.
@@ -151,6 +152,9 @@ Revision history
   v0.0.5  2026-09-25  Align the state denominator with the fixed-profile
                       MBTRAIN.REPAIR fatal policy and its no-entry transition.
 
+  v0.0.6  2026-09-29  Documentation: align docstring reachable states count
+                      (21) and unreachable states list (12h, 13h, 17h) with the
+                      active 21-state denominator.
 License
 -------
   SPDX-License-Identifier: Apache-2.0

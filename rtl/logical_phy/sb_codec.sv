@@ -14,7 +14,7 @@
 //       tx_busy asserts upon packet acceptance and remains held through
 //       all 64 UIs of header, 32 UIs of header gap, optional 64 UIs of
 //       padded payload, and 32 UIs of final payload gap.
-//   RX: Deserializes packets into an internal two-entry completion queue.
+//   RX: Deserializes packets into an internal two-entry packet-event queue.
 //       rx_valid asserts while the queue is non-empty and holds the
 //       decoded rx_packet, rx_format_error, rx_cp_error, and rx_dp_error
 //       stable until acknowledged and popped by rx_ready.
@@ -53,9 +53,9 @@
 //                                 sb_rx_clk / sb_rx_data physical pins with SDR
 //                                 strobe clocking per UCIe 1.0 Section 4.1.5 and 5.13.
 //                                 Adopted sb_packet_t handshake (tx_valid/tx_ready,
-//                                 rx_valid/rx_ready) with 2-entry completion queue,
-//                                 deterministic 64 UI packet / 32 UI low gap timing,
-//                                 strict header/payload gap validation, negedge
+//                                 rx_valid/rx_ready) with a 2-entry packet-event
+//                                 queue, deterministic 64 UI packet / 32 UI low
+//                                 gap timing, strict header/payload gap validation,
 //                                 sb_rx_clk sampling, opcode-driven payload handling,
 //                                 detection of early strobe loss, unexpected gap
 //                                 strobes, reserved opcodes/fields, CP/DP parity,
@@ -362,7 +362,7 @@ module sb_codec (
   logic        rx_gap_strobe_err_q;
   logic        rx_strobe_loss_err_q;
 
-  // Completion Queue Entry Definition
+  // Packet-event queue entry definition
   typedef struct packed {
     sb_packet_t packet;
     logic       format_error;
@@ -512,7 +512,7 @@ module sb_codec (
         end
 
         RX_EVAL_DONE: begin
-          // Commit packet and error assessment into completion queue
+          // Commit the packet and error assessment into the packet-event queue.
           rx_push_req <= 1'b1;
           rx_state_q  <= RX_IDLE;
         end
@@ -594,7 +594,7 @@ module sb_codec (
   assign new_rx_entry.dp_error     = rx_strobe_loss_err_q ? 1'b0 : dp_mismatch_err;
 
   // =========================================================================
-  // TWO-ENTRY COMPLETION QUEUE AND HANDSHAKE INTERFACE
+  // TWO-ENTRY PACKET-EVENT QUEUE AND HANDSHAKE INTERFACE
   // =========================================================================
   // Holds up to 2 received packet events.
   // Produces one retained packet event on {rx_valid, rx_packet, error flags}

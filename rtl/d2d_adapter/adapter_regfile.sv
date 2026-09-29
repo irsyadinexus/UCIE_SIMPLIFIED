@@ -15,7 +15,7 @@
 //   UCIe 1.0 Specification, Table 30 - Transmitter Electrical Parameters
 //
 // DESCRIPTION
-//   Adapter CSR (Configuration / Status Register) file. Contains six 64-bit
+//   Adapter CSR (Configuration / Status Register) file. Contains ten 64-bit
 //   registers at byte offsets within the Adapter CSR address space:
 //
 //   Offset  Register           Access  Description
@@ -192,7 +192,7 @@ module adapter_regfile (
   // --------------------------------------------------------------------------
   // Register Storage
   // --------------------------------------------------------------------------
-  // Six 64-bit registers. Each is maintained by its own always_ff block
+  // Ten 64-bit registers. Each is maintained by its own always_ff block
   // below. Error Log 0 bits [7:0] hold the LTSM State N value; the high
   // bits are reserved for local error indications.
   //

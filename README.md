@@ -28,7 +28,7 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
   a directed unit test)
 - Data width : parameterized `NBYTES`, default 16 bytes, on both FDI and RDI
 - Data link : no CRC, no retry/replay, no sequence numbers (legal at 4 GT/s)
-- Sideband packet : 64-bit header, one bit per UI, 32-UI inter-packet gap
+- Sideband packet : standard 64-bit header (Figures 100-103), 32-UI inter-packet gap, optional 64-bit payload (DATA64 / 32-bit zero-padded) followed by 32-UI gap, serialized over scalar pins (`sb_tx_clk`, `sb_tx_data`, `sb_rx_clk`, `sb_rx_data`) with 800 MHz SDR forwarded strobe clocking and falling-edge sampling
 - **Physical Layer RESET** : Physical Layer must stay in RESET for a minimum of 4ms upon every entry to RESET, as mentioned in the spec.
 - Timer constants : 4 ms RESET minimum, 8 ms residency/message timeouts, and 4 ms stall keep-alive
   are implemented at their true spec physical values in `rtl/rtl_common/timer.sv` calibrated to lclk = 500 MHz;
@@ -45,20 +45,23 @@ rtl/d2d_adapter/     d2d_adapter.sv, fdi_state_machine.sv,
                      adapter_datapath.sv, adapter_regfile.sv,
                      adapter_sb_if.sv
 rtl/logical_phy/     logical_phy.sv, rdi_state_machine.sv, ltsm.sv,
-                     sb_codec.sv, pattern_gen.sv, byte_lane_mapper.sv,
+                     sb_codec.sv, sb_init_raw.sv, sb_cdc_mailbox.sv,
+                     pattern_gen.sv, byte_lane_mapper.sv,
                      mb_gearbox.sv, phy_csr.sv
 ```
 
 Verification (Icarus Verilog 12.0, `make -C sim all`):
 
 ```
-tb/unit/         eight directed unit tests, one per FSM and datapath block
-tb/bfm/          protocol layer BFM for the FDI stimulus side
-tb/loopback/     two real `ucie_main` instances, sideband and main band both
+tb/unit/         twelve directed unit tests, one per FSM, datapath block, and protocol policy
+tb/bfm/          protocol layer BFM for FDI stimulus, independent sideband peer BFM
+                 (tb_sideband_peer.sv), golden vectors (sb_golden_vectors.sv), and Adapter
+                 sideband testbench (tb_adapter_sideband.sv)
+tb/loopback/     two real `ucie_main` instances, scalar sideband and main band both
                  crossed die-to-die
 tb/monitors/     coverage counters exported as JSON (no covergroup support in
                  Icarus Verilog 12.0)
-sim/             Makefile targets compile / unit / loopback / coverage / all,
+sim/             Makefile targets compile / sideband-unit / sideband-peer / unit / loopback / coverage / all,
                  cov_report.py reads the JSON
 ```
 
@@ -66,9 +69,11 @@ The loopback reaches LINK ACTIVE on both dies and completes Raw Mode streaming
 transfers in both directions. The main band crosses the die boundary as true
 DDR at 2 GHz fCK, 1 bit per lane per fCK edge, so 16 lanes move a 128-bit
 word every 4 fCK cycles (Req.2). Coverage is reported over the 21 training
-states the reduced capability set actually walks; `PHYRETRAIN`, `TRAINERROR`
-and `L1L2` have no entry transition in this configuration and are reported as
-unreachable rather than counted as holes.
+states the reduced capability set actually walks (00h-11h, 14h, 15h, 16h);
+`TRAINERROR` (16h) is reachable and exercised through residency timeouts, sideband
+fault escalation, and mainband framing fault recovery. `MBTRAIN.REPAIR` (12h),
+`PHYRETRAIN` (13h), and `L1L2` (17h) have no entry transition in this configuration
+and are documented as unreachable rather than counted as holes in the 21-state denominator.
 
 - Strict Topology divided into two big modules. Other modules should be inside these two big modules.
 
@@ -78,11 +83,13 @@ UCIE Main
   |     |-- FDI State Machine (spec 8.2 / Table 115)
   |     |-- Streaming pass-through datapath
   |     |-- Adapter register file (Link Control/Status, Error Log 0/1)
-  |     `-- Adapter sideband interface (lp_cfg/pl_cfg)
+  |     `-- Adapter sideband interface (lp_cfg/pl_cfg, Stage 3 AdvCap.Adapter negotiation, Adapter LSM)
   |-- Logical PHY
   |     |-- RDI State Machine (spec 8.1 / Table 114)
-  |     |-- LTSM (all 24 state encodings; 21 reachable in this scope)
-  |     |-- Sideband codec (64-bit header, CP/DP parity)
+  |     |-- LTSM (all 24 state encodings; 21 reachable in this scope, including TRAINERROR)
+  |     |-- Sideband codec (Figures 100-103 64-bit header, CP/DP parity, scalar pins sb_tx_clk/data, sb_rx_clk/data)
+  |     |-- Raw SBINIT detector and driver (sb_init_raw.sv)
+  |     |-- Sideband CDC mailboxes (sb_cdc_mailbox.sv)
   |     |-- Training pattern generator (Per-Lane-ID, VALTRAIN, clock repair, LFSR)
   |     |-- Main-band DDR gearbox, 500 MHz lclk <-> 2 GHz fCK (Req.2)
   |     |-- Byte-to-lane mapper (x16 and both x8 degrade halves)

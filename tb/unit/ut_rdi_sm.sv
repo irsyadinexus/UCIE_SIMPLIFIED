@@ -19,10 +19,12 @@
 //   pin-by-pin; there is no LTSM and no link, so every state transition is
 //   requested explicitly by the stimulus and observed on the status outputs.
 //
-//   This is the only test that exercises the RDI state machine in isolation.
-//   The loopback test reaches ACTIVE and stops there, so the return paths, the
-//   recovery paths (LINKRESET, LINKERROR), the PMNAK answer and the four-phase
-//   stall handshake are reachable only here.
+//   This test exercises the RDI state machine in direct unit-level isolation
+//   without an LTSM or partner die. While integrated recovery paths (LinkReset,
+//   Disabled, framing-fault LinkError) and PMNAK are also exercised end-to-end
+//   in the two-die loopback testbench, this unit test provides exhaustive
+//   pin-level verification of all RDI state transitions, unsupported status
+//   holds, and the four-phase stall handshake.
 //
 //   The test walks this sequence:
 //

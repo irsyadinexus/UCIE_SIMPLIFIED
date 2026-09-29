@@ -3,10 +3,10 @@
 // Project     : UCIe 1.0 Simplified Endpoint
 // Description : Generic spec-compliant interval timer for UCIe link training.
 //
-// This module provides a configurable countdown/count-up timer used
-// throughout the UCIe link training state machine (LTSM) to enforce the
-// timing intervals mandated by the UCIe 1.0 specification.  A single
-// parameterisation serves all four timer roles:
+// This module provides a modular, configurable interval timer instantiated
+// locally by individual FSMs (such as LTSM and adapter LSM) to enforce the
+// timing intervals mandated by the UCIe 1.0 specification. Local instances
+// parameterise LIMIT_CYCLES for their specific roles:
 //
 //   1. Residency Timer (8 ms)
 //      Spec 4.5 – Sub-state residency timeout: if a training sub-state
@@ -22,15 +22,15 @@
 //
 //   3. Sideband Message Timeout (8 ms)
 //      Spec 6.1 – Sideband requests expecting a response time out after
-//      8 ms. Used in this simplified endpoint as an adapter response
+//      8 ms. Instantiated locally in adapter sideband logic as a response
 //      watchdog. Parameterised with LIMIT_CYCLES = C_SB_MSG (= 4 000 000
-//      lclk cycles at 500 MHz).
+//      cycles at 500 MHz).
 //
 //   4. Stall Interval Timer (4 ms)
 //      Spec 6.1 – When stalling to prevent timeout, a stall response
-//      cadence of 4 ms is specified. Used in this endpoint as a stall
+//      cadence of 4 ms is specified. Instantiated locally as a stall
 //      keep-alive timer. Parameterised with LIMIT_CYCLES = C_STALL
-//      (= 2 000 000 lclk cycles at 500 MHz).
+//      (= 2 000 000 cycles at 500 MHz).
 // ~~~~~~~~~~~~~~~
 //   - `start` pulse : clears the counter and the expired flag, beginning
 //                     a new interval.

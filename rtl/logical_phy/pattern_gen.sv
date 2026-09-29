@@ -35,8 +35,8 @@
 //         lane instantiates an independent scrambler with unique seed.
 //         Used during LINKINIT (spec 4.5.3.5) and LFSR-based MBTRAIN
 //         exchanges.  The pat_done flag fires when the UI counter reaches
-//         or crosses LFSR_PATTERN_UI (4096), marking the end of one
-//         training exchange.
+//         or crosses LFSR_PATTERN_UI (4096) as a diagnostic indicator of
+//         pattern completion (LTSM Active Entry is governed by LinkMgmt.RDI).
 //
 // INTERNAL BLOCK DIAGRAM
 //
@@ -100,8 +100,8 @@
 //   3. The data output is purely combinational (assign statements inside
 //      a generate block), so it settles within the same lclk cycle.
 //   4. pat_done is asserted during the lclk cycle whose ui_q reaches or
-//      crosses LFSR_PATTERN_UI (4096) minus 8, signalling the LTSM that
-//      the current LFSR training exchange is complete.
+//      crosses LFSR_PATTERN_UI (4096) minus 8, indicating diagnostic completion
+//      of the LFSR pattern (LTSM Active Entry is governed by LinkMgmt.RDI).
 //
 // REVISION HISTORY
 //   Rev    Date        Author      Description

@@ -12,16 +12,17 @@
 //
 // DESCRIPTION
 // -----------
-// This unit test exercises the adapter_datapath module to verify that:
+// This unit test exercises the adapter_datapath and d2d_adapter modules to verify that:
 //
 //   1. Stall handshake operates correctly per UCIe Specification
-//      Section 8.3.1 — Stallreq/Ack Mechanism.
-//      When stall_active is asserted by the testbench, the DUT must
-//      de-assert rdi_lp_irdy (blocking data towards the PHY) and
-//      de-assert pl_trdy (blocking acknowledgement towards the
-//      Protocol Layer).  Once stall_active is released, normal
-//      flow resumes within one clock cycle.
-//
+//      Section 8.3.1 — Stallreq/Ack Mechanism:
+//      - On adapter_datapath (u_dut): when stall_active is asserted,
+//        the DUT de-asserts rdi_lp_irdy (blocking data towards PHY) and
+//        de-asserts pl_trdy (blocking acknowledgement towards Protocol Layer).
+//      - On integrated d2d_adapter (u_adapter): verifies the four-phase stall
+//        handshake bridging PHY request (rdi_pl_stallreq) to Protocol Layer
+//        (pl_stallreq), acknowledgement (lp_stallack to rdi_lp_stallack),
+//        and datapath stall gating across the adapter boundary.
 //   2. Streaming pass-through datapath:
 //      In the absence of a stall condition, FDI-side transmit data
 //      (lp_data, lp_valid, lp_irdy) is forwarded through the
@@ -54,7 +55,8 @@
 //
 // DUT
 // ---
-//   adapter_datapath  u_dut
+//   adapter_datapath u_dut     — direct datapath and stall gate
+//   d2d_adapter      u_adapter — integrated 4-phase stall bridge and controls
 //
 // STIMULUS
 // --------
@@ -88,7 +90,9 @@
 //   "FAIL ut_stall: N errors" otherwise.
 //
 //   On success, a JSON evidence file (logs/stall_evidence.json)
-//   is written for coverage-report merging.
+//   is written for coverage-report merging, recording evidence for
+//   both the 4-phase stall handshake (stall_4phase) and x8 width
+//   degrade (width_degrade_x8).
 //
 // CLOCK / RESET
 // -------------

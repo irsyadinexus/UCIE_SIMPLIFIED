@@ -16,8 +16,8 @@
 //                                sideband message timeout (8 ms), stall
 //                                interval (4 ms), and SBINIT active/idle
 //                                windows (1 ms each).
-//   4. Sideband framing        – Packet width (64 b) and inter-packet gap
-//                                (32 UI).
+//   4. Sideband framing        – Header and payload phase width (64 b), optional
+//                                64-bit payload, and inter-packet gap (32 UI).
 //   5. Training pattern sizes  – SBINIT waveform, detection, and tail limits;
 //                                VALTRAIN iteration count and threshold; and
 //                                the LFSR pattern length in UI.
@@ -137,8 +137,8 @@ package ucie_pkg;
   // NBYTES: number of bytes per flit per direction; 16 bytes for the x16
   //         Standard Package (UCIe 1.0, section 3.1, Table 3).
   // DATA_W: total data width in bits = NBYTES × 8 = 128 b.
-  // NC:     sideband configuration interface width (8 bits), matching the
-  //         SB channel physical width.
+  // NC:     sideband configuration interface width (8 bits) for FDI lp_cfg/pl_cfg
+  //         (distinct from scalar physical sideband pins).
   localparam int unsigned NBYTES    = 16;
   localparam int unsigned DATA_W    = NBYTES * 8;
   localparam int unsigned NC        = 8;   // sideband cfg interface width
@@ -184,7 +184,7 @@ package ucie_pkg;
   // ========================================================================
   // Sideband Framing
   // ========================================================================
-  // SB_PKT_BITS : 64 – each sideband packet is 64 bits (spec 6.1.1).
+  // SB_PKT_BITS : 64 – sideband header/payload phase width in bits (spec 6.1.1).
   // SB_GAP_UI   : 32 – minimum inter-packet gap in UI (spec 6.1.2).
   localparam int unsigned SB_PKT_BITS  = 64;
   localparam int unsigned SB_GAP_UI    = 32;

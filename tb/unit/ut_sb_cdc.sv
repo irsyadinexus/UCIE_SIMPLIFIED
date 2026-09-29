@@ -4,14 +4,14 @@
 // Description : Unit test for the Phase A sideband asynchronous mailbox.
 //
 // PURPOSE
-//   Proves that complete bundled packets cross between the 500 MHz lclk and
-//   800 MHz sbclk domains without losing a one-cycle source send event.
-//   The sbclk-to-lclk instance uses the Phase A 101-bit RX packet bundle:
-//   opcode, IDs, message fields, CP/DP results, and DATA64 payload.
-//
+//   Proves that asynchronous mailbox transfers cross between the 500 MHz lclk
+//   and 800 MHz sbclk domains without losing a one-cycle source send event.
+//   The test exercises a 16-bit lclk-to-sbclk payload channel and a standalone
+//   101-bit flat sbclk-to-lclk RX bundle: opcode, IDs, message fields, CP/DP
+//   results, and DATA64 payload.
 // CHECKS
 //   1. lclk-to-sbclk payload delivery and one-cycle destination valid pulse.
-//   2. 101-bit sbclk-to-lclk packet delivery with one coherent event.
+//   2. 101-bit flat sbclk-to-lclk bundle delivery with one coherent event.
 //   3. Source payload stability while the mailbox is busy.
 //   4. Mailbox reuse after acknowledgement and reset clearing.
 //
@@ -19,7 +19,7 @@
 //
 // REVISION HISTORY
 //   v0.0.1  2026-09-23  Req.3: add asynchronous 500 MHz/800 MHz CDC test.
-//   v0.0.2  2026-09-24  Phase A: test the complete 101-bit RX packet bundle,
+//   v0.0.2  2026-09-24  Phase A: test the standalone 101-bit flat RX bundle,
 //                        source busy retention, and one coherent event.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -106,7 +106,7 @@ module ut_sb_cdc;
     @(posedge sbclk);
     #0.01;
     if (!s2l_busy) begin
-      $display("FAIL ut_sb_cdc: 101-bit source did not become busy");
+      $display("FAIL ut_sb_cdc: 101-bit flat bundle source did not become busy");
       errors = errors + 1;
     end
     s2l_data = ~expected_packet;

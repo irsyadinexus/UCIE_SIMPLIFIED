@@ -30,9 +30,9 @@
 //        No CRC, no retry, no flit-header insertion, no DLLP path.
 //
 //     3. adapter_sb_if (u_sb_if)
-//        Adapter-side lp_cfg / pl_cfg sideband interface per spec 6.1.3.
-//        Handles the FDI credit loop, the remote credit loop, the 8 ms
-//        message timeout, and the 4 ms Stall keep-alive timer.
+//        Adapter-side sideband interface per spec 6.1. Handles internal CSR
+//        arbitration, peer sideband packets via typed adapter_sb_* ports,
+//        FDI lp_cfg/pl_cfg credit loop, 8 ms timeout, and 4 ms Stall timer.
 //
 //     4. adapter_regfile (u_regfile)
 //        Adapter CSR register file: UCIe Link Control, UCIe Link Status,
@@ -72,10 +72,10 @@
 //   | | machine         |    | datapath          |    | sb_if           |  |
 //   | | (u_fdi_sm)      |    | (u_datapath)      |    | (u_sb_if)      |  |
 //   | |                 |    |                   |    |                 |  |
-//   | | FDI LSM per     |    | FDI<->RDI data   |    | lp_cfg/pl_cfg  |  |
-//   | | spec 8.2        |    | pipe stage, x8   |    | credit loop,   |  |
-//   | | 4-way Active    |    | degrade, stall   |    | 8ms/4ms timers |  |
-//   | | handshake       |    | gate              |    | CSR rd/wr path |  |
+//   | | FDI LSM per     |    | FDI<->RDI data   |    | sideband & CSR  |  |
+//   | | spec 8.2        |    | pipe stage, x8   |    | arbitration,    |  |
+//   | | 4-way Active    |    | degrade, stall   |    | 8ms/4ms timers, |  |
+//   | | handshake       |    | gate              |    | packet routing  |  |
 //   | +---------+-------+    +---------+---------+    +--------+--------+  |
 //   |           |                      |                       |           |
 //   |     fdi_state_req_out     rdi_lp_data/valid/irdy   csr_wr/rd/addr   |
@@ -500,8 +500,8 @@ module d2d_adapter #(
   // -------------------------------------------------------------------------
   // Module Instantiation: adapter_sb_if (u_sb_if)
   //
-  // Adapter-side sideband transport per spec 6.1. It owns CSR decode,
-  // generic request transport, credit accounting, and monitor timers.
+  // Adapter-side sideband interface per spec 6.1. It owns CSR decode/arbitration,
+  // typed packet transport (adapter_sb_*), credit accounting, and monitor timers.
   // LinkMgmt.RDI Active policy remains in the Logical PHY LTSM.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.5 and 6.1; PLAN.md Section 15.5.
@@ -561,14 +561,18 @@ module d2d_adapter #(
   // -------------------------------------------------------------------------
   // Module Instantiation: adapter_regfile (u_regfile)
   //
-  // Adapter CSR register file containing six 64-bit registers at byte
-  // offsets 0x00-0x28 within the Adapter CSR address space:
+  // Adapter CSR register file containing ten 64-bit registers at byte
+  // offsets 0x00-0x48 within the Adapter CSR address space:
   //   0x00 : UCIe Link Control  - bit 0 starts link training (RW).
   //   0x08 : UCIe Link Status   - in-band presence, PHY state, link width.
   //   0x10 : Error Log 0        - LTSM State N in bits [7:0].
   //   0x18 : Error Log 1        - trainerror/phyinrecenter sticky (RW1C).
   //   0x20 : Electrical Params  - speed, swing, clock mode (CSR-only).
   //   0x28 : Electrical Params 2 - reserved expansion.
+  //   0x30 : Sideband Mailbox Index - remote request selector and metadata.
+  //   0x38 : Sideband Mailbox Data  - remote request or completion data.
+  //   0x40 : Sideband Mailbox Control - remote request trigger and control.
+  //   0x48 : Sideband Mailbox Status - completion status and error flags.
   //
   // CSR reads and writes arrive from u_sb_if via csr_wr/csr_rd/csr_addr/
   // csr_wdata and return on csr_rdata/csr_rdata_vld. Hardware writes

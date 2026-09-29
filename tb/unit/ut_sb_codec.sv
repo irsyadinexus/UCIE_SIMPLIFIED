@@ -1,7 +1,9 @@
 // ============================================================================
 // File        : ut_sb_codec.sv
 // Module      : ut_sb_codec
-// Description : Typed sideband codec loopback and parity-error smoke test.
+// Description : Typed sideband codec loopback and aggregate corruption smoke test
+//               (inverted serial bitstream asserts aggregate error without overflow;
+//               literal CP parity error is verified in tb_sideband_peer).
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;

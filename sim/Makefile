@@ -20,26 +20,33 @@
 #   lists and the pass/fail strings, so the tests themselves stay free of
 #   build knowledge.
 #
-#   The verification strategy has three independent layers:
+#   The verification strategy has structured layers:
 #
-#     1. compile  - Elaborates the full RTL with -g2012 -Wall. ZERO warnings
-#                   is the gate, not merely zero errors. Warnings are read
-#                   back from a log file rather than trusted from the exit
-#                   code, because Icarus returns 0 for some diagnostics.
+#     1. compile       - Elaborates the full RTL with -g2012 -Wall. ZERO warnings
+#                        is the gate, not merely zero errors. Warnings are read
+#                        back from a log file rather than trusted from the exit
+#                        code, because Icarus returns 0 for some diagnostics.
 #
-#     2. unit     - Directed testbenches in tb/unit/, one per FSM, datapath
-#                   block, and protocol function. Each drives its DUT directly
-#                   and prints the literal line "TEST PASSED <name>". The recipe
-#                   checks for that exact string, so a test that merely compiles
-#                   but never asserts success still fails the gate. On success,
-#                   relevant unit tests write Phase F event evidence JSON
-#                   fragments into logs/ (*_evidence.json) for coverage merging.
+#     2. sideband-unit - Focused scalar sideband unit testbenches (ut_sb_codec,
+#                        ut_sbinit, tb_adapter_sideband) verifying typed packet
+#                        interfaces and scalar pins without full-link overhead.
 #
-#     3. loopback - Two real ucie_main instances with the sideband and main
-#                   band crossed die-to-die. This is the only test that
-#                   exercises the whole stack together: adapter, logical PHY,
-#                   LTSM bring-up, and Raw Mode streaming in both directions.
+#     3. sideband-peer - Independent scalar sideband peer testbench driving
+#                        literal golden vectors to verify codec deserialization,
+#                        framing, and CP error detection.
 #
+#     4. unit          - Directed testbenches in tb/unit/, one per FSM, datapath
+#                        block, and protocol function. Each drives its DUT directly
+#                        and prints the literal line "TEST PASSED <name>". The recipe
+#                        checks for that exact string, so a test that merely compiles
+#                        but never asserts success still fails the gate. On success,
+#                        relevant unit tests write Phase F event evidence JSON
+#                        fragments into logs/ (*_evidence.json) for coverage merging.
+#
+#     5. loopback      - Two real ucie_main instances with the sideband and main
+#                        band crossed die-to-die. Exercises the whole stack together:
+#                        adapter, logical PHY, LTSM bring-up, link recovery, and
+#                        Raw Mode streaming in both directions.
 #   Coverage is computed by sim/cov_report.py from a JSON file that the
 #   loopback monitor writes (sim/logs/coverage.json), combined with Phase F
 #   event evidence fragments (*_evidence.json) written by unit tests. The
@@ -66,21 +73,19 @@
 #                            |  -Wall, zero warn    |
 #                            +----------+-----------+
 #                                       |
-#                       +---------------+---------------+
-#                       |                               |
-#                       v                               v
-#              +------------------+           +--------------------+
-#              |  unit            |           |  loopback          |
-#              |  tb/unit/*.sv    |           |  tb/loopback/      |
-#              |  directed DUT    |           |  2x ucie_main      |
-#              |  testbenches     |           |  crossed die-to-die|
-#              +--------+---------+           +---------+----------+
-#                       |                               |
-#                       |  TEST PASSED <name>           |  LINK ACTIVE (die 0/1)
-#                       |  Phase F evidence fragments   |  RAW MODE TRANSFER OK
-#                       |  (*_evidence.json)            |  coverage.json (Phase F)
-#                       |                               |
-#                       +---------------+---------------+
+#         +------------------+----------+----------+------------------+
+#         |                  |                     |                  |
+#         v                  v                     v                  v
+#  +---------------+  +---------------+  +------------------+  +--------------------+
+#  | sideband-unit |  | sideband-peer |  |  unit            |  |  loopback          |
+#  | scalar codec, |  | literal peer  |  |  tb/unit/*.sv    |  |  tb/loopback/      |
+#  | sbinit, FDI   |  | golden vectors|  |  directed DUT    |  |  2x ucie_main      |
+#  +-------+-------+  +-------+-------+  +--------+---------+  +---------+----------+
+#          |                  |                   |                      |
+#          |  PASSED          |  PASSED           |  TEST PASSED         |  LINK ACTIVE
+#          |                  |                   |  evidence fragments  |  coverage.json
+#          |                  |                   |  (*_evidence.json)   |
+#          +------------------+---------+---------+----------------------+
 #                                       |
 #                                       v
 #                            +----------------------+
@@ -97,12 +102,17 @@
 #                            +----------------------+
 #
 # TARGETS
-#   all       - Final integration gate: compile + unit + loopback + coverage.
-#               Verifies zero warnings, all unit PASS strings, active link on
-#               both dies, bidirectional Raw Mode streaming, and 100% coverage.
-#   compile   - Elaborate all RTL with -Wall. Fails on any warning.
-#   unit      - Build and run every tb/unit/*.sv testbench; clears stale
-#               evidence and produces Phase F unit evidence fragments.
+#   all           - Final integration gate: compile + sideband-unit +
+#                   sideband-peer + unit + loopback + coverage.
+#                   Verifies zero warnings, all test PASS strings, active link on
+#                   both dies, bidirectional Raw Mode streaming, and 100% coverage.
+#   compile       - Elaborate all RTL with -Wall. Fails on any warning.
+#   sideband-unit - Run focused scalar sideband unit testbenches (ut_sb_codec,
+#                   ut_sbinit, tb_adapter_sideband).
+#   sideband-peer - Run independent scalar sideband peer testbench with literal
+#                   golden vectors (tb_sideband_peer).
+#   unit          - Build and run every tb/unit/*.sv testbench; clears stale
+#                   evidence and produces Phase F unit evidence fragments.
 #   loopback  - Build and run the two-die bring-up plus streaming test;
 #               records LTSM/RDI states and Phase F event coverage.
 #   coverage  - Run unit and loopback, then report merged Phase F coverage
@@ -351,14 +361,13 @@ loopback: compile
 #      causes, TRAINERROR, LinkReset, Disabled, PMNAK, Active Entry, pre-Active
 #      block, scrambling, framing fault, raw transfer fwd/rev, raw mode adv).
 #   2. $(LOGS)/*_evidence.json written by directed unit tests on success
-#      (e.g., stall_evidence.json, mapper_evidence.json) to cover paths
-#      structurally unexercised by nominal x16 loopback (4-phase stall,
-#      width degrade halves, byte reversal).
+#      (stall, mapper, ltsm_policy, sb_codec, gearbox, rdi_sm, fdi_sm)
+#      to cover paths structurally unexercised by nominal x16 loopback.
 #
-# The script evaluates reachable states (00h-12h, 14h, 15h, plus TRAINERROR
-# 16h via evidence) and Phase F event counters. Documented unreachable
-# states (PHYRETRAIN 13h, L1L2 17h) are excluded from the denominator.
-# Fails unless coverage reaches 100% with all evidence fragments accounted for.
+# The script evaluates 21 reachable LTSM states (00h-11h, 14h, 15h, plus
+# TRAINERROR 16h) and Phase F event counters. Documented unreachable
+# states (MBTRAIN.REPAIR 12h, PHYRETRAIN 13h, L1L2 17h) are excluded from the
+# denominator. Fails unless coverage reaches 100% with all evidence accounted for.
 coverage: unit loopback
 	@echo "== Coverage"
 	@$(PYTHON) $(ROOT)/sim/cov_report.py

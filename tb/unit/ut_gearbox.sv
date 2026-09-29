@@ -21,7 +21,7 @@
 //
 // VERIFICATION TARGETS
 // ~~~~~~~~~~~~~~~~~~~~
-// The testbench verifies three specific requirements:
+// The testbench verifies six specific requirements:
 //
 //   (a) Physical wire mapping per UCIe 1.0 spec section 4.1.1:
 //       At every UI u (0..7) and every lane L (0..15), the wire-level

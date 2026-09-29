@@ -149,9 +149,11 @@
 //   - The byte_lane_mapper is purely combinational. The testbench inserts
 //     `repeat (2) @(posedge lclk)` delays between stimulus changes to allow
 //     delta-cycle settling, but no pipeline latency is involved.
-//   - The loopback testbench (tb_loopback_top) exercises only the x16 path
-//     because the PoC never degrades. This unit test is the sole coverage
-//     source for x8-degrade, byte reversal, and the enable gate.
+//   - Nominal loopback exercises only the x16 path without width degradation.
+//     This unit test validates x8-degrade halves, byte reversal, and the enable
+//     gate directly, emitting evidence for width_degrade and lane_reversal
+//     which merges alongside ut_stall and loopback in the multi-source
+//     coverage model.
 //   - The reserved degrade_lanes code (2'b11) is tested to ensure the mapper
 //     fails safe by zeroing the upper half.
 //   - The evidence JSON file written on success is consumed by the coverage
@@ -308,9 +310,9 @@ module ut_mapper;
     repeat (2) @(posedge lclk);
     for (int i = NLANES_X8; i < NLANES_MAX; i = i + 1)
       chk_lane(i, 8'h00, "x8 reserved upper zero");
-    // The loopback is x16-only and never degrades, so this test is the only
-    // place the degrade halves and byte reversal run. Write the evidence
-    // file the coverage report merges with the loopback JSON.
+    // Nominal loopback runs x16 without degradation, so this unit test
+    // directly validates degrade halves and byte reversal. Write the evidence
+    // file that cov_report.py merges for width_degrade and lane_reversal bins.
     if (errors == 0) begin
       fd = $fopen("logs/mapper_evidence.json", "w");
       if (fd != 0) begin

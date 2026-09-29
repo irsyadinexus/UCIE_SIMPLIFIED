@@ -31,15 +31,15 @@
 //   dut_b) representing two chiplets on a UCIe package. The sideband and
 //   main-band wires between the two dies are crossed, forming a complete
 //   point-to-point UCIe link. Each die is driven by its own protocol-layer
-//   BFM stimulus that provides the RDI handshake signals (`lp_irdy`,
+//   BFM stimulus that provides the FDI handshake signals (`lp_irdy`,
 //   `lp_valid`, `lp_data`, `lp_state_req`, etc.).
 //
 //   CROSSED TOPOLOGY
 //     The testbench models the physical crossing between two die:
-//       - dut_a.sb_tx -> dut_b.sb_rx  (sideband A-to-B)
-//       - dut_b.sb_tx -> dut_a.sb_rx  (sideband B-to-A)
-//       - dut_a.mb_tx -> dut_b.mb_rx  (mainband A-to-B)
-//       - dut_b.mb_tx -> dut_a.mb_rx  (mainband B-to-A)
+//       - dut_a.sb_clk_out/data_out -> dut_b.sb_clk_in/data_in  (scalar sideband A-to-B)
+//       - dut_b.sb_clk_out/data_out -> dut_a.sb_clk_in/data_in  (scalar sideband B-to-A)
+//       - dut_a.mb_tx_data/valid    -> dut_b.mb_rx_data/valid   (mainband A-to-B)
+//       - dut_b.mb_tx_data/valid    -> dut_a.mb_rx_data/valid   (mainband B-to-A)
 //     This mirrors the physical die-to-die interconnect topology described in
 //     Section 4.1.1 - Byte to Lane Mapping. All crossings are modelled as
 //     zero-delay continuous assignments (ideal wires).
@@ -51,12 +51,12 @@
 //                  are referenced.
 //       - mbclk  : 2 GHz (0.5 ns period). The forwarded clock fCK that
 //                  clocks the main-band DDR serialiser / deserialiser. This
-//                  clock is GATED while BOTH Link Training State Machines
-//                  (LTSMs) sit in the LT_RESET state (encoded 8'h00).
-//                  The gating mirrors what a real PHY does before training
-//                  begins, per Section 5.2 - Overview and Section 4.1.3 -
-//                  Clock Gating. Once either LTSM exits RESET, fCK is
-//                  enabled and toggles at 2 GHz continuously.
+//                  clock is GATED while neither Link Training State Machine
+//                  (LTSM) sits in LINKINIT or ACTIVE. Sideband-only training
+//                  phases (RESET, SBINIT, MBINIT, MBTRAIN) suppress idle
+//                  fCK toggles. Once either LTSM enters LT_LINKINIT (for
+//                  diagnostic training patterns) or LT_ACTIVE (for scrambled
+//                  user data), fCK is enabled and toggles at 2 GHz.
 //       - sbclk  : 800 MHz (1.25 ns period), phase-offset from lclk. The
 //                  sideband codec runs in this independent domain. Toggle
 //                  mailboxes inside logical_phy preserve complete packet
@@ -78,18 +78,18 @@
 //     Both directions (die 0 -> die 1 "forward" and die 1 -> die 0 "reverse")
 //     are exercised.
 //
-//   PHASE E LINK RECOVERY SCENARIOS
-//     After the first Active Entry and data phase, the test drives the two
-//     approved recovery cases and one private fault case:
+//   POST-ACTIVE SCENARIOS (PHASE F PMNAK & PHASE E LINK RECOVERY)
+//     After the first Active Entry and data phase, the test verifies the
+//     unsupported power-management PMNAK scenario, followed by three recovery cases:
 //       1. LinkReset from Active: the protocol layer requests LinkReset on
 //          both dies. Both must publish LinkReset, enter RESET, hold the full
 //          4 ms minimum without restarting, and then recover to ACTIVE. Die 0
 //          recovers on a fresh software Start edge while its Start pin is
 //          held high across the dwell (a held level is not a trigger). Die 1
-//          recovers on a fresh RDI NOP-to-Active request event.
+//          recovers on a fresh FDI NOP-to-Active request event (forwarded to RDI).
 //       2. Disabled from Active: the protocol layer requests Disabled on both
 //          dies, both enter RESET, dwell the full minimum, and recover on
-//          fresh RDI NOP-to-Active events.
+//          fresh FDI NOP-to-Active events (forwarded to RDI).
 //       3. Private framing fault: one mid-word mainband valid change is
 //          injected on the wire that feeds Die 0's receive gearbox. It must
 //          produce TRAINERROR on both dies, a LinkError report, a LinkReset
@@ -135,12 +135,11 @@
 //   |  |                      |    |                       |        |
 //   |  |  BFM d0_lp_* ----+  |    |  +---- BFM d1_lp_*    |        |
 //   |  |                  |  |    |  |                     |        |
-//   |  |  sb_tx --------->+--+--->+--+-> sb_rx             |        |
-//   |  |  sb_rx <---------+--+<--+--+<- sb_tx              |        |
+//   |  sb_clk/data --->+--+--->+--+-> sb_clk/data_in    |        |
+//   |  sb_clk/data_in <+--+<--+--+<-- sb_clk/data       |        |
 //   |  |                  |  |    |  |                     |        |
-//   |  |  mb_tx --------->+--+--->+--+-> mb_rx             |        |
-//   |  |  mb_rx <---------+--+<--+--+<- mb_tx              |        |
-//   |  |                  |  |    |  |                     |        |
+//   |  mb_tx_data/val->+--+--->+--+-> mb_rx_data/val    |        |
+//   |  mb_rx_data/val <+--+<--+--+<-- mb_tx_data/val    |        |
 //   |  |  pl_data ------->+  |    |  +-------> pl_data     |        |
 //   |  +---------------------+    +------------------------+        |
 //   |            |                           |                      |
@@ -160,14 +159,14 @@
 //   This testbench uses the default parameter values from `ucie_pkg`:
 //     NC         - Sideband channel width (number of sideband data bits).
 //     NLANES_MAX - Maximum number of main-band lanes (16 for the x16 PoC).
-//     DATA_W     - RDI data word width (64 bits in the simplified endpoint).
+//     DATA_W     - FDI/RDI data word width (128 bits for x16 Standard Package).
 //   No additional parameters are declared.
 //
 // CLOCK / RESET
 //   lclk      : 500 MHz free-running clock generated by `always #1.00`.
 //   mbclk     : 2 GHz gated clock generated by `always #0.25` and enabled
 //               by `mbclk_en`. The gate opens when at least one LTSM is
-//               not in LT_RESET (state != 8'h00).
+//               in LT_LINKINIT or LT_ACTIVE.
 //   sbclk     : 800 MHz phase-offset clock generated after 0.1875 ns, then
 //               toggled every 0.625 ns. It is asynchronous to lclk.
 //   d0_lreset_n/d0_sbreset_n : Die 0 aligned local reset pair.
@@ -179,7 +178,7 @@
 //     asynchronous mailboxes before reaching its sb_codec.
 //   - The RDI state and LTSM state are observed via hierarchical references
 //     into each DUT. They feed the coverage monitor and the continuous Active
-//     gate invariant; the data scoreboard itself reads only the public RDI
+//     gate invariant; the data scoreboard itself reads only the public FDI
 //     receive surface (`pl_valid` / `pl_data`), so it stays data-path based.
 //   - The main-band crossing uses continuous assignments (ideal wires with
 //     zero propagation delay). A real package interconnect would introduce
@@ -1339,9 +1338,9 @@ module tb_loopback_top;
   // -------------------------------------------------------------------------
   // task: wait_rdi_reset_pair
   //
-  // Bounded wait until both dies publish FDI RESET. The RDI status follows
-  // the LTSM RESET entry by a register stage, so a recovery epoch waits for
-  // this report before it starts the dwell interval.
+//  Bounded wait until both dies publish FDI RESET on pl_state_sts. The
+//  public FDI report follows RDI status and LTSM RESET entry by a register
+//  stage, so a recovery epoch waits for this report before it starts the
   // -------------------------------------------------------------------------
   task wait_rdi_reset_pair;
     int cycles;
@@ -1518,10 +1517,11 @@ module tb_loopback_top;
   //   Die 0: a low-then-high Start pulse. Because the pin was held high
   //          through the dwell without restarting the link, this edge is the
   //          only software trigger the LTSM sees.
-  //   Die 1: the RDI request was withdrawn to NOP before this point, so
-  //          driving Active creates exactly one fresh NOP-to-Active event.
-  // Both dies must leave RESET. Die 0's RDI level then returns to Active so
-  // its RDI state machine can follow the LTSM into ACTIVE.
+//   Die 1: the FDI request was withdrawn to NOP before this point, so
+//          driving Active creates exactly one fresh NOP-to-Active event
+//          forwarded through the adapter to RDI.
+// Both dies must leave RESET. Die 0's FDI request level then returns to
+// Active so the adapter can follow the LTSM into ACTIVE.
   // -------------------------------------------------------------------------
   task recover_d0_start_d1_rdi;
     int cycles;
@@ -1574,10 +1574,9 @@ module tb_loopback_top;
   // -------------------------------------------------------------------------
   // task: recover_both_rdi
   //
-  // Recovery variant used after the Disabled exchange: both dies withdraw
-  // their RDI requests to NOP and then re-assert Active, so each die sees
-  // exactly one fresh NOP-to-Active event.
-  // -------------------------------------------------------------------------
+// Recovery variant used after the Disabled exchange: both dies withdraw
+// their FDI requests to NOP and then re-assert Active, so each die sees
+// exactly one fresh NOP-to-Active event forwarded to RDI.
   task recover_both_rdi;
     int cycles;
     begin

@@ -215,7 +215,7 @@ one outstanding local request per logical sub-state.
 
 ## Current compliant behavior
 
-The Standard Package SBINIT sequence is substantially implemented.
+The Standard Package SBINIT and post-SBINIT training sequences are implemented and verified in the current RTL for the simplified logical scope:
 
 - RESET has a 4 ms minimum residency.
 - RESET accepts the local training request or the two-pattern SBINIT trigger.
@@ -225,6 +225,10 @@ The Standard Package SBINIT sequence is substantially implemented.
 - Detection causes four further complete local iterations.
 - The LTSM repeats Out-of-Reset until the peer copy arrives.
 - Done request and Done response have separate obligations.
+- All 21 reachable LTSM states (00h-11h, 14h, 15h, 16h) are fully traversed; `TRAINERROR` (16h) is reachable and verified via timeout, sideband parity error escalation, and mainband framing faults.
+- The documented unreachable states (`MBTRAIN.REPAIR` 12h, `PHYRETRAIN` 13h, and `L1L2` 17h) are excluded from the 21-state coverage denominator.
+- Standard sideband packet architecture (`sb_packet_t`) per Figures 100-103 with 64-bit header, 32-UI gap, optional 64-bit payload, and CP/DP parity over scalar physical pins (`sb_tx_clk`, `sb_tx_data`, `sb_rx_clk`, `sb_rx_data`).
+- Verified across 12 directed unit tests in `tb/unit/`, sideband unit tests, independent sideband peer test (`tb_sideband_peer.sv`), and full 2-die loopback (`tb_loopback_top.sv`).
 
 Sources:
 
@@ -232,7 +236,7 @@ Sources:
 - `rtl/logical_phy/ltsm.sv:604-726`
 - `rtl/logical_phy/logical_phy.sv:652-667`
 
-## Remaining logical protocol gaps
+## Remaining logical protocol gaps (Historical Assessment and Resolution)
 
 ### P0: Post-SBINIT sideband request and response semantics
 
@@ -266,6 +270,9 @@ Sources:
 - `rtl/logical_phy/ltsm.sv:700-726`
 - `UCIE.md:4096-4105`
 
+**Current Status: RESOLVED in RTL.**
+Phase A/B implemented separate request and response obligations in `rtl/logical_phy/ltsm.sv:963-999, 1044-1073`. Local requests and peer requests are tracked independently, peer requests generate matching responses, and sub-states advance only when both local-request response and peer-request handling are satisfied. Verified in `tb/unit/ut_ltsm_policy.sv` (Scenarios 1 & 4).
+
 ### P0: MBINIT.PARAM payload exchange is absent
 
 The project excludes analog parameter application, but it requires logical
@@ -284,6 +291,9 @@ Sources:
 - `rtl/logical_phy/ltsm.sv:826-831`
 - `rtl/logical_phy/logical_phy.sv:538-554`
 - `UCIE.md:3648-3681`
+
+**Current Status: RESOLVED in RTL.**
+Phase B implemented the logical PARAM payload exchange in `rtl/logical_phy/ltsm.sv:837-895` and `rtl/logical_phy/logical_phy.sv:538-554`. The LTSM transmits `SB_OP_MSG_DATA64` with fixed-profile parameters (4 GT/s, differential continuous clock, swing 0.4V), receives and validates peer configuration responses, and escalates profile incompatibilities to TRAINERROR. Verified in `tb/unit/ut_ltsm_policy.sv` (Scenario 6).
 
 ### P0: RDI Active Entry is not part of LINKINIT completion
 
@@ -311,6 +321,9 @@ Sources:
 - `UCIE.md:4544-4551`
 - `UCIE.md:9906-9932`
 
+**Current Status: RESOLVED in RTL.**
+Phase A/B integrated RDI Active Entry into LINKINIT completion in `rtl/logical_phy/ltsm.sv:1664-1680`. The LTSM remains in LINKINIT until both local and remote `{LinkMgmt.RDI.Req.Active}` and `{LinkMgmt.RDI.Rsp.Active}` exchanges complete, coordinating with `rdi_state_machine.sv` before publishing Active. Verified in `tb/unit/ut_ltsm_policy.sv` and `tb/loopback/tb_loopback_top.sv`.
+
 ### P0: LinkReset recovery and unsupported runtime requests
 
 RDI LinkReset is supported and must drive the LTSM to RESET. After its 4 ms
@@ -330,6 +343,9 @@ Sources:
 - `UCIE.md:11254-11267`
 - `UCIE.md:11366-11369`
 
+**Current Status: RESOLVED in RTL.**
+Phase C implemented link recovery policy in `rtl/logical_phy/ltsm.sv:963-999` and `rtl/logical_phy/rdi_state_machine.sv:203-240`. RDI LinkReset transitions LTSM to RESET and enforces the 4 ms minimum dwell before accepting a new permitted trigger (NOP-to-Active or `start_link_train`). Unsupported L1/L2 requests return PMNAK deterministically; Retrain requests do not disturb LTSM state. Verified in `tb/unit/ut_rdi_sm.sv` and `tb/unit/ut_ltsm_policy.sv` (Scenario 8).
+
 ### P1: Fixed-profile LINKSPEED resolution is incomplete
 
 The RTL always advances from LINKSPEED to REPAIR. The approved fixed 4 GT/s
@@ -341,6 +357,9 @@ Sources:
 
 - `rtl/logical_phy/ltsm.sv:755-766`
 - `UCIE.md:4415-4455`
+
+**Current Status: RESOLVED in RTL.**
+Phase B/C implemented fixed-profile LINKSPEED resolution in `rtl/logical_phy/ltsm.sv:1635-1652`. Successful handshake transitions directly to LINKINIT, while error or unsupported repair/degrade requests trigger fatal escalation to TRAINERROR. Verified in `tb/unit/ut_ltsm_policy.sv` (Scenario 7).
 
 ### P1: TRAINERROR protocol and sideband integrity handling are incomplete
 
@@ -367,6 +386,9 @@ Sources:
 - `rtl/logical_phy/ltsm.sv:826-833`
 - `UCIE.md:4711-4732`
 
+**Current Status: RESOLVED in RTL.**
+Phase B/C implemented TRAINERROR entry protocol in `rtl/logical_phy/ltsm.sv:1664-1680`. Residency timeouts, PARAM incompatibilities, framing faults, and CP/DP parity errors from `sb_codec.sv` initiate the `{TRAINERROR Entry}` request/response handshake (`MC_TRAINERROR` = E5h/EAh), assert RDI LinkError, and hold until LinkReset recovery. Verified in `tb/unit/ut_ltsm_policy.sv` (Scenarios 2, 8, 9).
+
 ### P1: RDI Stallreq/Ack is absent
 
 The public RDI stall request is tied low. The internal acknowledgment is
@@ -380,6 +402,9 @@ Sources:
 - `rtl/logical_phy/logical_phy.sv:832-840`
 - `rtl/logical_phy/rdi_state_machine.sv:310-341`
 - `UCIE.md:11058-11090`
+
+**Current Status: RESOLVED in RTL.**
+Phase D/F implemented the 4-phase stall tracker in `rtl/logical_phy/rdi_state_machine.sv:314-393`. `pl_stallreq` rises only when `lp_stallack` is low, requiring registered response and data quashing. Verified in `tb/unit/ut_stall.sv` and captured in `stall_evidence.json`.
 
 ### P1: Digital Active-state data control is incomplete
 
@@ -404,6 +429,9 @@ Sources:
 - `rtl/logical_phy/logical_phy.sv:699-705`
 - `UCIE.md:4544-4567`
 
+**Current Status: RESOLVED in RTL.**
+Phase B/F implemented Active data-path gating and scrambling in `rtl/logical_phy/logical_phy.sv:1255-1390` and `rtl/rtl_common/scrambler.sv:109-208`. Mainband data is blocked outside RDI Active, scrambling is applied per-lane, and framing faults detected by `mb_gearbox.sv` trigger fatal error escalation to TRAINERROR. Verified in `tb/unit/ut_gearbox.sv` and `tb/unit/ut_ltsm_policy.sv` (Scenario 9).
+
 ## Recommended implementation order
 
 1. Add correct generic sideband request-response semantics.
@@ -414,6 +442,4 @@ Sources:
 
 ## Assessment conclusion
 
-SBINIT is close to the Standard Package flow in the simplified logical scope.
-The post-SBINIT LTSM is a nominal training model. It is not a complete logical
-implementation of UCIe 1.0 Section 4.5.3.
+The historical logical protocol gaps identified in this assessment have been resolved in the current RTL across Phases A–F and the sideband protocol remediation. The LTSM now implements spec-compliant request-response semantics, MBINIT.PARAM payload negotiation, LINKINIT Active Entry coordination, LinkReset recovery, deterministic PMNAK rejection, fatal TRAINERROR escalation, 4-phase stall tracking, and Active-gated scrambling. All 21 reachable states (including TRAINERROR) are verified across 12 directed unit tests, sideband peer tests, and two-die loopback, achieving 100% coverage with zero warnings.

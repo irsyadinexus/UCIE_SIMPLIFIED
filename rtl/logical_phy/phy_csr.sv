@@ -54,9 +54,9 @@
 // --------------------------------------------------------------------------
 // Write path
 // --------------------------------------------------------------------------
-//   On csr_wr, the addressed register is updated from csr_wdata on the next
-//   rising lclk edge. Only TRAIN_CTL and ELEC_PARAM are writable; writes to
-//   other addresses are silently ignored.
+//   On csr_wr, the addressed register is updated from csr_wdata using
+//   csr_byte_en on the next rising lclk edge. Only TRAIN_CTL and ELEC_PARAM
+//   are writable; writes to other addresses are silently ignored.
 //
 //   A private input, clear_start_link_train, clears the sticky TRAIN_CTL bit
 //   0 value after a successful Active Entry. The clear has priority over a
@@ -73,7 +73,7 @@
 // --------------------------------------------------------------------------
 // Interfaces
 // --------------------------------------------------------------------------
-//   Write : csr_wr, csr_addr[26:0], csr_wdata[63:0].
+//   Write : csr_wr, csr_byte_en[7:0], csr_addr[26:0], csr_wdata[63:0].
 //   Read  : csr_rd, csr_addr[26:0] -> csr_rdata[63:0], csr_rdata_vld.
 //   Status: ltsm_state[7:0], lnk_is_x8, degrade_lanes[1:0], train_error.
 //   Output: start_link_train (from TRAIN_CTL bit 0).
@@ -187,7 +187,7 @@ module phy_csr (
   //                NOTE: No analog implementation. These are register values
   //                only, used during the MBINIT.PARAM sideband exchange.
   //
-  // start_train_q: Training start bit. Writing 1 to TRAIN_CTL[0] pulses
+  // start_train_q: Training start bit. Writing 1 to TRAIN_CTL[0] asserts
   //                start_link_train, which causes the LTSM to exit RESET
   //                (spec 4.5.3.1).
   //                The bit is sticky: it holds its value until reset, a

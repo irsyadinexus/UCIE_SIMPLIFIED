@@ -13,11 +13,12 @@
 // that internally, so a source uses src_send for one cycle only when src_busy is
 // low. The destination sees exactly one dst_valid pulse for each accepted send.
 //
-// This is a one-entry asynchronous mailbox, not a streaming FIFO. It is used
-// for infrequent complete sideband control packets between the 500 MHz LTSM
-// registers and the 800 MHz sb_codec. It prevents a one-clock-domain valid
-// pulse from being lost in the other clock domain and keeps each payload stable
-// during synchronization.
+// This is a generic parameterizable one-entry asynchronous mailbox, not a
+// streaming FIFO. It is used for transferring discrete typed payloads (such
+// as complete sideband packets or status words) across asynchronous clock
+// domains (e.g. between 500 MHz lclk and 800 MHz sbclk in Logical PHY). It
+// prevents a one-clock-domain valid pulse from being lost in the other clock
+// domain and keeps each payload stable during synchronization.
 //
 // RESET CONTRACT
 //   Both domain resets must assert together before traffic begins. Reset

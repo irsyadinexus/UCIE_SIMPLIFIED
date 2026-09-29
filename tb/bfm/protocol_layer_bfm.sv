@@ -19,7 +19,7 @@
 // ----------------------
 // The BFM supports only:
 //   * Streaming traffic (lp_stream driven with a fixed Stack-0 stream ID).
-//   * Raw Mode, Format 1 -- 256-bit data words, no flit packaging.
+//   * Raw Mode, Format 1 -- 128-bit data words (NBYTES*8 bits, default NBYTES=16), no flit packaging.
 // This matches the simplified subset implemented by the RTL adapter under
 // test.  Full UCIe protocol-layer features (flit packing, retry, CRC,
 // credit return, etc.) are intentionally omitted.
@@ -62,7 +62,8 @@
 // -------------
 //   send(data, stream)
 //       Drives lp_data, lp_stream, lp_valid, lp_irdy.  Blocks until the
-//       adapter has accepted the word (pl_trdy && pl_valid).  Handles any
+//       adapter has accepted the word (pl_trdy && pl_valid, coupling transmit
+//       acceptance to receive valid).  Handles any
 //       stall that occurs mid-transfer by withdrawing valid/irdy and
 //       waiting for the stall to clear.
 //
@@ -169,7 +170,7 @@ module protocol_layer_bfm #(
       lp_valid = 1'b1;
       lp_irdy  = 1'b1;
       @(posedge lclk);
-      // Hold until the adapter accepts.
+      // Hold until both transmit ready and receive valid are asserted.
       while (!(pl_trdy && pl_valid)) begin
         @(posedge lclk);
         if (pl_stallreq) begin

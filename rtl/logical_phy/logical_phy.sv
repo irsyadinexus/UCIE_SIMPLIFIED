@@ -60,12 +60,12 @@
 //   RX path : mb_rx_data pins -> RX gearbox -> per-byte descrambler ->
 //             Active data gate -> rdi_pl_data.
 //             The RX gearbox also reports a private mainband framing fault.
-//   Sideband: ltsm (lclk) -> async mailbox -> sb_codec (sbclk) -> sideband
-//             pins. During RESET and SBINIT pattern phases, a raw sbclk
-//             waveform/CDC primitive owns the pins and keeps the codec reset.
-//             A complete decoded RX packet remains held in sbclk until the
-//             sbclk-to-lclk mailbox accepts it. Phase B passes its DATA64
-//             payload to the LTSM, where role and fixed-profile policy apply.
+//   Sideband: logical_phy owns typed sb_packet_t CDC mailboxes bridging lclk
+//             and sbclk. On TX, it arbitrates between LTSM and Adapter packets;
+//             on RX, it routes decoded packets to LTSM or Adapter clients.
+//             During RESET and SBINIT pattern phases, a raw sbclk primitive owns
+//             the pins and keeps the codec reset.
+//             The codec serializes 64-bit headers and optional 64-bit payloads.
 //
 // --------------------------------------------------------------------------
 // Parameters
@@ -79,12 +79,12 @@
 //   RDI (Table 114) : rdi_lp_* inputs from the adapter, rdi_pl_* outputs to
 //                     the adapter. Implements the state machine of spec 8.1.5
 //                     and the Active-entry handshake of 8.1.6.
-//   Sideband pins   : sb_tx_data/valid, sb_rx_data/valid toward the partner
-//                     die. They carry the raw SBINIT waveform before they
-//                     carry serialized 64-bit packets from the codec.
+//   Sideband pins   : sb_tx_clk/sb_tx_data, sb_rx_clk/sb_rx_data toward partner
+//                     die. They carry raw SBINIT waveform before carrying
+//                     serialized 64-bit headers and optional payloads.
 //   Main-band pins  : mb_tx_data, mb_rx_data. One bit per lane per UI.
-//   CSR/cfg         : lp_cfg/pl_cfg sideband register access path (stubbed
-//                     in this reduced-capability build).
+//   CSR/cfg         : phy_csr_* dedicated internal channel from Adapter with
+//                     byte enables (lp_cfg/pl_cfg is FDI-only, tied off here).
 //
 // --------------------------------------------------------------------------
 // Clock domains
@@ -100,8 +100,8 @@
 //   1. The byte_lane_mapper is instantiated but held disabled (enable=1'b0);
 //      the main-band TX data is driven entirely by pattern_gen during
 //      training, and by the gated Active data path otherwise.
-//   2. The CSR write/read path is stubbed to constants; the PHY CSR is
-//      reachable only through the csr_start_link_train output.
+//   2. The PHY CSR write/read path connects to the adapter's phy_csr_* channel,
+//      supporting byte-enabled accesses alongside csr_start_link_train.
 //   3. Static RDI outputs (pl_lnk_cfg, pl_speedmode, pl_stallreq) are tied
 //      to the reduced-capability defaults: x16, 4 GT/s, no stall.
 //   4. User data flows only while the link is fully Active: the private gate
@@ -331,9 +331,9 @@ module logical_phy #(
   logic [DATA_W-1:0] rx_gearbox_word;    // word reassembled by the RX gearbox
   logic              rx_gearbox_valid;   // valid strobe for that word
 
-  // ------------------------------------------------- LTSM <-> sideband CDC
-  // Typed sb_packet_t channels for transmit and receive. Complete packets
-  // cross the asynchronous domain boundary via sb_cdc_mailbox instances.
+  // ------------------------------------------------- Logical PHY typed sideband CDC
+  // Typed sb_packet_t channels for transmit and receive, bridging arbitrated
+  // LTSM/Adapter traffic with sb_codec across the asynchronous clock boundary.
   // Spec ref: UCIe 1.0 Section 4.1.5, Section 5.13, Section 6.1.
   localparam int unsigned SB_PKT_W = $bits(sb_packet_t);
   localparam int unsigned SB_RX_MAILBOX_W = SB_PKT_W + 3;
@@ -1169,8 +1169,8 @@ module logical_phy #(
   // during the MBTRAIN and LINKINIT sub-states. The LTSM selects the active
   // pattern (PAT_PERLANEID, PAT_VALTRAIN, PAT_CLKREPAIR, PAT_LFSR) and
   // controls the LFSR reseed via pat_lfsr_reset/pat_lfsr_enable. The
-  // pat_done signal fires on the final UI of the LFSR pattern (4096 UI) to
-  // allow the LTSM to advance from LINKINIT to ACTIVE.
+  // pat_done signal fires on the final UI of the LFSR pattern (4096 UI)
+  // as a diagnostic indicator; LTSM Active Entry is governed by LinkMgmt.RDI.
   // ---------------------------------------------------------------------------
   logic [DATA_W-1:0] pat_data_out;
   // -------------------------------------------------------------------------
@@ -1231,8 +1231,8 @@ module logical_phy #(
   // The PHY CSR block holds the local electrical parameters (supply voltage,
   // termination impedance) that are advertised to the partner during
   // MBINIT.PARAM, the negotiated link width, and the LTSM training status.
-  // The adapter reads these registers through the sideband register access
-  // path (cfg interface).
+  // The adapter accesses these registers through the dedicated internal
+  // phy_csr_* channel with byte enables.
   //
   // start_link_train output: writing a 1 to CSR_TRAIN_CTL (offset 0x0)
   // initiates the LTSM RESET exit, complementing the top-level
@@ -1303,12 +1303,12 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
 
   // ---------------------------------------------------------------------------
-  // CSR access path stub  (spec 7.1 sideband register access)
+  // CSR access path (spec 7.5 sideband register access)
   // ---------------------------------------------------------------------------
-  // The CSR write/read path is presented on the cfg interface so the adapter
-  // can reach the PHY registers through the sideband. In this reduced-
-  // capability build the path is stubbed to constants: no external register
-  // accesses are generated.
+  // The CSR write/read path connects directly to the phy_csr_* channel from the
+  // adapter, enabling byte-enabled register reads and writes into u_phy_csr.
+  // External register accesses are routed through this internal path rather
+  // than being stubbed to constants.
   // ---------------------------------------------------------------------------
   assign csr_wr            = phy_csr_wr;
   assign csr_rd            = phy_csr_rd;

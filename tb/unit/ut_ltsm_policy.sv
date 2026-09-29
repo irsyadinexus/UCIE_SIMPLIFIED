@@ -14,7 +14,7 @@
 // intervals, arbitrates pending obligations, validates PARAM DATA64
 // compatibility, and handles LINKSPEED success and failure outcomes.
 //
-// The test covers seven independent scenarios:
+// The test covers nine independent scenarios:
 //
 //   1.  Role Separation
 //       A peer PARAM request never satisfies the local PARAM response

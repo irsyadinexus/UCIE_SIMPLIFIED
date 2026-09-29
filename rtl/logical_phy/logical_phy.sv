@@ -8,10 +8,11 @@
 //               RDI (Raw Die-to-Die Interface, spec 8.1) and the physical pins.
 //
 // Spec refs   : UCIe 1.0 spec section 4.0 (Logical Physical Layer),
+//               section 4.1.5 (Sideband transmission), section 5.13
+//               (Sideband signaling), section 6.0 / 6.1 (Sideband protocol),
 //               section 8.1 - Raw Die-to-Die Interface (RDI), Table 114
 //               (RDI signal list), section 4.5.3 (Link Training State
-//               Machine), section 6.0 (Sideband), section 7.5 (UCIe
-//               Registers).
+//               Machine), section 7.5 (UCIe Registers).
 //
 // Capability  : Standard Package, x16, 4 GT/s, Streaming / Raw Mode
 //               (Format 1). Single stack (Stack-0). No retimer. Reduced-
@@ -186,6 +187,21 @@
   // v0.0.23 2026-09-25  Include the current private framing-fault event in
   //                        the Active-data gate while preserving recovery after
   //                        the gearbox sticky history remains set.
+  // v0.0.24 2026-09-28  Migrate sideband physical pins to scalar sb_tx_clk /
+  //                        sb_tx_data and sb_rx_clk / sb_rx_data per UCIe 1.0
+  //                        Sections 4.1.5 and 5.13. Adopt typed sb_packet_t
+  //                        channels for TX and RX CDC mailboxes. Connect new
+  //                        sb_codec handshake (tx_valid/ready, rx_valid/ready)
+  //                        and route sticky codec overflow into the LTSM fatal
+  //                        event policy. Add private Adapter packet client ports
+  //                        (adapter_sb_tx_* / adapter_sb_rx_*) with a non-starving
+  //                        arbiter featuring mandatory LTSM/response priority and
+  //                        alternating request selection (Sections 4.1.5, 5.13, 6.1).
+  //                        Convert between LTSM flat sideband fields and typed
+  //                        sb_packet_t at the LTSM policy boundary.
+  // v0.0.25 2026-09-28  Connect separate PHY CSR channel (phy_csr_*) to u_phy_csr
+  //                        with byte enables (Sections 6.1, 7.5). Add private
+  //                        rdi_lp_linkerror input (Section 8.1).
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -205,6 +221,7 @@ module logical_phy #(
   input logic        adapter_start_link_train,
   input  rdi_req_t   rdi_lp_state_req,
   input  logic        rdi_lp_stallack,
+  input  logic        rdi_lp_linkerror = 1'b0,
   output rdi_sts_t    rdi_pl_state_sts,
   output logic        rdi_pl_inband_pres,
   output logic        rdi_pl_linkerror,
@@ -223,11 +240,31 @@ module logical_phy #(
   output logic        rdi_pl_stallreq,
   output logic        clear_start_link_train,
   input  logic        adapter_active_req,
-  output logic [NC-1:0] sb_tx_data,
-  output logic        sb_tx_valid,
-  input  logic [NC-1:0] sb_rx_data,
-  input  logic        sb_rx_valid,
+  // Public scalar physical sideband interface (UCIe 1.0 Section 4.1.5 and 5.13)
+  output logic        sb_tx_clk,
+  output logic        sb_tx_data,
+  input  logic        sb_rx_clk,
+  input  logic        sb_rx_data,
 
+  // Private Adapter sideband packet client interface (UCIe 1.0 Section 6.1)
+  input  logic        adapter_sb_tx_valid,
+  output logic        adapter_sb_tx_ready,
+  input  sb_packet_t  adapter_sb_tx_packet,
+  output logic        adapter_sb_rx_valid,
+  input  logic        adapter_sb_rx_ready,
+  output sb_packet_t  adapter_sb_rx_packet,
+  output logic        adapter_sb_rx_cp_error,
+  output logic        adapter_sb_rx_dp_error,
+  output logic        adapter_sb_rx_format_error,
+
+  // Separate PHY CSR Access Channel (from Adapter, Sections 6.1, 7.5)
+  input  logic        phy_csr_wr = 1'b0,
+  input  logic        phy_csr_rd = 1'b0,
+  input  logic [26:0] phy_csr_addr = 27'h0,
+  input  logic [63:0] phy_csr_wdata = 64'h0,
+  input  logic [7:0]  phy_csr_be = 8'h0,
+  output logic [63:0] phy_csr_rdata,
+  output logic        phy_csr_rdata_vld,
   // -------------------------------------------------- main band to partner
   output logic [NLANES-1:0] mb_tx_data,
   output logic        mb_tx_valid,  // main band framing valid (Req.2)
@@ -240,6 +277,8 @@ module logical_phy #(
   output logic            pl_cfg_vld,
   output logic            pl_cfg_crd
 );
+  import ucie_pkg::*;
+
 
   // ------------------------------------------------- internal datapath
   logic [NBYTES-1:0][7:0] tx_bytes;
@@ -293,15 +332,13 @@ module logical_phy #(
   logic              rx_gearbox_valid;   // valid strobe for that word
 
   // ------------------------------------------------- LTSM <-> sideband CDC
-  // The LTSM side uses lclk. The sb_codec side uses sbclk. Each direction
-  // carries complete packet fields through a one-entry asynchronous mailbox.
-  localparam int unsigned SB_TX_W = 126;
-  localparam int unsigned SB_RX_W = 101;
+  // Typed sb_packet_t channels for transmit and receive. Complete packets
+  // cross the asynchronous domain boundary via sb_cdc_mailbox instances.
+  // Spec ref: UCIe 1.0 Section 4.1.5, Section 5.13, Section 6.1.
+  localparam int unsigned SB_PKT_W = $bits(sb_packet_t);
+  localparam int unsigned SB_RX_MAILBOX_W = SB_PKT_W + 3;
 
-  // LTSM-facing TX request, mailbox acceptance, and codec-facing backpressure.
-  // sb_tx_accepted pulses only when the source mailbox captures the LTSM
-  // bundle. It is not serializer completion. The LTSM uses this pulse to
-  // distinguish accepted local transactions from blocked presentation.
+  // LTSM-facing TX request fields (converted into sb_packet_t)
   logic        sb_tx_load;
   logic [4:0]  sb_tx_opcode;
   logic [2:0]  sb_tx_srcid;
@@ -317,65 +354,82 @@ module logical_phy #(
   logic        sb_tx_has_data;
   logic        sb_tx_accepted;
   logic        sb_tx_busy;
-  // Codec-facing TX request produced by the lclk-to-sbclk mailbox.
-  logic [SB_TX_W-1:0] sb_tx_cdc_data;
-  logic               sb_tx_cdc_busy;
-  logic               codec_tx_load;
-  logic [4:0]         codec_tx_opcode;
-  logic [2:0]         codec_tx_srcid;
-  logic [2:0]         codec_tx_dstid;
-  logic [7:0]         codec_tx_msginfo;
-  logic [7:0]         codec_tx_msgcode;
-  logic [7:0]         codec_tx_msgsubcode;
-  logic [7:0]         codec_tx_be;
-  logic [4:0]         codec_tx_tag;
-  logic               codec_tx_ep;
-  logic [11:0]        codec_tx_addr;
-  logic [63:0]        codec_tx_data_in;
-  logic               codec_tx_has_data;
-  logic               codec_tx_busy;
-  logic               codec_tx_busy_meta_q;
-  logic               codec_tx_busy_sync_q;
-  logic               codec_tx_inflight_q;
-  logic               codec_tx_busy_seen_q;
-  logic [NC-1:0]      codec_sb_tx_data;
-  logic               codec_sb_tx_valid;
-  logic               codec_reset_n;
 
-  // Codec-facing RX packet and LTSM-facing packet delivered by sbclk-to-lclk.
-  // Phase A retains the complete decoded packet before it enters the mailbox.
-  // The LTSM keeps its existing private receive interface until Phase B adds
-  // DATA64 transaction validation. The lclk-domain payload signal remains
-  // live only to prove coherent Phase A transport and avoid data loss.
-  logic               codec_rx_pkt_vld;
-  logic [4:0]         codec_rx_opcode;
-  logic [2:0]         codec_rx_srcid;
-  logic [2:0]         codec_rx_dstid;
-  logic [7:0]         codec_rx_msginfo;
-  logic [7:0]         codec_rx_msgcode;
-  logic [7:0]         codec_rx_msgsubcode;
-  logic [63:0]        codec_rx_data;
-  logic               codec_rx_cp_err;
-  logic               codec_rx_dp_err;
-  logic [SB_RX_W-1:0] sb_rx_hold_data_q;
-  logic               sb_rx_hold_q;
-  logic [SB_RX_W-1:0] sb_rx_cdc_data;
-  logic               sb_rx_cdc_busy;
-  logic               sb_rx_pkt_vld;
-  logic [4:0]         sb_rx_opcode;
-  logic [2:0]         sb_rx_srcid;
-  logic [2:0]         sb_rx_dstid;
-  logic [7:0]         sb_rx_msginfo;
-  logic [7:0]         sb_rx_msgcode;
-  logic [7:0]         sb_rx_msgsubcode;
-  logic [63:0]        sb_rx_payload;
-  logic               sb_rx_cp_err;
-  logic               sb_rx_dp_err;
-  logic               sb_rx_valid_meta_q;
-  logic               sb_rx_valid_sync_q;
-  logic               sb_msg_timeout;
-  logic               sb_stall_sent;
+  sb_packet_t  ltsm_tx_packet;
 
+  // Arbiter between LTSM TX and Adapter TX
+  logic        arb_prio_q;
+  logic        ltsm_grant;
+  logic        adapter_grant;
+  logic        arb_toggle;
+  logic        tx_cdc_send;
+  sb_packet_t  tx_cdc_packet;
+  logic        tx_cdc_busy;
+
+  // Codec-facing TX signals in sbclk
+  sb_packet_t  codec_tx_cdc_data;
+  logic        codec_tx_cdc_valid;
+  logic        codec_tx_pending_q;
+  sb_packet_t  codec_tx_packet_q;
+  logic        codec_tx_valid;
+  logic        codec_tx_ready;
+  sb_packet_t  codec_tx_pkt;
+  logic        codec_tx_busy;
+  logic        codec_tx_busy_combined;
+  logic        codec_tx_busy_meta_q;
+  logic        codec_tx_busy_sync_q;
+  logic        codec_tx_inflight_q;
+  logic        codec_tx_busy_seen_q;
+  logic        codec_sb_tx_clk;
+  logic        codec_sb_tx_data;
+  logic        codec_reset_n;
+
+  // Codec-facing RX signals in sbclk
+  logic        codec_rx_valid;
+  logic        codec_rx_ready;
+  sb_packet_t  codec_rx_packet;
+  logic        codec_rx_format_error;
+  logic        codec_rx_cp_error;
+  logic        codec_rx_dp_error;
+  logic        codec_rx_overflow;
+  logic        codec_rx_overflow_meta_q;
+  logic        codec_rx_overflow_sync_q;
+  logic        codec_rx_overflow_prev_q;
+  logic        codec_rx_overflow_rise;
+
+  // Mailbox-facing RX signals in lclk
+  logic        rx_cdc_valid;
+  logic        rx_cdc_format_error;
+  logic        rx_cdc_cp_error;
+  logic        rx_cdc_dp_error;
+  sb_packet_t  rx_cdc_packet;
+  logic        sb_rx_cdc_busy;
+
+  // LTSM-facing RX signals (converted from sb_packet_t)
+  logic        sb_rx_pkt_vld;
+  logic [4:0]  sb_rx_opcode;
+  logic [2:0]  sb_rx_srcid;
+  logic [2:0]  sb_rx_dstid;
+  logic [7:0]  sb_rx_msginfo;
+  logic [7:0]  sb_rx_msgcode;
+  logic [7:0]  sb_rx_msgsubcode;
+  logic [63:0] sb_rx_payload;
+  logic        sb_rx_cp_err;
+  logic        sb_rx_dp_err;
+
+  // Adapter RX holding buffer in lclk
+  logic        adapter_rx_hold_q;
+  sb_packet_t  adapter_rx_pkt_q;
+  logic        adapter_rx_cp_err_q;
+  logic        adapter_rx_dp_err_q;
+  logic        adapter_rx_fmt_err_q;
+
+  // Sideband presence tracking
+  logic        sb_rx_present_s;
+  logic        sb_rx_present_meta_q;
+  logic        sb_rx_present_sync_q;
+  logic        sb_msg_timeout;
+  logic        sb_stall_sent;
   // --------------------------------------- LTSM <-> raw SBINIT primitive
   logic               pattern_run_enable;
   logic               sbinit_raw_mode;
@@ -392,8 +446,8 @@ module logical_phy #(
   logic               raw_rx_low_sample;
   logic               raw_tx_idle_s;
 
-  logic [NC-1:0]      raw_sb_tx_data;
-  logic               raw_sb_tx_valid;
+  logic               raw_sb_tx_clk;
+  logic               raw_sb_tx_data;
   logic               raw_tx_iter_done_s;
   logic               raw_rx_iter_vld_s;
   logic               raw_rx_iter_match_s;
@@ -435,6 +489,7 @@ module logical_phy #(
   logic        csr_rd;
   logic [26:0] csr_addr;
   logic [63:0] csr_wdata;
+  logic [7:0]  csr_be;
   logic [63:0] csr_rdata;
   logic        csr_rdata_vld;
 
@@ -450,11 +505,11 @@ module logical_phy #(
     .sbreset_n          (sbreset_n),
     .pattern_run_enable (pattern_run_enable),
     .sbinit_raw_mode    (sbinit_raw_mode),
+    .sb_rx_clk          (sb_rx_clk),
     .sb_rx_data         (sb_rx_data),
-    .sb_rx_valid        (sb_rx_valid),
     .raw_rx_result_busy (raw_rx_result_busy),
+    .sb_tx_clk          (raw_sb_tx_clk),
     .sb_tx_data         (raw_sb_tx_data),
-    .sb_tx_valid        (raw_sb_tx_valid),
     .raw_mode_active    (raw_mode_active_s),
     .raw_rx_low_sample  (raw_rx_low_sample),
     .raw_tx_idle        (raw_tx_idle_s),
@@ -583,94 +638,162 @@ module logical_phy #(
   // Raw and packet valid are selected together, so data and framing cannot
   // come from different sideband sources.
   // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
-  assign sb_tx_data  = raw_mode_active_s ? raw_sb_tx_data  :
-                                           codec_sb_tx_data;
-  assign sb_tx_valid = raw_mode_active_s ? raw_sb_tx_valid :
-                                           codec_sb_tx_valid;
+  // ===========================================================================
+  // Sideband Pin Multiplexing (spec 4.1.5, 4.5.3.2, 5.13)
+  // ===========================================================================
+  // Raw mode owns the public physical pins for the entire pattern phase, including its
+  // 1 ms idle windows. Packet pins become visible only after the boundary-safe
+  // mode change has reset and released the codec.
+  // Only scalar clock and scalar data are muxed to the physical pins.
+  // ===========================================================================
+  assign sb_tx_clk  = raw_mode_active_s ? raw_sb_tx_clk  : codec_sb_tx_clk;
+  assign sb_tx_data = raw_mode_active_s ? raw_sb_tx_data : codec_sb_tx_data;
 
-  // ---------------------------------------------------------------------------
-  // Sideband CDC and Codec Instantiations  (u_sb_tx_cdc/u_sb_codec/u_sb_rx_cdc)
-  // ---------------------------------------------------------------------------
-  // The LTSM generates and consumes one-lclk-cycle packet events. The sb_codec
-  // samples and produces one-sbclk-cycle packet events at 800 MHz. The paired
-  // toggle mailboxes preserve packet data and event delivery across the two
-  // asynchronous domains. The codec remains the sole sbclk-domain serializer
-  // and deserializer.
-  //
-  // The TX mailbox carries the full 126-bit LTSM request bundle to sbclk. The
-  // RX mailbox carries 101 bits: packet fields, CP/DP results, and DATA64.
-  // A sbclk-domain hold register preserves a decoded packet if the RX mailbox
-  // is busy. The busy path synchronizes codec backpressure into lclk and
-  // combines it with mailbox occupancy before the LTSM can issue another
-  // request.
-  // Spec ref: UCIe 1.0 Chapter 6, Section 6.1.2, Tables 47, 53, 54, and 56.
-  sb_cdc_mailbox #(.WIDTH(SB_TX_W)) u_sb_tx_cdc (
+  // ===========================================================================
+  // LTSM TX Packet Assembly and Arbitration (UCIe 1.0 Section 6.1)
+  // ===========================================================================
+  // Converts flat LTSM TX fields into one typed sb_packet_t container.
+  // Preserves existing LTSM port interface so ltsm.sv remains functional.
+  // ===========================================================================
+  always_comb begin
+    ltsm_tx_packet             = '0;
+    ltsm_tx_packet.opcode      = sb_tx_opcode;
+    ltsm_tx_packet.src_id      = sb_tx_srcid;
+    ltsm_tx_packet.dst_id      = sb_tx_dstid;
+    ltsm_tx_packet.msg_info    = {8'h00, sb_tx_msginfo};
+    ltsm_tx_packet.msg_code    = sb_tx_msgcode;
+    ltsm_tx_packet.msg_subcode = sb_tx_msgsubcode;
+    ltsm_tx_packet.cr          = 1'b0;
+    ltsm_tx_packet.addr        = {15'h0000, sb_tx_addr};
+    ltsm_tx_packet.be          = sb_tx_be;
+    ltsm_tx_packet.tag         = sb_tx_tag;
+    ltsm_tx_packet.ep          = sb_tx_ep;
+    ltsm_tx_packet.status      = 3'b000;
+    ltsm_tx_packet.data        = sb_tx_data_in;
+  end
+
+  // Pure helper: response packet detection per Section 6.1
+  function automatic logic is_response_packet(input sb_packet_t pkt);
+    sb_packet_kind_t kind;
+    kind = ucie_pkg::sb_packet_kind(pkt.opcode);
+    if (kind == SB_PKT_COMPLETION) begin
+      return 1'b1;
+    end else if (kind == SB_PKT_MESSAGE) begin
+      return (!pkt.msg_code[0] && (pkt.msg_code != 8'h00));
+    end else begin
+      return 1'b0;
+    end
+  endfunction
+
+  // Pure helper: PHY link training traffic identification (Sections 4.5.3, 6.1)
+  function automatic logic is_phy_training_packet(input sb_packet_t pkt);
+    if ((pkt.opcode == SB_OP_MSG_NODATA) || (pkt.opcode == SB_OP_MSG_DATA64)) begin
+      if ((pkt.src_id == SRCID_PHY) && (pkt.dst_id == DSTID_REMOTE_PHY)) begin
+        case (pkt.msg_code)
+          MC_SB_OOB_RESET,
+          MC_SB_DONE_REQ,
+          MC_SB_DONE_RSP,
+          8'h03, // MC_MBINIT_REQ
+          8'h04, // MC_MBINIT_RSP
+          8'h05, // MC_MBTRAIN_REQ
+          8'h06, // MC_MBTRAIN_RSP
+          8'h07, // MC_PHYRETRAIN_REQ
+          8'h08, // MC_PHYRETRAIN_RSP
+          MC_LM_RDI_REQ,
+          MC_LM_RDI_RSP,
+          MC_TE_REQ,
+          MC_TE_RSP: return 1'b1;
+          default:   return 1'b0;
+        endcase
+      end else begin
+        return 1'b0;
+      end
+    end else begin
+      return 1'b0;
+    end
+  endfunction
+
+  // Small non-starving arbiter with mandatory LTSM/response priority and
+  // alternating Adapter/LTSM request selection. Does not own remote request
+  // credits or tags here.
+  wire ltsm_is_resp    = is_response_packet(ltsm_tx_packet);
+  wire adapter_is_resp = is_response_packet(adapter_sb_tx_packet);
+
+  always_comb begin
+    ltsm_grant    = 1'b0;
+    adapter_grant = 1'b0;
+    arb_toggle    = 1'b0;
+
+    if (sb_tx_load && (ltsm_state != LT_ACTIVE)) begin
+      // Mandatory LTSM priority during link training
+      ltsm_grant = 1'b1;
+    end else if (sb_tx_load && ltsm_is_resp) begin
+      // Mandatory LTSM response priority
+      ltsm_grant = 1'b1;
+    end else if (adapter_sb_tx_valid && adapter_is_resp) begin
+      // Mandatory Adapter response priority over requests
+      adapter_grant = 1'b1;
+    end else if (sb_tx_load && adapter_sb_tx_valid) begin
+      // Alternating request selection between LTSM and Adapter
+      if (!arb_prio_q) begin
+        ltsm_grant = 1'b1;
+        arb_toggle = 1'b1;
+      end else begin
+        adapter_grant = 1'b1;
+        arb_toggle    = 1'b1;
+      end
+    end else if (sb_tx_load) begin
+      ltsm_grant = 1'b1;
+    end else if (adapter_sb_tx_valid) begin
+      adapter_grant = 1'b1;
+    end
+  end
+
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      arb_prio_q <= 1'b0;
+    end else if (arb_toggle && tx_cdc_send) begin
+      arb_prio_q <= ~arb_prio_q;
+    end
+  end
+
+  assign tx_cdc_send         = (ltsm_grant || adapter_grant) && !sb_tx_busy;
+  assign tx_cdc_packet       = ltsm_grant ? ltsm_tx_packet : adapter_sb_tx_packet;
+  assign sb_tx_accepted      = ltsm_grant && !sb_tx_busy;
+  assign adapter_sb_tx_ready = adapter_grant && !sb_tx_busy;
+
+  // ===========================================================================
+  // Transmit CDC Mailbox (lclk to sbclk)
+  // ===========================================================================
+  // Carries complete typed sb_packet_t transactions to sbclk.
+  sb_cdc_mailbox #(.WIDTH(SB_PKT_W)) u_sb_tx_cdc (
     .src_clk    (lclk),
     .src_reset_n(lreset_n),
-    .src_data   ({sb_tx_opcode, sb_tx_srcid, sb_tx_dstid, sb_tx_msginfo,
-                  sb_tx_msgcode, sb_tx_msgsubcode, sb_tx_be, sb_tx_tag,
-                  sb_tx_ep, sb_tx_addr, sb_tx_data_in, sb_tx_has_data}),
-    .src_send   (sb_tx_load),
-    .src_busy   (sb_tx_cdc_busy),
+    .src_data   (tx_cdc_packet),
+    .src_send   (tx_cdc_send),
+    .src_busy   (tx_cdc_busy),
     .dst_clk    (sbclk),
     .dst_reset_n(sbreset_n),
-    .dst_data   (sb_tx_cdc_data),
-    .dst_valid  (codec_tx_load)
+    .dst_data   (codec_tx_cdc_data),
+    .dst_valid  (codec_tx_cdc_valid)
   );
-  // ---------------------------------------------------------------------------
-  // TX Mailbox Source-Acceptance Event
-  // ---------------------------------------------------------------------------
-  // The mailbox samples a source bundle only when src_send is high and its
-  // source-side busy output is low. This lclk pulse exposes that exact event
-  // to the LTSM. It does not report sbclk delivery or serializer completion.
-  // The combined sb_tx_busy signal continues to prevent a second transaction.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.2; PLAN.md §15.3 transaction acceptance.
-  // ---------------------------------------------------------------------------
-  assign sb_tx_accepted = sb_tx_load && !sb_tx_cdc_busy;
 
-  // ---------------------------------------------------------------------------
-  // assign: Decode the sideband TX mailbox bundle
-  // Unpacks the stable mailbox payload for the sbclk-domain codec transmit
-  // fields. The mailbox handshake already qualifies the bundle for this
-  // combinational decode, so no additional state or event is created here.
-  //
-  // Spec ref: UCIe 1.0 Section 6.1.2; PLAN.md Section 15.3.
-  assign {codec_tx_opcode, codec_tx_srcid, codec_tx_dstid, codec_tx_msginfo,
-          codec_tx_msgcode, codec_tx_msgsubcode, codec_tx_be, codec_tx_tag,
-          codec_tx_ep, codec_tx_addr, codec_tx_data_in, codec_tx_has_data} =
-         sb_tx_cdc_data;
-
-  // Synchronize codec busy and packet-mode sideband presence into lclk.
-  // Raw pattern valid is excluded from RDI in-band presence.
-  // ---------------------------------------------------------------------------
-  // always_ff: Synchronize codec busy and packet presence
-  //
-  // Transfers codec busy and packet-valid indications into lclk with two
-  // registers. Raw SBINIT traffic is excluded from packet presence reporting.
-  //
-  // Spec ref: UCIe 1.0 Section 6.1.2; PLAN.md Section 15.3.
+  // Synchronize codec busy and sideband packet presence into lclk
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_busy_meta_q <= 1'b0;
       codec_tx_busy_sync_q <= 1'b0;
-      sb_rx_valid_meta_q   <= 1'b0;
-      sb_rx_valid_sync_q   <= 1'b0;
+      sb_rx_present_meta_q <= 1'b0;
+      sb_rx_present_sync_q <= 1'b0;
     end else begin
-      codec_tx_busy_meta_q <= codec_tx_busy;
+      codec_tx_busy_meta_q <= codec_tx_busy_combined;
       codec_tx_busy_sync_q <= codec_tx_busy_meta_q;
-      sb_rx_valid_meta_q   <= sb_rx_valid && codec_packet_ready_s;
-      sb_rx_valid_sync_q   <= sb_rx_valid_meta_q;
+      sb_rx_present_meta_q <= sb_rx_present_s;
+      sb_rx_present_sync_q <= sb_rx_present_meta_q;
     end
   end
 
-  // A mailbox acknowledgement means that sbclk captured the bundle, not that
-  // the serializer completed the packet. Hold the lclk busy contract until
-  // codec busy has been observed high and then low. Source acceptance starts
-  // the in-flight interval, which closes the acknowledgement/busy CDC gap.
-  // This protects repeated Out-of-Reset and queued peer-response packets.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.2; PLAN.md §15.3 transaction acceptance.
+  // In-flight tracking: ensure lclk busy interval covers the entire transaction
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_inflight_q  <= 1'b0;
@@ -678,132 +801,163 @@ module logical_phy #(
     end else if (sbinit_raw_mode) begin
       codec_tx_inflight_q  <= 1'b0;
       codec_tx_busy_seen_q <= 1'b0;
-    end else if (sb_tx_accepted) begin
+    end else if (tx_cdc_send) begin
       codec_tx_inflight_q  <= 1'b1;
       codec_tx_busy_seen_q <= 1'b0;
     end else if (codec_tx_inflight_q) begin
       if (codec_tx_busy_sync_q) codec_tx_busy_seen_q <= 1'b1;
-      if (codec_tx_busy_seen_q && !codec_tx_busy_sync_q &&
-          !sb_tx_cdc_busy) begin
+      if (codec_tx_busy_seen_q && !codec_tx_busy_sync_q && !tx_cdc_busy) begin
         codec_tx_inflight_q  <= 1'b0;
         codec_tx_busy_seen_q <= 1'b0;
       end
     end
   end
 
-  // ---------------------------------------------------------------------------
-  // assign: Combine sideband transaction busy sources
-  //
-  // Blocks a new packet while the mailbox, codec, in-flight tracker, or
-  // boundary-safe codec reset is still busy.
-  //
-  // Spec ref: UCIe 1.0 Section 6.1.2; PLAN.md Section 15.3.
-  assign sb_tx_busy = sb_tx_cdc_busy | codec_tx_busy_sync_q |
+  assign sb_tx_busy = tx_cdc_busy | codec_tx_busy_sync_q |
                       codec_tx_inflight_q | !codec_packet_ready_sync_q;
 
-  // ---------------------------------------------------------------------------
-  // Module instantiation: Sideband packet codec
-  //
-  // Converts accepted lclk-domain packet fields into the sbclk-domain
-  // sideband stream and decodes received packets for the Logical PHY.
-  //
-  // Spec ref: UCIe 1.0 Chapter 6, Section 6.1.2, Tables 47, 53, 54, and 56.
-  sb_codec u_sb_codec (
-    .sbclk        (sbclk),
-    .sbreset_n    (codec_reset_n),
-    .tx_load      (codec_tx_load),
-    .tx_opcode    (codec_tx_opcode),
-    .tx_srcid     (codec_tx_srcid),
-    .tx_dstid     (codec_tx_dstid),
-    .tx_msginfo   (codec_tx_msginfo),
-    .tx_msgcode   (codec_tx_msgcode),
-    .tx_msgsubcode(codec_tx_msgsubcode),
-    .tx_cr        (1'b0),
-    .tx_addr      (codec_tx_addr),
-    .tx_be        (codec_tx_be),
-    .tx_tag       (codec_tx_tag),
-    .tx_ep        (codec_tx_ep),
-    .tx_data_in   (codec_tx_data_in),
-    .tx_has_data  (codec_tx_has_data),
-    .tx_busy      (codec_tx_busy),
-    .sb_tx_data   (codec_sb_tx_data),
-    .sb_tx_valid  (codec_sb_tx_valid),
-    .sb_rx_data   (sb_rx_data),
-    .sb_rx_valid  (sb_rx_valid && codec_packet_ready_s),
-    .rx_pkt_vld   (codec_rx_pkt_vld),
-    .rx_opcode    (codec_rx_opcode),
-    .rx_srcid     (codec_rx_srcid),
-    .rx_dstid     (codec_rx_dstid),
-    .rx_msginfo   (codec_rx_msginfo),
-    .rx_msgcode   (codec_rx_msgcode),
-    .rx_msgsubcode(codec_rx_msgsubcode),
-    .rx_cr        (),
-    .rx_addr      (),
-    .rx_data      (codec_rx_data),
-    .rx_cp_err    (codec_rx_cp_err),
-    .rx_dp_err    (codec_rx_dp_err)
-  );
-  // -------------------------------------------------------------------------
-  // always_ff: sbclk RX packet retention
-  //
-  // Captures every decoded codec packet before the asynchronous RX mailbox.
-  // The register retains the complete 101-bit packet while the mailbox busy
-  // handshake returns from lclk. This prevents a one-cycle codec event from
-  // disappearing because the mailbox cannot accept it on that sbclk edge.
-  // The lclk destination observes the same coherent fields and DATA64 word.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1 packet transport; PLAN.md §15.2 Phase A.
-  // -------------------------------------------------------------------------
+  // Buffer each mailbox delivery until the codec accepts it. The mailbox
+  // valid pulse remains high through the codec acceptance edge, so retire
+  // an existing pending packet before capturing a new delivery. This keeps
+  // one CDC event equal to one codec transaction.
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
-      sb_rx_hold_q      <= 1'b0;
-      sb_rx_hold_data_q <= '0;
-    end else if (codec_rx_pkt_vld) begin
-      sb_rx_hold_q      <= 1'b1;
-      sb_rx_hold_data_q <= {codec_rx_opcode, codec_rx_srcid, codec_rx_dstid,
-                            codec_rx_msginfo, codec_rx_msgcode,
-                            codec_rx_msgsubcode, codec_rx_cp_err,
-                            codec_rx_dp_err, codec_rx_data};
-    end else if (!sb_rx_cdc_busy) begin
-      sb_rx_hold_q <= 1'b0;
+      codec_tx_pending_q <= 1'b0;
+      codec_tx_packet_q  <= '0;
+    end else if (codec_tx_ready && codec_tx_pending_q) begin
+      codec_tx_pending_q <= 1'b0;
+    end else if (codec_tx_cdc_valid) begin
+      codec_tx_pending_q <= 1'b1;
+      codec_tx_packet_q  <= codec_tx_cdc_data;
     end
   end
 
-  // -------------------------------------------------------------------------
-  // Instantiation: sb_cdc_mailbox RX transport
-  //
-  // Transfers one retained parsed packet from sbclk to lclk. The source send
-  // level remains asserted until the mailbox accepts the hold register while
-  // not busy. The mailbox therefore transports a coherent payload and error
-  // event without changing the public logical PHY interface.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1; PLAN.md §15.2 private packet transport.
-  // -------------------------------------------------------------------------
-  sb_cdc_mailbox #(.WIDTH(SB_RX_W)) u_sb_rx_cdc (
+  assign codec_tx_valid         = codec_tx_pending_q;
+  assign codec_tx_pkt           = codec_tx_packet_q;
+  assign codec_tx_busy_combined = codec_tx_busy || codec_tx_pending_q;
+
+  // Track sideband presence in packet mode
+  always_ff @(posedge sbclk or negedge sbreset_n) begin
+    if (!sbreset_n) begin
+      sb_rx_present_s <= 1'b0;
+    end else if (!codec_packet_ready_s) begin
+      sb_rx_present_s <= 1'b0;
+    end else if (codec_rx_valid) begin
+      sb_rx_present_s <= 1'b1;
+    end
+  end
+
+  // ===========================================================================
+  // Sideband Physical Codec Instantiation (sb_codec)
+  // ===========================================================================
+  // Owns SDR strobe serializing/deserializing on scalar physical pins.
+  // Connects new sb_codec handshake (tx_valid/ready, rx_valid/ready).
+  // Spec ref: UCIe 1.0 Section 4.1.5, Section 5.13, Section 6.1.
+  // ===========================================================================
+  sb_codec u_sb_codec (
+    .sbclk          (sbclk),
+    .sbreset_n      (codec_reset_n),
+    .tx_valid       (codec_tx_valid),
+    .tx_ready       (codec_tx_ready),
+    .tx_packet      (codec_tx_pkt),
+    .tx_busy        (codec_tx_busy),
+    .sb_tx_clk      (codec_sb_tx_clk),
+    .sb_tx_data     (codec_sb_tx_data),
+    .sb_rx_clk      (sb_rx_clk),
+    .sb_rx_data     (sb_rx_data),
+    .rx_valid       (codec_rx_valid),
+    .rx_ready       (codec_rx_ready),
+    .rx_packet      (codec_rx_packet),
+    .rx_format_error(codec_rx_format_error),
+    .rx_cp_error    (codec_rx_cp_error),
+    .rx_dp_error    (codec_rx_dp_error),
+    .rx_overflow    (codec_rx_overflow)
+  );
+
+  // Hold codec RX events until the lclk mailbox accepts them
+  assign codec_rx_ready = codec_rx_valid && !sb_rx_cdc_busy;
+
+  // Synchronize sticky codec overflow error into lclk fatal policy
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      codec_rx_overflow_meta_q <= 1'b0;
+      codec_rx_overflow_sync_q <= 1'b0;
+      codec_rx_overflow_prev_q <= 1'b0;
+    end else begin
+      codec_rx_overflow_meta_q <= codec_rx_overflow;
+      codec_rx_overflow_sync_q <= codec_rx_overflow_meta_q;
+      codec_rx_overflow_prev_q <= codec_rx_overflow_sync_q;
+    end
+  end
+
+  assign codec_rx_overflow_rise = codec_rx_overflow_sync_q && !codec_rx_overflow_prev_q;
+
+  // ===========================================================================
+  // Receive CDC Mailbox (sbclk to lclk)
+  // ===========================================================================
+  // Carries complete typed sb_packet_t plus aligned CP/DP/format error bits.
+  sb_cdc_mailbox #(.WIDTH(SB_RX_MAILBOX_W)) u_sb_rx_cdc (
     .src_clk    (sbclk),
     .src_reset_n(sbreset_n),
-    .src_data   (sb_rx_hold_data_q),
-    .src_send   (sb_rx_hold_q && !sb_rx_cdc_busy),
+    .src_data   ({codec_rx_format_error, codec_rx_cp_error, codec_rx_dp_error, codec_rx_packet}),
+    .src_send   (codec_rx_valid && !sb_rx_cdc_busy),
     .src_busy   (sb_rx_cdc_busy),
     .dst_clk    (lclk),
     .dst_reset_n(lreset_n),
-    .dst_data   (sb_rx_cdc_data),
-    .dst_valid  (sb_rx_pkt_vld)
+    .dst_data   ({rx_cdc_format_error, rx_cdc_cp_error, rx_cdc_dp_error, rx_cdc_packet}),
+    .dst_valid  (rx_cdc_valid)
   );
 
-  // -------------------------------------------------------------------------
-  // assign: complete RX packet unpack
-  //
-  // Unpacks the mailbox destination bundle in exactly the same order used by
-  // the sbclk hold register. DATA64 is retained in the private lclk signal
-  // sb_rx_payload for Phase B. Existing LTSM inputs remain unchanged in Phase A.
-  // CP and DP error bits remain aligned with all decoded packet fields.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.2; PLAN.md §15.2 lossless transport.
-  // -------------------------------------------------------------------------
-  assign {sb_rx_opcode, sb_rx_srcid, sb_rx_dstid, sb_rx_msginfo,
-          sb_rx_msgcode, sb_rx_msgsubcode, sb_rx_cp_err, sb_rx_dp_err,
-          sb_rx_payload} = sb_rx_cdc_data;
+  // ===========================================================================
+  // Receive Packet Demux and Field Unpack (lclk)
+  // ===========================================================================
+  // Routes required PHY LTSM traffic to LTSM; routes all non-PHY-training
+  // traffic to the private Adapter RX client.
+  wire route_to_ltsm    = (ltsm_state != LT_ACTIVE) || is_phy_training_packet(rx_cdc_packet);
+  wire route_to_adapter = !route_to_ltsm;
+
+  // LTSM policy boundary unpack: preserves existing ltsm.sv port interface
+  assign sb_rx_pkt_vld    = rx_cdc_valid && route_to_ltsm;
+  assign sb_rx_opcode     = rx_cdc_packet.opcode;
+  assign sb_rx_srcid      = rx_cdc_packet.src_id;
+  assign sb_rx_dstid      = rx_cdc_packet.dst_id;
+  assign sb_rx_msginfo    = rx_cdc_packet.msg_info[7:0];
+  assign sb_rx_msgcode    = rx_cdc_packet.msg_code;
+  assign sb_rx_msgsubcode = rx_cdc_packet.msg_subcode;
+  assign sb_rx_payload    = rx_cdc_packet.data;
+  assign sb_rx_cp_err     = rx_cdc_cp_error | rx_cdc_format_error;
+  assign sb_rx_dp_err     = rx_cdc_dp_error;
+
+  // Adapter RX client holding buffer: delivers packet and retains until acknowledged
+  wire adapter_rx_in_vld = rx_cdc_valid && route_to_adapter;
+
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      adapter_rx_hold_q    <= 1'b0;
+      adapter_rx_pkt_q     <= '0;
+      adapter_rx_cp_err_q  <= 1'b0;
+      adapter_rx_dp_err_q  <= 1'b0;
+      adapter_rx_fmt_err_q <= 1'b0;
+    end else begin
+      if (adapter_rx_in_vld) begin
+        if (!adapter_sb_rx_ready || adapter_rx_hold_q) begin
+          adapter_rx_hold_q    <= 1'b1;
+          adapter_rx_pkt_q     <= rx_cdc_packet;
+          adapter_rx_cp_err_q  <= rx_cdc_cp_error;
+          adapter_rx_dp_err_q  <= rx_cdc_dp_error;
+          adapter_rx_fmt_err_q <= rx_cdc_format_error;
+        end
+      end else if (adapter_sb_rx_ready && adapter_rx_hold_q) begin
+        adapter_rx_hold_q <= 1'b0;
+      end
+    end
+  end
+
+  assign adapter_sb_rx_valid        = adapter_rx_hold_q || adapter_rx_in_vld;
+  assign adapter_sb_rx_packet       = adapter_rx_hold_q ? adapter_rx_pkt_q : rx_cdc_packet;
+  assign adapter_sb_rx_cp_error     = adapter_rx_hold_q ? adapter_rx_cp_err_q : rx_cdc_cp_error;
+  assign adapter_sb_rx_dp_error     = adapter_rx_hold_q ? adapter_rx_dp_err_q : rx_cdc_dp_error;
+  assign adapter_sb_rx_format_error = adapter_rx_hold_q ? adapter_rx_fmt_err_q : rx_cdc_format_error;
 
   // ---------------------------------------------------------------------------
   // always_ff: Private LTSM Start and RDI event sampling
@@ -971,7 +1125,7 @@ module logical_phy #(
   //
   // In this build:
   //   - phy_retrain_req is derived from the adapter requesting RDI_REQ_RETRAIN.
-  //   - phy_inband_pres mirrors sb_rx_valid (partner alive on sideband).
+//   - phy_inband_pres indicates partner present in packet mode.
   //   - cerror, nferror, and stall_req are tied to zero.
   //   - rdi_pl_state_sts is the registered RDI state and drives the public
   //     status output directly, so the Adapter observes the published state.
@@ -997,7 +1151,7 @@ module logical_phy #(
     .phy_link_reset  (link_reset_out),
     .phy_retrain_req (rdi_lp_state_req == ucie_pkg::RDI_REQ_RETRAIN),
     .phy_train_error (train_error),
-    .phy_inband_pres (sb_rx_valid_sync_q),
+    .phy_inband_pres (sb_rx_present_sync_q),
     .cerror          (1'b0),
     .nferror         (1'b0),
     .stall_req       (1'b0),
@@ -1094,6 +1248,7 @@ module logical_phy #(
     .csr_rd        (csr_rd),
     .csr_addr      (csr_addr),
     .csr_wdata     (csr_wdata),
+    .csr_be        (csr_be),
     .csr_rdata     (csr_rdata),
     .csr_rdata_vld (csr_rdata_vld),
     .ltsm_state    (ltsm_state),
@@ -1155,11 +1310,13 @@ module logical_phy #(
   // capability build the path is stubbed to constants: no external register
   // accesses are generated.
   // ---------------------------------------------------------------------------
-  assign csr_wr    = 1'b0;
-  assign csr_rd    = 1'b0;
-  assign csr_addr  = 27'h0;
-  assign csr_wdata = 64'h0;
-
+  assign csr_wr            = phy_csr_wr;
+  assign csr_rd            = phy_csr_rd;
+  assign csr_addr          = phy_csr_addr;
+  assign csr_wdata         = phy_csr_wdata;
+  assign csr_be            = phy_csr_be;
+  assign phy_csr_rdata     = csr_rdata;
+  assign phy_csr_rdata_vld = csr_rdata_vld;
   // ---------------------------------------------------------------------------
   // Configuration interface stub  (spec 6.1 sideband cfg)
   // ---------------------------------------------------------------------------
@@ -1485,7 +1642,7 @@ module logical_phy #(
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
   //           PLAN.md Sections 15.6 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
-  assign ltsm_framing_fault_event = (rx_framing_fault_rise &&
+  assign ltsm_framing_fault_event = ((rx_framing_fault_rise || codec_rx_overflow_rise) &&
                                      ltsm_fatal_policy_armed) ||
                                     rx_framing_fault_pending_q;
 
@@ -1651,11 +1808,16 @@ module logical_phy #(
   //           PLAN.md Sections 15.5 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
   logic unused;
-  assign unused = adapter_active_req | csr_rdata_vld |
-                  csr_rdata[0] | phy_retrain_done | sb_msg_timeout |
+  assign unused = adapter_active_req | rdi_lp_linkerror |
+                  phy_retrain_done | sb_msg_timeout |
                   sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |
                   raw_rx_result_busy | raw_tx_done_busy |
-                  lp_cfg[0] | lp_cfg_vld | lp_cfg_crd;
+                  lp_cfg[0] | lp_cfg_vld | lp_cfg_crd |
+                  sb_tx_has_data |
+                  rx_cdc_packet.cr | rx_cdc_packet.ep |
+                  rx_cdc_packet.tag[0] | rx_cdc_packet.be[0] |
+                  rx_cdc_packet.status[0] | rx_cdc_packet.addr[0] |
+                  rx_cdc_packet.msg_info[8] | codec_tx_ready;
 
 endmodule
 

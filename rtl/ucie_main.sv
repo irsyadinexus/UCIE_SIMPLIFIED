@@ -85,6 +85,10 @@
 //      |  lp_state_req ---------+                                |
 //      |  lp_stallack ----------+                                |
 //      |  lp_stream/rx_active --+                                |
+//      |  lp_cfg/pl_cfg <------->                                |
+//      |  lp_clk_ack/pl_clk_req -+                                |
+//      |  lp_wake_req/pl_wake_ack                                |
+//      |  lp_linkerror --------->                                |
 //      |                        |                                |
 //      |  pl_trdy/valid/data <--+                                |
 //      |  pl_state_sts <--------+                                |
@@ -93,8 +97,7 @@
 //      |  pl_error/cerror/nf <--+                                |
 //      |  pl_phyinrecenter <----+                                |
 //      |  pl_inband_pres <------+                                |
-//      |  lp_linkerror <--------+                                |
-//      |                        |                                |
+//      |  pl_speed/lnk_cfg <----+                                |
 //      v                        v                                v
 //  +================================================================+
 //  |                        ucie_main (this module)                 |
@@ -122,11 +125,10 @@
 //  |  |  | Error Log 0/1      |  | rdi_pl_stallreq    | |(6.1)   | | |
 //  |  |  +---------------------+  | rdi_pl_linkerror   | +--------+ | |
 //  |  |                           |                   |            | |
-//  |  |  +---------------------+  | lp_cfg / pl_cfg   | +--------+ | |
-//  |  |  | Adapter SB IF       |  | lp_cfg_vld        | |PatGen  | | |
-//  |  |  | (lp_cfg / pl_cfg)  |  | lp_cfg_crd        | |(4.4)   | | |
-//  |  |  +---------------------+  | pl_cfg_vld        | +--------+ | |
-//  |  |                           | pl_cfg_crd        |            | |
+//  |  |  +---------------------+  | adapter_sb_* pkt  | +--------+ | |
+//  |  |  | Adapter SB IF       |  | phy_csr_* channel | |PatGen  | | |
+//  |  |  | (lp_cfg / pl_cfg)  |  | rdi_lp_linkerror  | |(4.4)   | | |
+//  |  |  +---------------------+  |                   | +--------+ | |
 //  |  |  Start copies -------->| private event wiring  | |ByteLane| | |
 //  |  |  (Adapter and PHY CSR) | clear after Active    | | Mapper | | |
 //  |  +------------------------+ Entry, spec 8.1.6     | |(4.1.1) | | |
@@ -137,10 +139,10 @@
 //  |                                                  | |(7.5.3) | | |
 //  |                                                  | +--------+ | |
 //  |                                                  |            | |
-//  |                                                  | sb_tx_data |==> SB TX
-//  |                                                  | sb_tx_valid|==> to
-//  |                                                  | sb_rx_data |<== partner
-//  |                                                  | sb_rx_valid|<== die
+//  |                                                  | sb_tx_clk  |==> SB TX
+//  |                                                  | sb_tx_data |==> to
+//  |                                                  | sb_rx_clk  |<== partner
+//  |                                                  | sb_rx_data |<== die
 //  |                                                  |            | |
 //  |                                                  | mb_tx_data |==> MB TX
 //  |                                                  | mb_rx_data |<== MB RX
@@ -250,8 +252,17 @@
   //                                        Adapter register copy.
   // v0.0.7    2026-09-25    Phase D: route Adapter Start as a private event
   //                                        and remove stale peer-Active feedback.
-  // v0.0.8    2026-09-25    Preserve the public adapter_active_req input
-  //                                        with a low policy-inert tie-off.
+//   v0.0.8    2026-09-25    Preserve the public adapter_active_req input
+//                           with a low policy-inert tie-off.
+//   v0.0.9    2026-09-28    Sideband protocol remediation:
+//                           Expose scalar sb_tx_clk/sb_tx_data and
+//                           sb_rx_clk/sb_rx_data (Sections 4.1.5, 5.13).
+//                           Expose public FDI cfg sideband (lp_cfg/pl_cfg)
+//                           and Stage 3 clock/wake/protocol ports
+//                           (Sections 6.1, 7.5, 8.2). Make lp_linkerror
+//                           an input (Section 8.2). Cross-connect typed
+//                           Adapter packet channels and PHY CSR channel
+//                           between u_adapter and u_lphy (Sections 6.1, 7.5, 8.1).
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -259,7 +270,8 @@ import ucie_pkg::*;
 `timescale 1ns/1ps
 module ucie_main #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES,
-  parameter int unsigned NLANES = NLANES_MAX
+  parameter int unsigned NLANES = NLANES_MAX,
+  parameter int unsigned NC     = ucie_pkg::NC
 ) (
   input  logic        lclk,
   input  logic        lreset_n,
@@ -290,13 +302,30 @@ module ucie_main #(
   output logic [3:0]  pl_state_sts,
   output logic        pl_inband_pres,
   output logic        pl_stallreq,
-  output logic        lp_linkerror,
-  // ------------------------------------------------- sideband to partner
-  output logic [NC-1:0] sb_tx_data,
-  output logic        sb_tx_valid,
-  input  logic [NC-1:0] sb_rx_data,
-  input  logic        sb_rx_valid,
+  input  logic        lp_linkerror = 1'b0,
 
+  // FDI Configuration Sideband (UCIe 1.0 Section 8.2.3, Table 115)
+  input  logic [NC-1:0] lp_cfg = '0,
+  input  logic        lp_cfg_vld = 1'b0,
+  input  logic        lp_cfg_crd = 1'b0,
+  output logic [NC-1:0] pl_cfg,
+  output logic        pl_cfg_vld,
+  output logic        pl_cfg_crd,
+
+  // FDI Stage 3 Clock / Wake / Protocol Status (UCIe 1.0 Section 8.2, Table 115)
+  output logic        pl_protocol_vld,
+  output logic        pl_clk_req,
+  input  logic        lp_clk_ack = 1'b1,
+  input  logic        lp_wake_req = 1'b0,
+  output logic        pl_wake_ack,
+  output logic [2:0]  pl_speedmode,
+  output logic [2:0]  pl_lnk_cfg,
+
+  // ------------------------------------------------- sideband to partner (scalar)
+  output logic        sb_tx_clk,
+  output logic        sb_tx_data,
+  input  logic        sb_rx_clk,
+  input  logic        sb_rx_data,
   // ------------------------------------------------- main band to partner
   output logic [NLANES-1:0] mb_tx_data,
   output logic        mb_tx_valid,  // main band framing valid (Req.2)
@@ -353,13 +382,31 @@ module ucie_main #(
   logic [2:0]  rdi_pl_lnk_cfg;
   logic [2:0]  rdi_pl_speedmode;
   logic        rdi_pl_stallreq;
-  logic [NC-1:0] lp_cfg;
-  logic          lp_cfg_vld;
-  logic          lp_cfg_crd;
-  logic [NC-1:0] pl_cfg;
-  logic          pl_cfg_vld;
-  logic          pl_cfg_crd;
+  logic        rdi_lp_linkerror;
 
+  // ==========================================================================
+  // Private Typed Adapter Packet Client Channel -- Spec 6.1
+  // ==========================================================================
+  logic        adapter_sb_tx_valid;
+  logic        adapter_sb_tx_ready;
+  sb_packet_t  adapter_sb_tx_packet;
+  logic        adapter_sb_rx_valid;
+  logic        adapter_sb_rx_ready;
+  sb_packet_t  adapter_sb_rx_packet;
+  logic        adapter_sb_rx_cp_error;
+  logic        adapter_sb_rx_dp_error;
+  logic        adapter_sb_rx_format_error;
+
+  // ==========================================================================
+  // Separate PHY CSR Access Channel -- Spec 7.5
+  // ==========================================================================
+  logic        phy_csr_wr;
+  logic        phy_csr_rd;
+  logic [26:0] phy_csr_addr;
+  logic [63:0] phy_csr_wdata;
+  logic [7:0]  phy_csr_be;
+  logic [63:0] phy_csr_rdata;
+  logic        phy_csr_rdata_vld;
   // ==========================================================================
   // Private Start-event wiring -- PLAN.md Sections 15.5 and 15.9
   // ==========================================================================
@@ -392,62 +439,93 @@ module ucie_main #(
   //   Clocks/reset (lclk, lreset_n), FDI (lp_*/pl_*), RDI (rdi_lp_*/rdi_pl_*),
   //   sideband config (lp_cfg/pl_cfg), and trigger/active status signals.
   // ==========================================================================
-  d2d_adapter #(.NBYTES(NBYTES)) u_adapter (
-    .lclk            (lclk),
-    .lreset_n        (lreset_n),
+  d2d_adapter #(
+    .NBYTES(NBYTES),
+    .NC(NC)
+  ) u_adapter (
+    .lclk                  (lclk),
+    .lreset_n              (lreset_n),
     // FDI
-    .lp_irdy         (lp_irdy),
-    .lp_valid        (lp_valid),
-    .lp_data         (lp_data),
-    .lp_stream       (lp_stream),
-    .lp_stallack     (lp_stallack),
-    .lp_rx_active_sts(lp_rx_active_sts),
-    .pl_trdy         (pl_trdy),
-    .pl_valid        (pl_valid),
-    .pl_data         (pl_data),
-    .pl_stream       (pl_stream),
-    .pl_error        (pl_error),
-    .pl_cerror       (pl_cerror),
-    .pl_nferror      (pl_nferror),
-    .pl_trainerror   (pl_trainerror),
-    .pl_phyinrecenter(pl_phyinrecenter),
-    .pl_protocol     (pl_protocol),
-    .pl_protocol_flitfmt(pl_protocol_flitfmt),
-    .pl_rx_active_req(pl_rx_active_req),
-    .lp_state_req    (lp_state_req),
-    .pl_state_sts    (pl_state_sts),
-    .pl_inband_pres  (pl_inband_pres),
-    .pl_stallreq     (pl_stallreq),
-    .lp_linkerror    (lp_linkerror),
+    .lp_irdy               (lp_irdy),
+    .lp_valid              (lp_valid),
+    .lp_data               (lp_data),
+    .lp_stream             (lp_stream),
+    .lp_stallack           (lp_stallack),
+    .lp_rx_active_sts      (lp_rx_active_sts),
+    .pl_trdy               (pl_trdy),
+    .pl_valid              (pl_valid),
+    .pl_data               (pl_data),
+    .pl_stream             (pl_stream),
+    .pl_error              (pl_error),
+    .pl_cerror             (pl_cerror),
+    .pl_nferror            (pl_nferror),
+    .pl_trainerror         (pl_trainerror),
+    .pl_phyinrecenter      (pl_phyinrecenter),
+    .pl_protocol           (pl_protocol),
+    .pl_protocol_flitfmt   (pl_protocol_flitfmt),
+    .pl_protocol_vld       (pl_protocol_vld),
+    .pl_clk_req            (pl_clk_req),
+    .lp_clk_ack            (lp_clk_ack),
+    .lp_wake_req           (lp_wake_req),
+    .pl_wake_ack           (pl_wake_ack),
+    .pl_speedmode          (pl_speedmode),
+    .pl_lnk_cfg            (pl_lnk_cfg),
+    .pl_rx_active_req      (pl_rx_active_req),
+    .lp_state_req          (lp_state_req),
+    .pl_state_sts          (pl_state_sts),
+    .pl_inband_pres        (pl_inband_pres),
+    .pl_stallreq           (pl_stallreq),
+    .lp_cfg                (lp_cfg),
+    .lp_cfg_vld            (lp_cfg_vld),
+    .lp_cfg_crd            (lp_cfg_crd),
+    .pl_cfg                (pl_cfg),
+    .pl_cfg_vld            (pl_cfg_vld),
+    .pl_cfg_crd            (pl_cfg_crd),
+    .lp_linkerror          (lp_linkerror),
     // RDI
-    .rdi_lp_state_req(rdi_lp_state_req),
-    .rdi_lp_stallack (rdi_lp_stallack),
-    .rdi_pl_state_sts(rdi_pl_state_sts),
-    .rdi_pl_inband_pres(rdi_pl_inband_pres),
-    .rdi_pl_error    (rdi_pl_error),
-    .rdi_pl_phyinrecenter(rdi_pl_phyinrecenter),
-    .rdi_pl_cerror   (rdi_pl_cerror),
-    .rdi_pl_nferror  (rdi_pl_nferror),
-    .rdi_pl_trainerror(rdi_pl_trainerror),
-    .rdi_lp_irdy     (rdi_lp_irdy),
-    .rdi_lp_valid    (rdi_lp_valid),
-    .rdi_lp_data     (rdi_lp_data),
-    .rdi_pl_trdy     (rdi_pl_trdy),
-    .rdi_pl_valid    (rdi_pl_valid),
-    .rdi_pl_data     (rdi_pl_data),
-    .rdi_pl_lnk_cfg  (rdi_pl_lnk_cfg),
-    .rdi_pl_speedmode(rdi_pl_speedmode),
-    .rdi_pl_stallreq (rdi_pl_stallreq),
-    // cfg sideband
-    .lp_cfg          (lp_cfg),
-    .lp_cfg_vld      (lp_cfg_vld),
-    .lp_cfg_crd      (lp_cfg_crd),
-    .pl_cfg          (pl_cfg),
-    .pl_cfg_vld      (pl_cfg_vld),
-    .start_link_train(start_link_train),
+    .rdi_lp_state_req      (rdi_lp_state_req),
+    .rdi_lp_stallack       (rdi_lp_stallack),
+    .rdi_lp_linkerror      (rdi_lp_linkerror),
+    .rdi_pl_state_sts      (rdi_pl_state_sts),
+    .rdi_pl_inband_pres    (rdi_pl_inband_pres),
+    .rdi_pl_error          (rdi_pl_error),
+    .rdi_pl_phyinrecenter  (rdi_pl_phyinrecenter),
+    .rdi_pl_cerror         (rdi_pl_cerror),
+    .rdi_pl_nferror        (rdi_pl_nferror),
+    .rdi_pl_trainerror     (rdi_pl_trainerror),
+    .rdi_lp_irdy           (rdi_lp_irdy),
+    .rdi_lp_valid          (rdi_lp_valid),
+    .rdi_lp_data           (rdi_lp_data),
+    .rdi_pl_trdy           (rdi_pl_trdy),
+    .rdi_pl_valid          (rdi_pl_valid),
+    .rdi_pl_data           (rdi_pl_data),
+    .rdi_pl_lnk_cfg        (rdi_pl_lnk_cfg),
+    .rdi_pl_speedmode      (rdi_pl_speedmode),
+    .rdi_pl_stallreq       (rdi_pl_stallreq),
+    // Private Adapter sideband packet client interface
+    .adapter_sb_tx_valid       (adapter_sb_tx_valid),
+    .adapter_sb_tx_ready       (adapter_sb_tx_ready),
+    .adapter_sb_tx_packet      (adapter_sb_tx_packet),
+    .adapter_sb_rx_valid       (adapter_sb_rx_valid),
+    .adapter_sb_rx_ready       (adapter_sb_rx_ready),
+    .adapter_sb_rx_packet      (adapter_sb_rx_packet),
+    .adapter_sb_rx_cp_error    (adapter_sb_rx_cp_error),
+    .adapter_sb_rx_dp_error    (adapter_sb_rx_dp_error),
+    .adapter_sb_rx_format_error(adapter_sb_rx_format_error),
+    // Separate PHY CSR Access Channel
+    .phy_csr_wr            (phy_csr_wr),
+    .phy_csr_rd            (phy_csr_rd),
+    .phy_csr_addr          (phy_csr_addr),
+    .phy_csr_wdata         (phy_csr_wdata),
+    .phy_csr_be            (phy_csr_be),
+    .phy_csr_rdata         (phy_csr_rdata),
+    .phy_csr_rdata_vld     (phy_csr_rdata_vld),
+    // Training Start
+    .start_link_train      (start_link_train),
     .clear_start_link_train(clear_start_link_train),
     .adapter_start_link_train(adapter_start_link_train),
-    .ltsm_state_obs  ()
+    .ltsm_state_obs        (),
+    .link_active_obs       ()
   );
 
   // ==========================================================================
@@ -476,43 +554,61 @@ module ucie_main #(
     .start_link_train(start_link_train),
     .adapter_start_link_train(adapter_start_link_train),
     .rdi_lp_state_req(rdi_lp_state_req),
-    .rdi_lp_stallack (rdi_lp_stallack),
-    .rdi_pl_state_sts(rdi_pl_state_sts),
-    .rdi_pl_inband_pres(rdi_pl_inband_pres),
-    .rdi_pl_linkerror(rdi_pl_linkerror),
-    .rdi_pl_phyinrecenter(rdi_pl_phyinrecenter),
-    .rdi_pl_cerror   (rdi_pl_cerror),
-    .rdi_pl_nferror  (rdi_pl_nferror),
-    .rdi_pl_trainerror(rdi_pl_trainerror),
-    .rdi_lp_irdy     (rdi_lp_irdy),
-    .rdi_lp_valid    (rdi_lp_valid),
-    .rdi_lp_data     (rdi_lp_data),
-    .rdi_pl_trdy     (rdi_pl_trdy),
-    .rdi_pl_valid    (rdi_pl_valid),
-    .rdi_pl_data     (rdi_pl_data),
-    .rdi_pl_lnk_cfg  (rdi_pl_lnk_cfg),
-    .rdi_pl_speedmode(rdi_pl_speedmode),
-    .rdi_pl_stallreq (rdi_pl_stallreq),
+    .rdi_lp_stallack       (rdi_lp_stallack),
+    .rdi_lp_linkerror      (rdi_lp_linkerror),
+    .rdi_pl_state_sts      (rdi_pl_state_sts),
+    .rdi_pl_inband_pres    (rdi_pl_inband_pres),
+    .rdi_pl_linkerror      (rdi_pl_linkerror),
+    .rdi_pl_phyinrecenter  (rdi_pl_phyinrecenter),
+    .rdi_pl_cerror         (rdi_pl_cerror),
+    .rdi_pl_nferror        (rdi_pl_nferror),
+    .rdi_pl_trainerror     (rdi_pl_trainerror),
+    .rdi_lp_irdy           (rdi_lp_irdy),
+    .rdi_lp_valid          (rdi_lp_valid),
+    .rdi_lp_data           (rdi_lp_data),
+    .rdi_pl_trdy           (rdi_pl_trdy),
+    .rdi_pl_valid          (rdi_pl_valid),
+    .rdi_pl_data           (rdi_pl_data),
+    .rdi_pl_lnk_cfg        (rdi_pl_lnk_cfg),
+    .rdi_pl_speedmode      (rdi_pl_speedmode),
+    .rdi_pl_stallreq       (rdi_pl_stallreq),
     .clear_start_link_train(clear_start_link_train),
-    // sideband to partner
-    .sb_tx_data      (sb_tx_data),
-    .sb_tx_valid     (sb_tx_valid),
-    .sb_rx_data      (sb_rx_data),
-    .sb_rx_valid     (sb_rx_valid),
-    // main band to partner
-    .mb_tx_data      (mb_tx_data),
-    .mb_tx_valid     (mb_tx_valid),
-    .mb_rx_data      (mb_rx_data),
-    .mb_rx_valid     (mb_rx_valid),
-    // cfg sideband: the adapter drives pl_cfg, so the PHY side floats its
-    // observation outputs.
-    .lp_cfg          (lp_cfg),
-    .lp_cfg_vld      (lp_cfg_vld),
-    .lp_cfg_crd      (lp_cfg_crd),
-    .pl_cfg          (),
-    .pl_cfg_vld      (),
-    .pl_cfg_crd      (),
-    .adapter_active_req(1'b0)
+    .adapter_active_req    (1'b0),
+    // Scalar sideband to partner
+    .sb_tx_clk             (sb_tx_clk),
+    .sb_tx_data            (sb_tx_data),
+    .sb_rx_clk             (sb_rx_clk),
+    .sb_rx_data            (sb_rx_data),
+    // Typed Adapter packet client interface
+    .adapter_sb_tx_valid       (adapter_sb_tx_valid),
+    .adapter_sb_tx_ready       (adapter_sb_tx_ready),
+    .adapter_sb_tx_packet      (adapter_sb_tx_packet),
+    .adapter_sb_rx_valid       (adapter_sb_rx_valid),
+    .adapter_sb_rx_ready       (adapter_sb_rx_ready),
+    .adapter_sb_rx_packet      (adapter_sb_rx_packet),
+    .adapter_sb_rx_cp_error    (adapter_sb_rx_cp_error),
+    .adapter_sb_rx_dp_error    (adapter_sb_rx_dp_error),
+    .adapter_sb_rx_format_error(adapter_sb_rx_format_error),
+    // Separate PHY CSR Access Channel
+    .phy_csr_wr            (phy_csr_wr),
+    .phy_csr_rd            (phy_csr_rd),
+    .phy_csr_addr          (phy_csr_addr),
+    .phy_csr_wdata         (phy_csr_wdata),
+    .phy_csr_be            (phy_csr_be),
+    .phy_csr_rdata         (phy_csr_rdata),
+    .phy_csr_rdata_vld     (phy_csr_rdata_vld),
+    // Main band to partner
+    .mb_tx_data            (mb_tx_data),
+    .mb_tx_valid           (mb_tx_valid),
+    .mb_rx_data            (mb_rx_data),
+    .mb_rx_valid           (mb_rx_valid),
+    // Stubbed cfg
+    .lp_cfg                ({NC{1'b0}}),
+    .lp_cfg_vld            (1'b0),
+    .lp_cfg_crd            (1'b0),
+    .pl_cfg                (),
+    .pl_cfg_vld            (),
+    .pl_cfg_crd            ()
   );
 
   // --------------------------------------------------------------------------
@@ -550,8 +646,7 @@ module ucie_main #(
   //           sideband signals); Section 5.13 - Sideband signaling.
   // --------------------------------------------------------------------------
   logic unused;
-  assign unused = sbreset_n | rdi_lp_stallack | pl_cfg[0] | pl_cfg_vld |
-                  pl_cfg_crd | lp_cfg[0] | lp_cfg_vld | lp_cfg_crd |
+  assign unused = sbreset_n | rdi_lp_stallack |
                   mb_rx_data[0] | rdi_pl_lnk_cfg[0] | rdi_pl_speedmode[0];
 
 endmodule

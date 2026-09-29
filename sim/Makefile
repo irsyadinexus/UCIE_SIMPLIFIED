@@ -177,15 +177,23 @@
 #   v0.0.1  2025-XX-XX  Initial creation - compile, unit and loopback targets.
 #   v0.0.2  2026-09-22  Add the coverage target and cov_report.py integration.
 #   v0.0.3  2026-09-23  Documentation: expand header, add revision history.
-#   v0.0.4  2026-09-25  Document Phase F event evidence fragments and final integration gate.
+#   v0.0.4  2026-09-25  Document Phase F event evidence fragments and final
+#                       integration gate.
+#   v0.0.5  2026-09-28  Add focused sideband-unit and independent sideband-peer
+#                       targets for scalar codec, SBINIT, Adapter FDI, and
+#                       literal golden-vector verification.
+#   v0.0.6  2026-09-29  Set the loopback wall-clock timeout to 900 seconds.
 #
 # LICENSE
 #   SPDX-License-Identifier: Apache-2.0
 # ============================================================================
 
-IVERILOG ?= iverilog
-VVP     ?= vvp
-PYTHON  ?= python3
+IVERILOG    ?= iverilog
+VVP         ?= vvp
+PYTHON      ?= python3
+# Maximum wall-clock time for the slow full-link loopback simulation.
+SIM_TIMEOUT ?= 900
+
 
 ROOT    := ..
 RTL     := $(ROOT)/rtl
@@ -205,14 +213,14 @@ INCLUDES := -I $(RTL)/rtl_common -I $(TB)/monitors
 # Ensure all files explicitly compile warning-free without suppression
 FILTER  := cat
 
-.PHONY: all compile unit loopback coverage clean
+.PHONY: all compile unit sideband-unit sideband-peer loopback coverage clean
 
 # ------------------------------------------------------------- all
 # Final integration gate. Executes the complete verification cascade:
 # compile -> unit -> loopback -> coverage. Requires zero compile warnings,
 # all unit PASS markers, link Active on both dies, bidirectional Raw Mode
 # transfers, and 100% merged Phase F coverage without holes.
-all: compile unit loopback coverage
+all: compile sideband-unit sideband-peer unit loopback coverage
 
 # ------------------------------------------------------------- compile
 # Zero errors and zero warnings is the gate.
@@ -263,6 +271,49 @@ unit: compile
 	done; \
 	echo "ALL UNIT TESTS PASSED"
 
+# ------------------------------------------------------ sideband unit
+# Focused scalar codec and raw SBINIT tests. These tests use the typed packet
+# interface and scalar physical pins without the long full-link training run.
+sideband-unit: compile
+	@mkdir -p $(OUT) $(LOGS)
+	@echo "== Sideband unit tests"
+	@status=0; \
+	for t in $(TB)/unit/ut_sb_codec.sv $(TB)/unit/ut_sbinit.sv \
+	    $(TB)/bfm/tb_adapter_sideband.sv; do \
+	  name=$$(basename $$t .sv); \
+	  $(IVERILOG) -g2012 -Wall $(INCLUDES) -o $(OUT)/$$name.vvp $$t \
+	      $(RTL_COMMON) $(RTL_PHY) $(RTL_ADAPT) \
+	      > $(LOGS)/sideband_comp_$$name.txt 2>&1 || status=1; \
+	  if [ $$status -ne 0 ] || [ -s $(LOGS)/sideband_comp_$$name.txt ]; then \
+	    cat $(LOGS)/sideband_comp_$$name.txt; \
+	    echo "SIDEBAND UNIT FAILED ($$name)"; exit 1; \
+	  fi; \
+	  $(VVP) $(OUT)/$$name.vvp 2>&1 | tee -a $(LOGS)/sideband_unit.txt || status=1; \
+	  grep -q "^TEST PASSED $$name" $(LOGS)/sideband_unit.txt || status=1; \
+	  if [ $$status -ne 0 ]; then \
+	    echo "SIDEBAND UNIT FAILED ($$name)"; exit 1; \
+	  fi; \
+	done; \
+	echo "SIDEBAND UNIT PASSED"
+
+# ------------------------------------------------------ independent peer
+# The peer drives literal scalar headers and payloads. It does not reuse the
+# codec serializer, so bit order, gaps, and error reporting remain independent.
+sideband-peer: compile
+	@mkdir -p $(OUT) $(LOGS)
+	@echo "== Independent sideband peer"
+	@$(IVERILOG) -g2012 -Wall $(INCLUDES) -I $(TB)/bfm \
+	    -o $(OUT)/tb_sideband_peer.vvp $(TB)/bfm/tb_sideband_peer.sv \
+	    $(TB)/bfm/sb_golden_vectors.sv $(RTL_COMMON) \
+	    $(RTL)/logical_phy/sb_codec.sv > $(LOGS)/sideband_peer_comp.txt 2>&1; \
+	  status=$$?; cat $(LOGS)/sideband_peer_comp.txt; \
+	  if [ $$status -ne 0 ] || [ -s $(LOGS)/sideband_peer_comp.txt ]; then \
+	    echo "SIDEBAND PEER FAILED (compile/warnings)"; exit 1; \
+	  fi
+	@$(VVP) $(OUT)/tb_sideband_peer.vvp 2>&1 | tee $(LOGS)/sideband_peer.txt
+	@grep -q "^TEST PASSED tb_sideband_peer" $(LOGS)/sideband_peer.txt || \
+	  { echo "SIDEBAND PEER FAILED"; exit 1; }
+
 # ------------------------------------------------------------- loopback
 # Two real ucie_main instances crossed die-to-die.
 loopback: compile
@@ -277,7 +328,7 @@ loopback: compile
 	    cat $(LOGS)/loopback_comp.txt; \
 	    echo "LOOPBACK FAILED (compile/warnings)"; exit 1; \
 	  fi
-	@$(VVP) $(OUT)/loopback.vvp 2>&1 | tee $(LOGS)/loopback_run.txt
+	@timeout $(SIM_TIMEOUT)s $(VVP) $(OUT)/loopback.vvp 2>&1 | tee $(LOGS)/loopback_run.txt
 	@grep -q "LINK ACTIVE (die 0)"  $(LOGS)/loopback_run.txt || \
 	  { echo "LOOPBACK FAILED: die 0 not active"; exit 1; }
 	@grep -q "LINK ACTIVE (die 1)"  $(LOGS)/loopback_run.txt || \

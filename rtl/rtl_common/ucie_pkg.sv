@@ -34,7 +34,8 @@
 //  10. Speed / width / protocol– Speed mode (4 GT/s only), link config
 //                                (x8 / x16), protocol (Streaming), flit
 //                                format (Raw Mode Format 1), and stream ID.
-//  11. Sideband opcodes & IDs  – Table 47 opcodes, Table 49 source/dest IDs.
+//  11. Sideband opcodes & IDs  – Table 47 opcodes, Table 48/49 IDs, packet
+//                                types & struct, Figure 100-103 helpers.
 //  12. LTSM state encodings    – 8-bit state values for every Link Training
 //                                State Machine state (Error Log 0 "State N").
 //  13. Sideband message codes  – {code, subcode} pairs for SBINIT, MBINIT,
@@ -107,6 +108,12 @@
 //                                Table 56. Remove unrelated capability
 //                                fields and define request/response roles.
 //
+//   0.0.6 2026-09-28  -           Add Table 47 opcodes, Table 48 FDI IDs,
+//                                 Table 49 RDI IDs, UCIe Link IDs, packet-kind
+//                                 and completion-status types, sb_packet_t
+//                                 packed struct, Figure 100-103 encode/decode
+//                                 helpers, CP/DP rules, and structural decode
+//                                 error checking.
 // ============================================================================
 `ifndef UciePkg_SV
 `define UciePkg_SV
@@ -357,28 +364,441 @@ package ucie_pkg;
   localparam logic [7:0] STREAM_ID_S0_STREAMING = 8'h04;
 
   // ========================================================================
-  // Sideband Opcodes (spec Table 47)
+  // Sideband Opcodes (UCIe 1.0, Section 6.1.1, Table 47)
   // ========================================================================
   // sb_opcode_t – 5-bit opcode field in the sideband packet header.
-  //   SB_OP_MSG_NODATA : message without data payload (10010).
-  //   SB_OP_MSG_DATA64 : message with 64-bit data payload (11011).
+  // Every packet carries a 5-bit opcode indicating the transaction type
+  // and whether it carries 0, 32, or 64 bits of data payload.
+  //
+  // Spec ref: UCIe 1.0, Section 6.1.1, Table 47 - Opcode encodings mapped to Packet Types.
   typedef logic [4:0] sb_opcode_t;
-  localparam sb_opcode_t SB_OP_MSG_NODATA = 5'b10010; // message without data
-  localparam sb_opcode_t SB_OP_MSG_DATA64 = 5'b11011; // message with 64b data
+  localparam sb_opcode_t SB_OP_MEM_READ32   = 5'b00000; // 32b Memory Read (0B payload)
+  localparam sb_opcode_t SB_OP_MEM_WRITE32  = 5'b00001; // 32b Memory Write (4B payload)
+  localparam sb_opcode_t SB_OP_CFG_READ32   = 5'b00100; // 32b Configuration Read (0B payload)
+  localparam sb_opcode_t SB_OP_CFG_WRITE32  = 5'b00101; // 32b Configuration Write (4B payload)
+  localparam sb_opcode_t SB_OP_MEM_READ64   = 5'b01000; // 64b Memory Read (0B payload)
+  localparam sb_opcode_t SB_OP_MEM_WRITE64  = 5'b01001; // 64b Memory Write (8B payload)
+  localparam sb_opcode_t SB_OP_CFG_READ64   = 5'b01100; // 64b Configuration Read (0B payload)
+  localparam sb_opcode_t SB_OP_CFG_WRITE64  = 5'b01101; // 64b Configuration Write (8B payload)
+  localparam sb_opcode_t SB_OP_CPL_NODATA   = 5'b10000; // Completion without Data (0B payload)
+  localparam sb_opcode_t SB_OP_CPL_DATA32   = 5'b10001; // Completion with 32b Data (4B payload)
+  localparam sb_opcode_t SB_OP_CPL_DATA64   = 5'b11001; // Completion with 64b Data (8B payload)
+  localparam sb_opcode_t SB_OP_MSG_NODATA   = 5'b10010; // Message without Data (0B payload)
+  localparam sb_opcode_t SB_OP_MSG_DATA64   = 5'b11011; // Message with 64b Data (8B payload)
 
   // ========================================================================
-  // Sideband Source / Destination IDs (spec Table 49)
+  // Sideband Packet Kind (UCIe 1.0, Section 6.1.1, Section 6.1.2)
   // ========================================================================
-  // sb_srcid_t – 3-bit source/destination identifier.
-  //   SRCID_STACK0      : Stack 0 (protocol layer).
-  //   SRCID_ADAPT       : D2D adapter layer.
-  //   SRCID_PHY         : Physical Layer source on the UCIe Link sideband.
-  //   DSTID_REMOTE_PHY  : Remote-die Physical Layer destination.
+  // Distinguishes the three architectural header layouts:
+  //   SB_PKT_REG_REQ    : Register Access Request (Figure 100: Addr, BE, Tag)
+  //   SB_PKT_COMPLETION : Register Access Completion (Figure 101: Status, BE, Tag)
+  //   SB_PKT_MESSAGE    : Sideband Message (Figures 102/103: MsgInfo, MsgCode, MsgSubcode)
+  typedef logic [2:0] sb_packet_kind_t;
+  localparam sb_packet_kind_t SB_PKT_UNKNOWN    = 3'b000; // Reserved / unknown format
+  localparam sb_packet_kind_t SB_PKT_REG_REQ    = 3'b001; // Register Access Request (Fig 100)
+  localparam sb_packet_kind_t SB_PKT_COMPLETION = 3'b010; // Register Access Completion (Fig 101)
+  localparam sb_packet_kind_t SB_PKT_MESSAGE    = 3'b011; // Message with/without data (Fig 102/103)
+  // Named aliases
+  localparam sb_packet_kind_t SB_PKT_REQ        = SB_PKT_REG_REQ;
+  localparam sb_packet_kind_t SB_PKT_CPL        = SB_PKT_COMPLETION;
+  localparam sb_packet_kind_t SB_PKT_MSG        = SB_PKT_MESSAGE;
+  localparam sb_packet_kind_t SB_PKT_INVALID    = SB_PKT_UNKNOWN;
+
+  // ========================================================================
+  // Completion Status Types (UCIe 1.0, Section 6.1.2.1, Table 52)
+  // ========================================================================
+  // 3-bit status codes carried in Phase 1 [2:0] (header[34:32]) of completions.
+  // Other encodings are reserved.
+  typedef logic [2:0] sb_completion_status_t;
+  typedef sb_completion_status_t sb_status_t;
+  localparam sb_status_t SB_STS_SC    = 3'b000; // Successful Completion (SC)
+  localparam sb_status_t SB_STS_UR    = 3'b001; // Unsupported Request (UR)
+  localparam sb_status_t SB_STS_CA    = 3'b100; // Completer Abort (CA)
+  localparam sb_status_t SB_STS_STALL = 3'b111; // Stall response (4 ms cadence)
+
+  // ========================================================================
+  // Context-Specific Sideband Identifiers (UCIe 1.0, Section 6.1.1)
+  // ========================================================================
+  // Preserved legacy endpoint identifiers (retained for backward compatibility).
   typedef logic [2:0] sb_srcid_t;
   localparam sb_srcid_t SRCID_STACK0      = 3'b000;
   localparam sb_srcid_t SRCID_ADAPT       = 3'b001;
   localparam sb_srcid_t SRCID_PHY         = 3'b010;
   localparam sb_srcid_t DSTID_REMOTE_PHY  = 3'b110;
+
+  // FDI Sideband: srcid and dstid encodings (UCIe 1.0, Table 48)
+  // Note: srcid and dstid are reserved for completions transferred over FDI.
+  localparam logic [2:0] FDI_SRCID_STACK0       = 3'b000; // Stack 0 Protocol Layer
+  localparam logic [2:0] FDI_SRCID_STACK1       = 3'b100; // Stack 1 Protocol Layer
+  localparam logic [2:0] FDI_DSTID_ADAPTER      = 3'b001; // D2D Adapter
+  localparam logic [2:0] FDI_DSTID_PHY          = 3'b010; // Physical Layer
+
+  // RDI Sideband: srcid and dstid encodings (UCIe 1.0, Table 49)
+  localparam logic [2:0] RDI_SRCID_STACK0       = 3'b000; // Stack 0 Protocol Layer
+  localparam logic [2:0] RDI_SRCID_ADAPTER      = 3'b001; // D2D Adapter
+  localparam logic [2:0] RDI_SRCID_STACK1       = 3'b100; // Stack 1 Protocol Layer
+  localparam logic [2:0] RDI_DSTID_LOCAL_PHY    = 3'b010; // Local die terminated: Physical Layer
+  localparam logic [2:0] RDI_DSTID_REMOTE_ADAPT = 3'b101; // Remote die terminated: D2D Adapter
+  localparam logic [2:0] RDI_DSTID_REMOTE_PHY   = 3'b110; // Remote die terminated: Physical Layer
+
+  // UCIe Link Sideband: srcid and dstid encodings (UCIe 1.0, Table 49)
+  localparam logic [2:0] LINK_SRCID_ADAPTER     = 3'b001; // D2D Adapter
+  localparam logic [2:0] LINK_SRCID_PHY         = 3'b010; // Physical Layer
+  localparam logic [2:0] LINK_DSTID_REMOTE_ADAPT= 3'b101; // Remote die terminated: D2D Adapter
+  localparam logic [2:0] LINK_DSTID_REMOTE_PHY  = 3'b110; // Remote die terminated: Physical Layer
+
+  // ========================================================================
+  // Sideband Packet Structure (sb_packet_t)
+  // ========================================================================
+  // Project packed-struct style sideband packet container.
+  // Field order and bit widths are exact:
+  //   opcode[4:0], src_id[2:0], dst_id[2:0], msg_info[15:0], msg_code[7:0],
+  //   msg_subcode[7:0], cr, addr[26:0], be[7:0], tag[4:0], ep, status[2:0],
+  //   data[63:0].
+  // Total width: 152 bits.
+  typedef struct packed {
+    logic [4:0]  opcode;
+    logic [2:0]  src_id;
+    logic [2:0]  dst_id;
+    logic [15:0] msg_info;
+    logic [7:0]  msg_code;
+    logic [7:0]  msg_subcode;
+    logic        cr;
+    logic [26:0] addr;
+    logic [7:0]  be;
+    logic [4:0]  tag;
+    logic        ep;
+    logic [2:0]  status;
+    logic [63:0] data;
+  } sb_packet_t;
+
+  // ========================================================================
+  // Structural Decode Error Result (sb_decode_err_t)
+  // ========================================================================
+  // Synthesis-friendly packed-struct reporting decode anomaly flags.
+  typedef struct packed {
+    logic any_err;          // 1 if any decode anomaly is detected
+    logic rsvd_opcode;      // Opcode not defined in Table 47
+    logic rsvd_field;       // Non-zero bits in reserved fields (Figures 100-103)
+    logic illegal_payload;  // Illegal opcode/payload combination (DP set with 0B payload)
+    logic cp_err;           // Control Parity mismatch across 64-bit header
+  } sb_decode_err_t;
+
+  // ========================================================================
+  // Pure Helpers (UCIe 1.0, Sections 6.1.1, 6.1.2, 6.1.3; Figures 100-103)
+  // ========================================================================
+
+  // sb_packet_kind: maps Table 47 opcode to architectural format category.
+  function automatic sb_packet_kind_t sb_packet_kind(input logic [4:0] opcode);
+    case (opcode)
+      SB_OP_MEM_READ32,
+      SB_OP_MEM_WRITE32,
+      SB_OP_CFG_READ32,
+      SB_OP_CFG_WRITE32,
+      SB_OP_MEM_READ64,
+      SB_OP_MEM_WRITE64,
+      SB_OP_CFG_READ64,
+      SB_OP_CFG_WRITE64:  sb_packet_kind = SB_PKT_REG_REQ;
+      SB_OP_CPL_NODATA,
+      SB_OP_CPL_DATA32,
+      SB_OP_CPL_DATA64:   sb_packet_kind = SB_PKT_COMPLETION;
+      SB_OP_MSG_NODATA,
+      SB_OP_MSG_DATA64:   sb_packet_kind = SB_PKT_MESSAGE;
+      default:            sb_packet_kind = SB_PKT_UNKNOWN;
+    endcase
+  endfunction
+
+  // sb_payload_bytes: returns payload byte count (0, 4, or 8) directly from opcode.
+  // Read requests, Cpl-without-data, and Msg-without-data carry 0B payload.
+  function automatic int unsigned sb_payload_bytes(input logic [4:0] opcode);
+    case (opcode)
+      SB_OP_MEM_WRITE32,
+      SB_OP_CFG_WRITE32,
+      SB_OP_CPL_DATA32:  sb_payload_bytes = 4;
+      SB_OP_MEM_WRITE64,
+      SB_OP_CFG_WRITE64,
+      SB_OP_CPL_DATA64,
+      SB_OP_MSG_DATA64:  sb_payload_bytes = 8;
+      default:           sb_payload_bytes = 0;
+    endcase
+  endfunction
+
+  // sb_opcode_supported: returns 1'b1 for valid Table 47 opcodes; 1'b0 for reserved.
+  function automatic logic sb_opcode_supported(input logic [4:0] opcode);
+    case (opcode)
+      SB_OP_MEM_READ32,
+      SB_OP_MEM_WRITE32,
+      SB_OP_CFG_READ32,
+      SB_OP_CFG_WRITE32,
+      SB_OP_MEM_READ64,
+      SB_OP_MEM_WRITE64,
+      SB_OP_CFG_READ64,
+      SB_OP_CFG_WRITE64,
+      SB_OP_CPL_NODATA,
+      SB_OP_CPL_DATA32,
+      SB_OP_CPL_DATA64,
+      SB_OP_MSG_NODATA,
+      SB_OP_MSG_DATA64:  sb_opcode_supported = 1'b1;
+      default:           sb_opcode_supported = 1'b0;
+    endcase
+  endfunction
+
+  // sb_pad_data: pads 32-bit payload upper bits [63:32] to zero; clears 0B payload.
+  function automatic logic [63:0] sb_pad_data(
+    input logic [4:0]  opcode,
+    input logic [63:0] raw_data
+  );
+    case (sb_payload_bytes(opcode))
+      4:       sb_pad_data = {32'h0, raw_data[31:0]};
+      8:       sb_pad_data = raw_data;
+      default: sb_pad_data = 64'h0;
+    endcase
+  endfunction
+
+  // sb_calc_dp: calculates Data Parity (even parity over payload; 0 if no payload).
+  // Spec ref: Table 50 ("If there is no data payload, this bit is set to 0b").
+  function automatic logic sb_calc_dp(
+    input logic [4:0]  opcode,
+    input logic [63:0] data
+  );
+    case (sb_payload_bytes(opcode))
+      4:       sb_calc_dp = ^data[31:0];
+      8:       sb_calc_dp = ^data[63:0];
+      default: sb_calc_dp = 1'b0;
+    endcase
+  endfunction
+
+  // sb_calc_cp: calculates Control Parity (even parity of header bits excluding DP).
+  // Spec ref: Table 50, Table 52 ("even parity of all the header bits excluding DP").
+  function automatic logic sb_calc_cp(input logic [63:0] header);
+    sb_calc_cp = ^({header[63:32], 1'b0, 1'b0, header[29:0]});
+  endfunction
+
+  // sb_check_dp_err: validates received DP bit against received payload.
+  function automatic logic sb_check_dp_err(
+    input logic [4:0]  opcode,
+    input logic        dp_bit,
+    input logic [63:0] data
+  );
+    sb_check_dp_err = (dp_bit !== sb_calc_dp(opcode, data));
+  endfunction
+
+  // sb_encode_header: packs sb_packet_t into exact 64-bit header per Figures 100-103.
+  // Handles 32-bit data padding and CP/DP calculation deterministically.
+  function automatic logic [63:0] sb_encode_header(input sb_packet_t packet);
+    logic [63:0] hdr;
+
+    hdr = 64'h0;
+
+    // Phase 0 common fields (Figures 100-103)
+    hdr[4:0]  = packet.opcode;
+    hdr[7:5]  = packet.src_id;
+    hdr[10:8] = packet.dst_id;
+    hdr[16]   = packet.ep;
+    hdr[17]   = packet.cr;
+
+    case (sb_packet_kind(packet.opcode))
+      SB_PKT_REG_REQ: begin
+        // Figure 100: Register Access Request
+        hdr[15:11] = packet.tag;
+        if (sb_payload_bytes(packet.opcode) == 4 ||
+            packet.opcode == SB_OP_MEM_READ32 ||
+            packet.opcode == SB_OP_CFG_READ32) begin
+          hdr[28:21] = {4'b0000, packet.be[3:0]}; // BE[7:4] reserved for 32b
+        end else begin
+          hdr[28:21] = packet.be;
+        end
+        hdr[58:32] = packet.addr;
+      end
+
+      SB_PKT_COMPLETION: begin
+        // Figure 101: Register Access Completion
+        hdr[15:11] = packet.tag;
+        if (packet.opcode == SB_OP_CPL_DATA32) begin
+          hdr[28:21] = {4'b0000, packet.be[3:0]}; // BE[7:4] reserved for 32b
+        end else begin
+          hdr[28:21] = packet.be;
+        end
+        hdr[34:32] = packet.status;
+      end
+
+      SB_PKT_MESSAGE: begin
+        // Figures 102/103: Message without/with data
+        hdr[15:11] = 5'b00000; // Reserved
+        hdr[28:21] = 8'h00;    // Reserved
+        hdr[39:32] = packet.msg_subcode;
+        hdr[47:40] = packet.msg_code;
+        hdr[63:48] = packet.msg_info;
+      end
+
+      default: begin
+        hdr[63:32] = 32'h0;
+      end
+    endcase
+
+    // Data parity in bit 30
+    hdr[30] = sb_calc_dp(packet.opcode, packet.data);
+
+    // Control parity in bit 31
+    hdr[31] = sb_calc_cp(hdr);
+
+    return hdr;
+  endfunction
+
+  // sb_decode_header: unpacks 64-bit header into sb_packet_t per Figures 100-103.
+  function automatic sb_packet_t sb_decode_header(input logic [63:0] header);
+    sb_packet_t pkt;
+
+    pkt = '0;
+    pkt.opcode = header[4:0];
+    pkt.src_id = header[7:5];
+    pkt.dst_id = header[10:8];
+    pkt.ep     = header[16];
+    pkt.cr     = header[17];
+    pkt.data   = 64'h0;
+
+    case (sb_packet_kind(header[4:0]))
+      SB_PKT_REG_REQ: begin
+        // Figure 100
+        pkt.tag         = header[15:11];
+        pkt.be          = header[28:21];
+        pkt.addr        = header[58:32];
+        pkt.status      = 3'b000;
+        pkt.msg_info    = 16'h0000;
+        pkt.msg_code    = 8'h00;
+        pkt.msg_subcode = 8'h00;
+      end
+
+      SB_PKT_COMPLETION: begin
+        // Figure 101
+        pkt.tag         = header[15:11];
+        pkt.be          = header[28:21];
+        pkt.addr        = 27'h0;
+        pkt.status      = header[34:32];
+        pkt.msg_info    = 16'h0000;
+        pkt.msg_code    = 8'h00;
+        pkt.msg_subcode = 8'h00;
+      end
+
+      SB_PKT_MESSAGE: begin
+        // Figures 102/103
+        pkt.tag         = 5'b00000;
+        pkt.be          = 8'h00;
+        pkt.addr        = 27'h0;
+        pkt.status      = 3'b000;
+        pkt.msg_subcode = header[39:32];
+        pkt.msg_code    = header[47:40];
+        pkt.msg_info    = header[63:48];
+      end
+
+      default: begin
+        pkt.tag         = 5'b00000;
+        pkt.be          = 8'h00;
+        pkt.addr        = 27'h0;
+        pkt.status      = 3'b000;
+        pkt.msg_info    = 16'h0000;
+        pkt.msg_code    = 8'h00;
+        pkt.msg_subcode = 8'h00;
+      end
+    endcase
+
+    return pkt;
+  endfunction
+
+  // sb_decode_header_task: output-argument helper for simulators requiring procedural output ports.
+  task automatic sb_decode_header_task(
+    input  logic [63:0] header,
+    output sb_packet_t  packet
+  );
+    packet = sb_decode_header(header);
+  endtask
+
+  // sb_decode_error: evaluates reserved opcodes, reserved fields, illegal payload, and CP errors.
+  function automatic sb_decode_err_t sb_decode_error(input logic [63:0] header);
+    sb_decode_err_t err;
+    logic [4:0] op;
+    logic       rsvd_f;
+
+    err = '0;
+    op = header[4:0];
+    rsvd_f = 1'b0;
+
+    // Reserved opcode check (Table 47)
+    if (!sb_opcode_supported(op)) begin
+      err.rsvd_opcode = 1'b1;
+    end
+
+    // Reserved fields check (Figures 100-103)
+    if (header[29] != 1'b0 || header[20:18] != 3'b000) begin
+      rsvd_f = 1'b1;
+    end
+
+    case (sb_packet_kind(op))
+      SB_PKT_REG_REQ: begin
+        if (header[63:59] != 5'b00000) begin
+          rsvd_f = 1'b1;
+        end
+        // Table 50 address/BE alignment rules
+        if (op == SB_OP_MEM_READ64 || op == SB_OP_MEM_WRITE64 ||
+            op == SB_OP_CFG_READ64 || op == SB_OP_CFG_WRITE64) begin
+          if (header[34:32] != 3'b000) rsvd_f = 1'b1; // Addr[2:0] reserved
+        end
+        if (op == SB_OP_MEM_READ32 || op == SB_OP_MEM_WRITE32 ||
+            op == SB_OP_CFG_READ32 || op == SB_OP_CFG_WRITE32) begin
+          if (header[33:32] != 2'b00)   rsvd_f = 1'b1; // Addr[1:0] reserved
+          if (header[28:25] != 4'b0000) rsvd_f = 1'b1; // BE[7:4] reserved
+        end
+      end
+
+      SB_PKT_COMPLETION: begin
+        if (header[63:35] != 29'h0) begin
+          rsvd_f = 1'b1;
+        end
+        if (op == SB_OP_CPL_DATA32) begin
+          if (header[28:25] != 4'b0000) rsvd_f = 1'b1; // BE[7:4] reserved
+        end
+        // Table 52 status encodings
+        case (header[34:32])
+          SB_STS_SC,
+          SB_STS_UR,
+          SB_STS_CA,
+          SB_STS_STALL: /* valid status */ ;
+          default:      rsvd_f = 1'b1;
+        endcase
+      end
+
+      SB_PKT_MESSAGE: begin
+        if (header[15:11] != 5'b00000 || header[28:21] != 8'h00) begin
+          rsvd_f = 1'b1; // Tag and BE reserved in messages
+        end
+      end
+
+      default: ;
+    endcase
+
+    err.rsvd_field = rsvd_f;
+
+    // Illegal payload rule (Table 50: DP=0 when no data payload)
+    if ((sb_payload_bytes(op) == 0) && (header[30] != 1'b0)) begin
+      err.illegal_payload = 1'b1;
+    end
+
+    // Control Parity (CP) rule (Table 50, 52: even parity over header excl DP)
+    if (^({header[63:31], 1'b0, header[29:0]}) !== 1'b0) begin
+      err.cp_err = 1'b1;
+    end
+
+    err.any_err = err.rsvd_opcode | err.rsvd_field | err.illegal_payload | err.cp_err;
+    return err;
+  endfunction
+
+  // sb_decode_error_task: output-argument helper for decode error check.
+  task automatic sb_decode_error_task(
+    input  logic [63:0]     header,
+    output sb_decode_err_t  err
+  );
+    err = sb_decode_error(header);
+  endtask
 
   // ========================================================================
   // LTSM State Encodings (Error Log 0, "State N")

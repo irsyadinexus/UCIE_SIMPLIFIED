@@ -2,513 +2,683 @@
 // File        : sb_codec.sv
 // Module      : sb_codec
 // Project     : UCIe 1.0 Simplified Endpoint
-// Description : Sideband encoder / decoder for UCIe 64-bit serial packets.
-//               Serialises outgoing sideband messages one bit per UI on the
-//               sbclk domain, and deserialises incoming messages into named
-//               fields. The codec is the only module that knows the bit-field
-//               positions of the sideband header; all other blocks (LTSM,
-//               RDI SM) see parsed, typed ports.
+// Description : Self-contained scalar physical sideband codec.
 //
-// Spec refs   : UCIe 1.0 spec Chapter 6 (sideband framing, 64-bit serial
-//               packets with a 32-UI inter-packet gap), Table 47 (sideband
-//               opcodes), Tables 53/54/56 (message codes and subcodes).
+// Serializes outgoing sideband transactions onto scalar physical pins
+// (sb_tx_clk, sb_tx_data) and deserializes incoming transactions from scalar
+// physical pins (sb_rx_clk, sb_rx_data) using Single Data Rate (SDR) strobe
+// signaling per the UCIe 1.0 specification.
 //
-// --------------------------------------------------------------------------
-// 64-bit header layout  (PoC; documented in doc/PLAN.md section 4.2)
-// --------------------------------------------------------------------------
+// Handshake:
+//   TX: Accept exactly one packet when tx_valid && tx_ready.
+//       tx_busy asserts upon packet acceptance and remains held through
+//       all 64 UIs of header, 32 UIs of header gap, optional 64 UIs of
+//       padded payload, and 32 UIs of final payload gap.
+//   RX: Deserializes packets into an internal two-entry completion queue.
+//       rx_valid asserts while the queue is non-empty and holds the
+//       decoded rx_packet, rx_format_error, rx_cp_error, and rx_dp_error
+//       stable until acknowledged and popped by rx_ready.
+//       Sticky rx_overflow asserts if a packet arrives while the two-entry
+//       queue is full and not popping.
 //
-//   Bit range   Field           Width   Description
-//   ---------   -----           -----   -----------
-//   [ 4: 0]     Opcode           5      Table 47 sideband opcode.
-//   [ 7: 5]     SrcID            3      Source stack ID (Table 49).
-//   [10: 8]     DstID            3      Destination stack ID (Table 49).
-//   [18:11]     MsgInfo          8      Message-specific info (Table 54).
-//   [26:19]     MsgCode          8      Message code (Tables 53/54/56).
-//   [34:27]     MsgSubcode       8      Message subcode (Tables 53/54/56).
-//   [35]        Cr               1      Credit return bit.
-//   [36]        CP               1      Even parity over all header bits
-//                                       except DP (bit 37). Spec Ch 6.
-//   [37]        DP               1      Even parity over the data payload;
-//                                       0 when there is no payload. Spec Ch 6.
-//   [45:38]     BE               8      Byte enables.
-//   [50:46]     Tag              5      Transaction tag.
-//   [51]        EP               1      Error/poison bit.
-//   [63:52]     Addr            12      Address field.
-//
-// --------------------------------------------------------------------------
-// Parity rules  (spec Chapter 6)
-// --------------------------------------------------------------------------
-//   CP (Command Parity): Even parity computed over every header bit EXCEPT
-//   DP (bit 37) and CP itself (bit 36). During assembly both placeholder
-//   bits are 0, so XOR-reducing the 64-bit word yields the correct CP value.
-//   CP is written into bit 36 after the reduction. DP is then OR'd into
-//   bit 37 independently.
-//
-//   DP (Data Parity): Even parity of the 64-bit data payload. Set to 0
-//   when the packet carries no data (opcode != SB_OP_MSG_DATA64).
-//
-//   On receive, CP is re-computed from the latched header and compared
-//   against bit 36; a mismatch raises rx_cp_err. DP is compared against
-//   bit 37 only when a data payload was received; a mismatch raises
-//   rx_dp_err.
+// Spec References:
+//   - UCIe 1.0, Section 4.1.5: Sideband transmission (serial data and clock pin
+//     pair, 64-bit serial packet, 32-bit low separation, 800 MT/s SDR).
+//   - UCIe 1.0, Section 5.13: Sideband signaling (800 MHz SDR, data edge-aligned
+//     with strobe, negedge strobe sampling, parked clock/data low).
+//   - UCIe 1.0, Section 5.13.1, Table 46: Sideband electrical parameters.
+//   - UCIe 1.0, Section 6.1.1, Table 47: Opcode encodings mapped to Packet Types.
+//   - UCIe 1.0, Section 6.1.1, Tables 48/49: FDI and RDI srcid / dstid encodings.
+//   - UCIe 1.0, Section 6.1.2, Figures 100-103: Packet layouts (Register Access
+//     Request, Register Access Completion, Sideband Message).
+//   - UCIe 1.0, Section 6.1.2.1, Table 50: Parity and field definitions.
+//   - UCIe 1.0, Section 6.1.2.1, Table 52: Completion Status encodings.
+//   - UCIe 1.0, Section 6.1.3: Flow Control and Data Integrity (fatal UIE on
+//     parity failure, 32-UI inter-packet gap).
+//   - UCIe 1.0, Figures 46 & 47: Sideband serial packet timing and back-to-back
+//     packet transmission (64 UI packet, 32 UI low separation).
+//   - UCIe 1.0, Figure 99: Sideband signaling and negedge strobe sample point.
 //
 // --------------------------------------------------------------------------
-//   1. The logical_phy lclk-to-sbclk mailbox asserts tx_load with all field
-//      inputs stable in the sbclk domain.
-//   2. The codec calls assemble_hdr() to pack the header, computes CP and
-//      DP, and latches the result.
-//   3. The header is shifted out one bit per sbclk cycle (64 UIs, LSB
-//      first), then the data payload (if tx_has_data), then a 32-UI idle
-//      gap (SB_GAP_UI).
-//   4. tx_busy is high throughout. logical_phy synchronizes this back to lclk
-//      and does not issue a new mailbox request until it is low.
-//
+// Revision History
 // --------------------------------------------------------------------------
-// RX sequencing
-// --------------------------------------------------------------------------
-//   1. The codec waits for sb_rx_valid to start collecting bits.
-//   2. A 64-bit shift register captures bits LSB-first (shift right).
-//   3. At bit 63, the header is latched. If the opcode is not
-//      SB_OP_MSG_DATA64, rx_pkt_vld pulses and collection ends.
-//   4. If the opcode IS SB_OP_MSG_DATA64, collection continues for another
-//      64 bits (payload). At bit 127 the data is latched, rx_pkt_vld
-//      pulses, and collection ends.
-//
-// --------------------------------------------------------------------------
-// Parameters
-// --------------------------------------------------------------------------
-//   None (NC and SB_GAP_UI from ucie_pkg).
-//
-// --------------------------------------------------------------------------
-//   TX: Packet fields arrive from the logical_phy lclk-to-sbclk mailbox.
-//       The codec serializes them at sbclk and returns tx_busy to logical_phy.
-//   RX: Serial input sb_rx_data/sb_rx_valid is parsed at sbclk. Parsed packet
-//       fields leave through the logical_phy sbclk-to-lclk mailbox. The codec
-//       owns no lclk logic and has no direct LTSM clock-domain crossing.
-//       rx_cp_err and rx_dp_err report parity errors with the parsed packet.
-//
-// --------------------------------------------------------------------------
-// Implementation notes
-// --------------------------------------------------------------------------
-//   1. The bit select for TX output uses a continuous assign (wire tx_bit)
-//      because Icarus Verilog 12 cannot evaluate a variable index inside
-//      an always_* process.
-//   2. The RX shift register shifts RIGHT so that the first-arriving bit
-//      (bit 0 of the header) lands in position 0, matching the transmitted
-//      word order.
-//   3. The DP parity check on receive validates that the received DP bit
-//      equals the XOR-reduction of the 64-bit data payload for every
-//      DATA64 packet.  This covers both DP=0 (even-parity payload) and
-//      DP=1 (odd-parity payload).  Non-DATA64 packets carry no payload
-//      and are not checked.  The codec is policy-free: it reports the
-//      error flag but does not decide what to do with it.
-//
-// --------------------------------------------------------------------------
-// Revision history
-// --------------------------------------------------------------------------
-//   v0.0.1  2025-XX-XX  First commit to git. Full TX/RX codec with CP/DP
-//                        parity, 32-UI gap, and field extraction.
-//   v0.0.2  2026-09-23  Documentation pass: added per-construct comment
-//                        blocks for tx_busy output, remaining RX field
-//                        extractions, and CP parity check assign, citing
-//                        UCIe 1.0 Section 6.1.2, 6.1.3, and Table 47.
-//   v0.0.3  2026-09-23  Req.3: document sbclk-only operation. logical_phy
-//                        now owns the asynchronous LTSM/codec boundaries.
-//   v0.0.4  2026-09-24  Phase A: fix DP parity check to validate DATA64
-//                        packets for both DP=0 (even parity) and DP=1
-//                        (odd parity).  Gate on opcode instead of DP
-//                        value so that a payload with even parity is
-//                        correctly accepted when DP=0.  Codec remains
-//                        policy-free (error flag only).
+//   Rev   Date        Author      Description
+//   ----- ----------  ----------  ------------------------------------------
+//   0.0.1 2025-XX-XX  -           Initial PoC sideband codec.
+//   0.0.2 2026-09-23  -           Documentation pass on parity rules.
+//   0.0.3 2026-09-23  -           Document sbclk-only operation.
+//   0.0.4 2026-09-24  -           Phase A: validate DATA64 DP parity for both values.
+//   0.0.5 2026-09-28  -           Rewrite as self-contained scalar physical sideband
+//                                 codec. Added scalar sb_tx_clk / sb_tx_data and
+//                                 sb_rx_clk / sb_rx_data physical pins with SDR
+//                                 strobe clocking per UCIe 1.0 Section 4.1.5 and 5.13.
+//                                 Adopted sb_packet_t handshake (tx_valid/tx_ready,
+//                                 rx_valid/rx_ready) with 2-entry completion queue,
+//                                 deterministic 64 UI packet / 32 UI low gap timing,
+//                                 strict header/payload gap validation, negedge
+//                                 sb_rx_clk sampling, opcode-driven payload handling,
+//                                 detection of early strobe loss, unexpected gap
+//                                 strobes, reserved opcodes/fields, CP/DP parity,
+//                                 upper 32-bit payload validation, and sticky overflow.
 // ============================================================================
 `ifndef SbCodec_SV
 `define SbCodec_SV
+
 `include "ucie_pkg.sv"
 
 `timescale 1ns/1ps
+
 module sb_codec (
-  input  logic        sbclk,         // 800 MHz sideband clock
-  input  logic        sbreset_n,
+  // -------------------------------------------------------------------------
+  // Core Clock and Reset
+  // -------------------------------------------------------------------------
+  input  logic        sbclk,            // 800 MHz internal sideband clock
+  input  logic        sbreset_n,        // Active-low reset
 
-  // --------------------------------------------------------------- transmit
-  input  logic        tx_load,       // pulse: load a new packet
-  input  logic [4:0]  tx_opcode,
-  input  logic [2:0]  tx_srcid,
-  input  logic [2:0]  tx_dstid,
-  input  logic [7:0]  tx_msginfo,
-  input  logic [7:0]  tx_msgcode,
-  input  logic [7:0]  tx_msgsubcode,
-  input  logic        tx_cr,
-  input  logic [11:0] tx_addr,
-  input  logic [7:0]  tx_be,
-  input  logic [4:0]  tx_tag,
-  input  logic        tx_ep,
-  input  logic [63:0] tx_data_in,
-  input  logic        tx_has_data,
-  output logic        tx_busy,
-  output logic [NC-1:0] sb_tx_data,  // serial lane toward partner
-  output logic        sb_tx_valid,
+  // -------------------------------------------------------------------------
+  // Transmit Parallel Interface (Handshake)
+  // -------------------------------------------------------------------------
+  input  logic        tx_valid,         // Packet transmission request from local agent
+  output logic        tx_ready,         // Codec ready to accept next packet (idle)
+  input  ucie_pkg::sb_packet_t tx_packet, // Packed sideband transaction to transmit
+  output logic        tx_busy,          // TX busy (packet active or trailing inter-packet gap)
 
-  // --------------------------------------------------------------- receive
-  input  logic [NC-1:0] sb_rx_data,
-  input  logic        sb_rx_valid,
-  output logic        rx_pkt_vld,
-  output logic [4:0]  rx_opcode,
-  output logic [2:0]  rx_srcid,
-  output logic [2:0]  rx_dstid,
-  output logic [7:0]  rx_msginfo,
-  output logic [7:0]  rx_msgcode,
-  output logic [7:0]  rx_msgsubcode,
-  output logic        rx_cr,
-  output logic [7:0]  rx_be,
-  output logic [4:0]  rx_tag,
-  output logic        rx_ep,
-  output logic [11:0] rx_addr,
-  output logic [63:0] rx_data,
-  output logic        rx_cp_err,     // CP mismatch
-  output logic        rx_dp_err      // DP mismatch (data payload only)
+  // -------------------------------------------------------------------------
+  // Sideband Physical Interface (Scalar SDR)
+  // -------------------------------------------------------------------------
+  output logic        sb_tx_clk,        // Forwarded TX strobe/clock (800 MHz SDR, gated)
+  output logic        sb_tx_data,       // Serial TX data (edge-aligned with sb_tx_clk)
+  input  logic        sb_rx_clk,        // Incoming RX strobe/clock (gated)
+  input  logic        sb_rx_data,       // Incoming RX serial data
+
+  // -------------------------------------------------------------------------
+  // Receive Parallel Interface (Queue / Handshake)
+  // -------------------------------------------------------------------------
+  output logic        rx_valid,         // Valid packet available at head of queue
+  input  logic        rx_ready,         // Consumer acknowledges and pops current packet
+  output ucie_pkg::sb_packet_t rx_packet, // Decoded sideband packet at head of queue
+  output logic        rx_format_error,  // Format error (early strobe loss, bad gap, reserved fields)
+  output logic        rx_cp_error,      // Control Parity mismatch flag for current packet
+  output logic        rx_dp_error,      // Data Parity mismatch flag for current packet
+  output logic        rx_overflow       // Sticky receive queue overflow indication
 );
 
   import ucie_pkg::*;
 
   // =========================================================================
-  // Header assembly function  (spec Chapter 6 header format)
+  // TRANSMIT DATAPATH AND SERIALIZER FSM
   // =========================================================================
-  // Packs all named fields into a 64-bit header word per the bit-field layout
-  // documented above. CP (bit 36) and DP (bit 37) are set to 0 during
-  // concatenation so that XOR-reducing the 64-bit word yields the correct CP
-  // value. CP is then written into bit 36. DP is handled separately by the
-  // caller (assemble_hdr returns the header with DP still at 0).
-  //
-  // The concatenation must be exactly 64 bits. Field order in the concat
-  // (MSB first): {Addr[11:0], EP, Tag[4:0], BE[7:0], DP_placeholder,
-  //               CP_placeholder, Cr, MsgSubcode[7:0], MsgCode[7:0],
-  //               MsgInfo[7:0], DstID[2:0], SrcID[2:0], Opcode[4:0]}.
+  // States:
+  //   TX_IDLE     : Waiting for tx_valid && tx_ready.
+  //   TX_HDR      : Emitting 64 header bits (1 bit/UI), toggling sb_tx_clk.
+  //   TX_HDR_GAP  : Emitting 32 UI low gap with sb_tx_clk parked low.
+  //   TX_PAYLOAD  : Emitting 64 padded payload bits, toggling sb_tx_clk.
+  //   TX_PLD_GAP  : Emitting 32 UI low gap with sb_tx_clk parked low.
   // =========================================================================
-  function automatic logic [63:0] assemble_hdr(
-    logic [4:0]  op,
-    logic [2:0]  sid,
-    logic [2:0]  did,
-    logic [7:0]  minfo,
-    logic [7:0]  mcode,
-    logic [7:0]  msub,
-    logic        cr,
-    logic [11:0] addr,
-    logic [7:0]  be,
-    logic [4:0]  tag,
-    logic        ep
-  );
-    logic [63:0] hdr;
-    logic        cp;
-    hdr = {addr, ep, tag, be, 1'b0, 1'b0, cr, msub, mcode, minfo, did, sid, op};
-    cp  = ^hdr;          // both placeholders are 0, so they do not contribute
-    hdr[36] = cp;
-    return hdr;
-  endfunction
+  typedef enum logic [2:0] {
+    TX_IDLE     = 3'd0,
+    TX_HDR      = 3'd1,
+    TX_HDR_GAP  = 3'd2,
+    TX_PAYLOAD  = 3'd3,
+    TX_PLD_GAP  = 3'd4
+  } tx_state_t;
 
-  // =========================================================================
-  // TX state registers and DP calculation
-  // =========================================================================
-  logic [63:0]  hdr_q;
-  logic [63:0]  payload_q;
-  logic         has_data_q;
-  logic [6:0]   bit_q;       // 0..63 within the header, then 0..63 within payload
-  logic         in_gap_q;
-  logic [5:0]   gap_q;
-  logic         in_payload_q;
-  logic         tx_busy_i;
+  tx_state_t   tx_state_q;
+  logic [5:0]  tx_bit_cnt_q;
+  logic [4:0]  tx_gap_cnt_q;
+  logic [63:0] tx_hdr_shift_q;
+  logic [63:0] tx_pld_shift_q;
+  logic        tx_has_pld_q;
+  logic        tx_clk_en_q;
+  logic        tx_clk_en_neg_q;
 
-  // =========================================================================
-  // DP (Data Parity) calculation  (spec Chapter 6)
-  // =========================================================================
-  // DP is the even parity of the 64-bit data payload. When tx_has_data is 0,
-  // DP is forced to 0. This wire is sampled on tx_load and written into
-  // hdr_q[37] one cycle after header assembly.
-  // =========================================================================
-  wire dp_calc = tx_has_data ? ^tx_data_in : 1'b0;
-
-  // =========================================================================
-  // TX serialiser FSM  (spec Chapter 6 – 64-bit serial, 32-UI gap)
-  // =========================================================================
-  // Drives the outgoing sideband lane one bit per sbclk cycle. The FSM has
-  // four phases:
-  //   1. Load      : tx_load && !tx_busy_i -> latch header, payload, set
-  //                  sb_tx_valid, start at bit 0.
-  //   2. Header    : Shift out bits 0..63 of the assembled header. If
-  //                  has_data_q, transition to payload phase; else enter gap.
-  //   3. Payload   : Shift out bits 0..63 of the data payload. Then enter
-  //                  gap.
-  //   4. Gap       : De-assert sb_tx_valid, count down SB_GAP_UI (32) cycles
-  //                  of idle. Then return to idle (tx_busy_i = 0).
-  //
-  // Reset clears all registers and de-asserts sb_tx_valid.
-  // =========================================================================
-  always_ff @(posedge sbclk or negedge sbreset_n) begin
+  // Glitch-free clock gating cell for forwarded TX strobe (sb_tx_clk).
+  // Clock enable is latched on negedge sbclk so that sb_tx_clk transitions
+  // occur cleanly edge-aligned with posedge sbclk, and park low when disabled.
+  always_ff @(negedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
-      hdr_q        <= 64'h0;
-      payload_q    <= 64'h0;
-      has_data_q   <= 1'b0;
-      bit_q        <= 7'h00;
-      in_gap_q     <= 1'b0;
-      in_payload_q <= 1'b0;
-      gap_q        <= 6'h00;
-      sb_tx_valid  <= 1'b0;
-    end else if (tx_load && !tx_busy_i) begin
-      hdr_q        <= assemble_hdr(tx_opcode, tx_srcid, tx_dstid, tx_msginfo,
-                                  tx_msgcode, tx_msgsubcode, tx_cr,
-                                  tx_addr, tx_be, tx_tag, tx_ep);
-      hdr_q[37]    <= dp_calc;      // DP is outside the CP coverage
-      payload_q    <= tx_data_in;
-      has_data_q   <= tx_has_data;
-      bit_q        <= 7'h00;
-      in_payload_q <= 1'b0;
-      in_gap_q     <= 1'b0;
-      sb_tx_valid  <= 1'b1;
-    end else if (sb_tx_valid) begin
-      if (!in_payload_q && bit_q == 7'd63) begin
-        if (has_data_q) begin
-          // Header sent and a payload follows.
-          bit_q        <= 7'h00;
-          in_payload_q <= 1'b1;
-        end else begin
-          sb_tx_valid  <= 1'b0;
-          in_gap_q     <= 1'b1;
-          gap_q        <= SB_GAP_UI[5:0];
-        end
-      end else if (in_payload_q && bit_q == 7'd63) begin
-        sb_tx_valid  <= 1'b0;
-        in_payload_q <= 1'b0;
-        in_gap_q     <= 1'b1;
-        gap_q        <= SB_GAP_UI[5:0];
-      end else begin
-        bit_q <= bit_q + 1'b1;
-      end
-    end else if (in_gap_q) begin
-      if (gap_q == 6'd1) in_gap_q <= 1'b0;
-      else               gap_q   <= gap_q - 1'b1;
+      tx_clk_en_neg_q <= 1'b0;
+    end else begin
+      tx_clk_en_neg_q <= tx_clk_en_q;
     end
   end
 
-  // =========================================================================
-  // TX output bit selection  (spec Chapter 6 – LSB-first serialisation)
-  // =========================================================================
-  // One header or payload bit per UI, bit 0 first. The bit select is a
-  // continuous assign because Icarus Verilog 12 cannot evaluate a variable
-  // index inside an always_* process. When sb_tx_valid is de-asserted the
-  // output lane is driven to zero (idle).
-  // =========================================================================
-  wire tx_bit = in_payload_q ? payload_q[bit_q] : hdr_q[bit_q];
+  assign sb_tx_clk = tx_clk_en_neg_q & sbclk;
 
-  // =========================================================================
-  // TX serial output  (spec Chapter 6 – NC-wide sideband lane)
-  // =========================================================================
-  // All NC bits of the sideband lane carry the same serialised bit value.
-  // When the codec is idle (sb_tx_valid = 0), the lane is driven low.
-  // =========================================================================
-  assign sb_tx_data = sb_tx_valid ? {NC{tx_bit}} : {NC{1'b0}};
+  assign sb_tx_data = (tx_state_q == TX_HDR) ||
+                      ((tx_state_q == TX_HDR_GAP) && (tx_gap_cnt_q == 5'd0)) ?
+                      tx_hdr_shift_q[0] :
+                      (tx_state_q == TX_PAYLOAD) ||
+                      ((tx_state_q == TX_PLD_GAP) && (tx_gap_cnt_q == 5'd0)) ?
+                      tx_pld_shift_q[0] :
+                      1'b0;
 
-  // =========================================================================
-  // TX busy signal
-  // =========================================================================
-  // tx_busy is asserted while the codec is serialising a packet or counting
-  // down the inter-packet gap. The LTSM must not assert tx_load while
-  // tx_busy is high.
-  // =========================================================================
-  assign tx_busy_i = sb_tx_valid | in_gap_q;
-  // -------------------------------------------------------------------------
-  // assign: TX busy output port
-  //
-  // tx_busy is the module-level output that mirrors the internal tx_busy_i
-  // signal. The separation exists so that tx_busy_i can be used as a
-  // feedback guard inside the TX serialiser FSM (the always_ff block reads
-  // tx_busy_i to qualify tx_load) while still exporting a clean output
-  // port to the LTSM. The LTSM must treat tx_busy == 1 as a back-pressure
-  // indication: no new tx_load may be asserted until the current packet
-  // and its 32-UI inter-packet gap have completed.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity.
-  // -------------------------------------------------------------------------
-  assign tx_busy   = tx_busy_i;
+  // Handshake and flow control
+  assign tx_ready = (tx_state_q == TX_IDLE);
+  assign tx_busy  = (tx_state_q != TX_IDLE);
 
-  // =========================================================================
-  // RX deserialiser state
-  // =========================================================================
-  logic [63:0] shift_q;
-  logic [6:0]  cnt_q;
-  logic        collecting_q;
-  logic        hdr_done_q;
-  logic [63:0] hdr_lat_q;
-  logic [63:0] data_lat_q;
-  logic        rx_bit;
-
-  wire [63:0]  new_word = {rx_bit, shift_q[63:1]};
-
-  // =========================================================================
-  // RX bit extraction  (spec Chapter 6 – first bit on sb_rx_data[0])
-  // =========================================================================
-  // The incoming sideband data is sampled on bit 0 of the NC-wide bus. All
-  // NC bits carry the same value; bit 0 is the canonical sample point.
-  // =========================================================================
-  assign rx_bit = sb_rx_data[0];
-
-  // =========================================================================
-  // RX deserialiser FSM  (spec Chapter 6 – 64-bit header + optional payload)
-  // =========================================================================
-  // Captures incoming sideband bits into a 64-bit shift register (shift
-  // right so bit 0 lands in position 0). The FSM has three phases:
-  //
-  //   1. Idle       : Wait for sb_rx_valid. On the first valid bit, set
-  //                   collecting_q and initialise cnt_q to 1 (this cycle
-  //                   counts as the first UI).
-  //   2. Header     : Shift bits 1..63 into the register. At cnt_q == 63
-  //                   (64th bit), latch the header (hdr_lat_q). If the
-  //                   opcode is NOT SB_OP_MSG_DATA64, pulse rx_pkt_vld and
-  //                   return to idle. Otherwise set hdr_done_q and continue.
-  //   3. Payload    : Shift bits 64..127 into the register. At cnt_q == 127
-  //                   (128th bit), latch the data (data_lat_q), pulse
-  //                   rx_pkt_vld, and return to idle.
-  //
-  // Reset clears all registers and de-asserts rx_pkt_vld.
-  // =========================================================================
+  // TX FSM
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
-      shift_q      <= 64'h0;
-      cnt_q        <= 7'h00;
-      collecting_q <= 1'b0;
-      hdr_done_q   <= 1'b0;
-      rx_pkt_vld   <= 1'b0;
-      hdr_lat_q    <= 64'h0;
-      data_lat_q   <= 64'h0;
+      tx_state_q      <= TX_IDLE;
+      tx_bit_cnt_q    <= 6'd0;
+      tx_gap_cnt_q    <= 5'd0;
+      tx_hdr_shift_q  <= 64'h0;
+      tx_pld_shift_q  <= 64'h0;
+      tx_has_pld_q    <= 1'b0;
+      tx_clk_en_q     <= 1'b0;
     end else begin
-      rx_pkt_vld <= 1'b0;
-
-      if (sb_rx_valid) begin
-        if (!collecting_q) begin
-          collecting_q <= 1'b1;
-          // Start at 1, not 0: the first UI is counted by this cycle, so the
-          // 64th header bit sees cnt_q == 63 and the 64th payload bit 127.
-          cnt_q        <= 7'd1;
-          shift_q      <= {rx_bit, 63'b0};
-        end else begin
-          cnt_q   <= cnt_q + 1'b1;
-          shift_q <= new_word;
-          if (cnt_q == 7'd63) begin
-            hdr_lat_q  <= new_word;
-            hdr_done_q <= 1'b1;
-            // A payload follows only for the with-data opcode. DP cannot be
-            // used here: a payload with even parity drives DP to 0, which
-            // would truncate a valid packet.
-            if (new_word[4:0] != SB_OP_MSG_DATA64) begin
-              rx_pkt_vld   <= 1'b1;
-              collecting_q <= 1'b0;
-              hdr_done_q   <= 1'b0;
-            end
-          end else if (hdr_done_q && cnt_q == 7'd127) begin
-            data_lat_q  <= new_word;
-            rx_pkt_vld  <= 1'b1;
-            collecting_q<= 1'b0;
-            hdr_done_q  <= 1'b0;
+      case (tx_state_q)
+        TX_IDLE: begin
+          tx_bit_cnt_q <= 6'd0;
+          tx_gap_cnt_q <= 5'd0;
+          if (tx_valid && tx_ready) begin
+            // Encode header with package helper (handles opcode, IDs, tags, addr, CP, DP)
+            tx_hdr_shift_q <= sb_encode_header(tx_packet);
+            // Pad 32-bit payload upper bits with zero; 64-bit unpadded; 0-byte zeroed
+            tx_pld_shift_q <= sb_pad_data(tx_packet.opcode, tx_packet.data);
+            tx_has_pld_q   <= (sb_payload_bytes(tx_packet.opcode) > 0);
+            tx_clk_en_q    <= 1'b1;
+            tx_state_q     <= TX_HDR;
+          end else begin
+            tx_clk_en_q    <= 1'b0;
           end
         end
+
+        TX_HDR: begin
+          // Hold the first bit through the first forwarded rising edge.
+          if (tx_bit_cnt_q != 6'd0) begin
+            tx_hdr_shift_q <= {1'b0, tx_hdr_shift_q[63:1]};
+          end
+          if (tx_bit_cnt_q == 6'd63) begin
+            // 64th bit transmitted; park clock and enter 32-UI header gap
+            tx_clk_en_q  <= 1'b0;
+            tx_gap_cnt_q <= 5'd0;
+            tx_state_q   <= TX_HDR_GAP;
+          end else begin
+            tx_bit_cnt_q <= tx_bit_cnt_q + 1'b1;
+            tx_clk_en_q  <= 1'b1;
+          end
+        end
+
+        TX_HDR_GAP: begin
+          // Count exactly 32 UI low separation (SB_GAP_UI)
+          if (tx_gap_cnt_q == 5'd31) begin
+            tx_gap_cnt_q <= 5'd0;
+            if (tx_has_pld_q) begin
+              // Advance to payload serialization phase
+              tx_bit_cnt_q <= 6'd0;
+              tx_clk_en_q  <= 1'b1;
+              tx_state_q   <= TX_PAYLOAD;
+            end else begin
+              // No payload; transaction complete after header gap
+              tx_clk_en_q  <= 1'b0;
+              tx_state_q   <= TX_IDLE;
+            end
+          end else begin
+            tx_gap_cnt_q <= tx_gap_cnt_q + 1'b1;
+            tx_clk_en_q  <= 1'b0;
+          end
+        end
+
+        TX_PAYLOAD: begin
+          // Hold the first payload bit through the first forwarded edge.
+          if (tx_bit_cnt_q != 6'd0) begin
+            tx_pld_shift_q <= {1'b0, tx_pld_shift_q[63:1]};
+          end
+          if (tx_bit_cnt_q == 6'd63) begin
+            // 64th bit transmitted; park clock and enter 32-UI final gap
+            tx_clk_en_q  <= 1'b0;
+            tx_gap_cnt_q <= 5'd0;
+            tx_state_q   <= TX_PLD_GAP;
+          end else begin
+            tx_bit_cnt_q <= tx_bit_cnt_q + 1'b1;
+            tx_clk_en_q  <= 1'b1;
+          end
+        end
+
+        TX_PLD_GAP: begin
+          // Count exactly 32 UI low separation before declaring idle
+          if (tx_gap_cnt_q == 5'd31) begin
+            tx_gap_cnt_q <= 5'd0;
+            tx_clk_en_q  <= 1'b0;
+            tx_state_q   <= TX_IDLE;
+          end else begin
+            tx_gap_cnt_q <= tx_gap_cnt_q + 1'b1;
+            tx_clk_en_q  <= 1'b0;
+          end
+        end
+
+        default: tx_state_q <= TX_IDLE;
+      endcase
+    end
+  end
+
+  // =========================================================================
+  // RECEIVE FRONT-END: PHYSICAL SAMPLING ON NEGEDGE SB_RX_CLK
+  // =========================================================================
+  // Per UCIe 1.0 Section 5.13 and Figure 99:
+  // Incoming data is edge-aligned with sb_rx_clk rising edges. The receiver
+  // samples serial data on the falling edge of the strobe (negedge sb_rx_clk),
+  // providing 50% UI eye setup and hold margin.
+  // =========================================================================
+  logic rx_fe_rst_n;
+  logic rx_abort_rst_q;
+
+  assign rx_fe_rst_n = sbreset_n && !rx_abort_rst_q;
+
+  logic [63:0] rx_shift_reg_q;
+  logic [5:0]  rx_fe_bit_cnt_q;
+  logic [63:0] rx_hdr_buf_q;
+  logic [63:0] rx_pld_buf_q;
+  logic        rx_hdr_done_tog_q;
+  logic        rx_pld_done_tog_q;
+  logic        rx_strobe_tog_q;
+  logic        rx_expect_pld_q;
+
+  always_ff @(negedge sb_rx_clk or negedge rx_fe_rst_n) begin
+    if (!rx_fe_rst_n) begin
+      rx_shift_reg_q    <= 64'h0;
+      rx_fe_bit_cnt_q   <= 6'd0;
+      rx_hdr_buf_q      <= 64'h0;
+      rx_pld_buf_q      <= 64'h0;
+      rx_hdr_done_tog_q <= 1'b0;
+      rx_pld_done_tog_q <= 1'b0;
+      rx_strobe_tog_q   <= 1'b0;
+    end else begin
+      rx_strobe_tog_q <= ~rx_strobe_tog_q;
+      rx_shift_reg_q  <= {sb_rx_data, rx_shift_reg_q[63:1]};
+
+      if (rx_fe_bit_cnt_q == 6'd63) begin
+        rx_fe_bit_cnt_q <= 6'd0;
+        if (!rx_expect_pld_q) begin
+          rx_hdr_buf_q      <= {sb_rx_data, rx_shift_reg_q[63:1]};
+          rx_hdr_done_tog_q <= ~rx_hdr_done_tog_q;
+        end else begin
+          rx_pld_buf_q      <= {sb_rx_data, rx_shift_reg_q[63:1]};
+          rx_pld_done_tog_q <= ~rx_pld_done_tog_q;
+        end
+      end else begin
+        rx_fe_bit_cnt_q <= rx_fe_bit_cnt_q + 1'b1;
       end
     end
   end
 
   // =========================================================================
-  // RX field extraction  (spec Chapter 6 / Tables 47, 49, 53, 54, 56)
+  // SYNCHRONIZATION AND STROBE MONITORING INTO SBCLK
   // =========================================================================
-  // Each named field is extracted from the latched header (hdr_lat_q) using
-  // the bit positions defined in the header layout above. The data payload
-  // is extracted from data_lat_q.
-  //
-  // rx_opcode    : [4:0]   Sideband opcode (Table 47).
-  // rx_srcid     : [7:5]   Source stack ID (Table 49).
-  // rx_dstid     : [10:8]  Destination stack ID (Table 49).
-  // rx_msginfo   : [18:11] Message info (Table 54).
-  // rx_msgcode   : [26:19] Message code (Tables 53/54/56).
-  // rx_msgsubcode: [34:27] Message subcode (Tables 53/54/56).
-  // rx_cr        : [35]    Credit return bit.
-  // rx_addr      : [63:52] Address field.
-  // rx_be        : [45:38] Byte enables.
-  // rx_tag       : [50:46] Transaction tag.
-  // rx_ep        : [51]    Error/poison bit.
-  // rx_data      : Full 64-bit data payload from data_lat_q.
-  // =========================================================================
-  assign rx_opcode    = hdr_lat_q[4:0];
-  // -------------------------------------------------------------------------
-  // assign (group): Remaining RX header field extractions
-  //
-  // Each signal below is a combinational slice of the latched 64-bit RX
-  // header word (hdr_lat_q).  The bit positions correspond to the sideband
-  // header layout defined in Section 6.1.2:
-  //   rx_srcid      [7:5]   - source stack ID (Table 49)
-  //   rx_dstid      [10:8]  - destination stack ID (Table 49)
-  //   rx_msginfo    [18:11] - message-specific info field
-  //   rx_msgcode    [26:19] - message code (Tables 53/54/56)
-  //   rx_msgsubcode [34:27] - message sub-code (Tables 53/54/56)
-  //   rx_cr         [35]    - credit-return bit
-  //   rx_addr       [63:52] - 12-bit address field
-  //   rx_be         [45:38] - byte enables
-  //   rx_tag        [50:46] - 5-bit transaction tag
-  //   rx_ep         [51]    - error / poison indicator
-  //   rx_data                - full 64-bit payload from data_lat_q
-  // These outputs are stable from the rising edge that sets rx_pkt_vld
-  // until the next packet reception begins.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.2 - Packet Formats;
-  //           Table 47 - sideband opcodes.
-  // -------------------------------------------------------------------------
-  assign rx_srcid     = hdr_lat_q[7:5];
-  assign rx_dstid     = hdr_lat_q[10:8];
-  assign rx_msginfo   = hdr_lat_q[18:11];
-  assign rx_msgcode   = hdr_lat_q[26:19];
-  assign rx_msgsubcode= hdr_lat_q[34:27];
-  assign rx_cr        = hdr_lat_q[35];
-  assign rx_addr      = hdr_lat_q[63:52];
-  assign rx_be        = hdr_lat_q[45:38];
-  assign rx_tag       = hdr_lat_q[50:46];
-  assign rx_ep        = hdr_lat_q[51];
-  assign rx_data      = data_lat_q;
+  logic [1:0] strobe_tog_sync_q;
+  logic [1:0] hdr_done_sync_q;
+  logic [1:0] pld_done_sync_q;
+  logic [1:0] rx_clk_level_sync_q;
+
+  always_ff @(posedge sbclk or negedge sbreset_n) begin
+    if (!sbreset_n) begin
+      strobe_tog_sync_q   <= 2'b00;
+      hdr_done_sync_q     <= 2'b00;
+      pld_done_sync_q     <= 2'b00;
+      rx_clk_level_sync_q <= 2'b00;
+    end else begin
+      strobe_tog_sync_q   <= {strobe_tog_sync_q[0], rx_strobe_tog_q};
+      hdr_done_sync_q     <= {hdr_done_sync_q[0], rx_hdr_done_tog_q};
+      pld_done_sync_q     <= {pld_done_sync_q[0], rx_pld_done_tog_q};
+      rx_clk_level_sync_q <= {rx_clk_level_sync_q[0], sb_rx_clk};
+    end
+  end
+
+  wire strobe_event   = strobe_tog_sync_q[1] ^ strobe_tog_sync_q[0];
+  wire hdr_done_event = hdr_done_sync_q[1]   ^ hdr_done_sync_q[0];
+  wire pld_done_event = pld_done_sync_q[1]   ^ pld_done_sync_q[0];
+  wire rx_clk_is_high = rx_clk_level_sync_q[1];
 
   // =========================================================================
-  // CP parity check  (spec Chapter 6 – Command Parity)
+  // RECEIVE PROTOCOL FSM AND ERROR CHECKING IN SBCLK
   // =========================================================================
-  // CP covers every header bit except DP (bit 37) and CP itself (bit 36).
-  // A mask zeroes bits [37:36] before XOR-reducing. The result is compared
-  // against the received CP value in bit 36. A mismatch raises rx_cp_err
-  // coincident with rx_pkt_vld.
+  // States:
+  //   RX_IDLE         : Waiting for first strobe of incoming packet.
+  //   RX_HDR_ACTIVE   : Assembling 64-bit header, monitoring for strobe loss.
+  //   RX_HDR_GAP      : Enforcing 32-UI header gap, checking for unexpected strobes.
+  //   RX_PLD_ACTIVE   : Assembling 64-bit payload, monitoring for strobe loss.
+  //   RX_PLD_GAP      : Enforcing 32-UI payload gap, checking for unexpected strobes.
+  //   RX_EVAL_DONE    : Evaluating parity, opcode, upper-32b, pushing to queue.
+  //   RX_ABORT_WAIT   : Clearing front-end after early strobe loss.
   // =========================================================================
-  wire [63:0] hdr_cp_mask = {hdr_lat_q[63:38], 2'b00, hdr_lat_q[35:0]};
-  // -------------------------------------------------------------------------
-  // assign: Command-parity error flag (rx_cp_err)
-  //
-  // Compares the re-computed even parity of the received header (with
-  // CP and DP bit-positions masked to zero) against the received CP
-  // value stored in hdr_lat_q[36].  A mismatch means the header was
-  // corrupted in transit.  rx_cp_err is asserted for exactly one cycle,
-  // coincident with rx_pkt_vld, so consumers can register the error
-  // together with the packet fields.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity.
-  // -------------------------------------------------------------------------
-  assign rx_cp_err = rx_pkt_vld && (^hdr_cp_mask != hdr_lat_q[36]);
+  typedef enum logic [2:0] {
+    RX_IDLE         = 3'd0,
+    RX_HDR_ACTIVE   = 3'd1,
+    RX_HDR_GAP      = 3'd2,
+    RX_PLD_ACTIVE   = 3'd3,
+    RX_PLD_GAP      = 3'd4,
+    RX_EVAL_DONE    = 3'd5,
+    RX_ABORT_WAIT   = 3'd6
+  } rx_state_t;
+
+  rx_state_t   rx_state_q;
+  logic [4:0]  rx_gap_cnt_q;
+  logic [5:0]  rx_strobe_timeout_cnt_q;
+  logic        rx_pld_started_q;
+  logic [63:0] rx_hdr_latched_q;
+  logic [63:0] rx_pld_latched_q;
+  logic        rx_gap_strobe_err_q;
+  logic        rx_strobe_loss_err_q;
+
+  // Completion Queue Entry Definition
+  typedef struct packed {
+    sb_packet_t packet;
+    logic       format_error;
+    logic       cp_error;
+    logic       dp_error;
+  } rx_queue_entry_t;
+
+  rx_queue_entry_t new_rx_entry;
+  logic            rx_push_req;
+
+  // Strobe timeout threshold in sbclk cycles for declaring early strobe loss
+  localparam logic [5:0] STROBE_LOSS_TIMEOUT = 6'd16;
+  // Maximum timeout waiting for payload strobe to commence after header gap
+  localparam logic [5:0] PLD_START_TIMEOUT   = 6'd63;
+
+  // RX Protocol FSM
+  always_ff @(posedge sbclk or negedge sbreset_n) begin
+    if (!sbreset_n) begin
+      rx_state_q              <= RX_IDLE;
+      rx_gap_cnt_q            <= 5'd0;
+      rx_strobe_timeout_cnt_q <= 6'd0;
+      rx_pld_started_q        <= 1'b0;
+      rx_hdr_latched_q        <= 64'h0;
+      rx_pld_latched_q        <= 64'h0;
+      rx_gap_strobe_err_q     <= 1'b0;
+      rx_strobe_loss_err_q    <= 1'b0;
+      rx_expect_pld_q         <= 1'b0;
+      rx_abort_rst_q          <= 1'b0;
+      rx_push_req             <= 1'b0;
+    end else begin
+      rx_push_req    <= 1'b0;
+      rx_abort_rst_q <= 1'b0;
+
+      case (rx_state_q)
+        RX_IDLE: begin
+          rx_gap_cnt_q            <= 5'd0;
+          rx_strobe_timeout_cnt_q <= 6'd0;
+          rx_pld_started_q        <= 1'b0;
+          rx_gap_strobe_err_q     <= 1'b0;
+          rx_strobe_loss_err_q    <= 1'b0;
+          rx_expect_pld_q         <= 1'b0;
+          // Recognize a packet only from active scalar strobe
+          if (strobe_event) begin
+            rx_state_q <= RX_HDR_ACTIVE;
+          end
+        end
+
+        RX_HDR_ACTIVE: begin
+          if (hdr_done_event) begin
+            // Arm payload capture as soon as the header completes. The
+            // serialized payload starts during the physical header gap,
+            // before the synchronized protocol FSM leaves RX_HDR_GAP.
+            rx_expect_pld_q  <= (sb_payload_bytes(rx_hdr_buf_q[4:0]) > 0);
+            rx_hdr_latched_q <= rx_hdr_buf_q;
+            rx_gap_cnt_q     <= 5'd0;
+            rx_state_q       <= RX_HDR_GAP;
+          end else begin
+            // Monitor for early strobe loss
+            if (strobe_event) begin
+              rx_strobe_timeout_cnt_q <= 6'd0;
+            end else begin
+              if (rx_strobe_timeout_cnt_q == STROBE_LOSS_TIMEOUT) begin
+                // Strobe stopped before 64 bits received
+                rx_strobe_loss_err_q <= 1'b1;
+                rx_abort_rst_q       <= 1'b1;
+                rx_push_req          <= 1'b1; // Push error event
+                rx_state_q           <= RX_ABORT_WAIT;
+              end else begin
+                rx_strobe_timeout_cnt_q <= rx_strobe_timeout_cnt_q + 1'b1;
+              end
+            end
+          end
+        end
+
+        RX_HDR_GAP: begin
+          // Require header gap of 32 UIs before optional payload phase
+          if (strobe_event || rx_clk_is_high) begin
+            // Unexpected strobe in gap detected
+            rx_gap_strobe_err_q <= 1'b1;
+          end
+
+          if (rx_gap_cnt_q == 5'd31) begin
+            rx_gap_cnt_q            <= 5'd0;
+            rx_strobe_timeout_cnt_q <= 6'd0;
+            rx_pld_started_q        <= 1'b0;
+            // Decode opcode to decide whether a payload follows
+            if (sb_payload_bytes(rx_hdr_latched_q[4:0]) > 0) begin
+              rx_expect_pld_q <= 1'b1;
+              rx_state_q      <= RX_PLD_ACTIVE;
+            end else begin
+              rx_expect_pld_q <= 1'b0;
+              rx_state_q      <= RX_EVAL_DONE;
+            end
+          end else begin
+            rx_gap_cnt_q <= rx_gap_cnt_q + 1'b1;
+          end
+        end
+
+        RX_PLD_ACTIVE: begin
+          if (pld_done_event) begin
+            // 64 payload bits assembled cleanly
+            rx_pld_latched_q <= rx_pld_buf_q;
+            rx_expect_pld_q  <= 1'b0;
+            rx_gap_cnt_q     <= 5'd0;
+            rx_state_q       <= RX_PLD_GAP;
+          end else if (!rx_pld_started_q) begin
+            if (strobe_event) begin
+              rx_pld_started_q        <= 1'b1;
+              rx_strobe_timeout_cnt_q <= 6'd0;
+            end else if (rx_strobe_timeout_cnt_q == PLD_START_TIMEOUT) begin
+              // Payload strobe never started after gap
+              rx_strobe_loss_err_q <= 1'b1;
+              rx_abort_rst_q       <= 1'b1;
+              rx_push_req          <= 1'b1;
+              rx_state_q           <= RX_ABORT_WAIT;
+            end else begin
+              rx_strobe_timeout_cnt_q <= rx_strobe_timeout_cnt_q + 1'b1;
+            end
+          end else begin
+            if (strobe_event) begin
+              rx_strobe_timeout_cnt_q <= 6'd0;
+            end else if (rx_strobe_timeout_cnt_q == STROBE_LOSS_TIMEOUT) begin
+              // Payload strobe stopped prematurely
+              rx_strobe_loss_err_q <= 1'b1;
+              rx_abort_rst_q       <= 1'b1;
+              rx_push_req          <= 1'b1;
+              rx_state_q           <= RX_ABORT_WAIT;
+            end else begin
+              rx_strobe_timeout_cnt_q <= rx_strobe_timeout_cnt_q + 1'b1;
+            end
+          end
+        end
+
+        RX_PLD_GAP: begin
+          // Require payload gap of 32 UIs before completion
+          if (strobe_event || rx_clk_is_high) begin
+            // Unexpected strobe in gap detected
+            rx_gap_strobe_err_q <= 1'b1;
+          end
+
+          if (rx_gap_cnt_q == 5'd31) begin
+            rx_gap_cnt_q <= 5'd0;
+            rx_state_q   <= RX_EVAL_DONE;
+          end else begin
+            rx_gap_cnt_q <= rx_gap_cnt_q + 1'b1;
+          end
+        end
+
+        RX_EVAL_DONE: begin
+          // Commit packet and error assessment into completion queue
+          rx_push_req <= 1'b1;
+          rx_state_q  <= RX_IDLE;
+        end
+
+        RX_ABORT_WAIT: begin
+          // Front-end reset settling cycle before returning to idle
+          rx_expect_pld_q <= 1'b0;
+          rx_state_q      <= RX_IDLE;
+        end
+
+        default: rx_state_q <= RX_IDLE;
+      endcase
+    end
+  end
 
   // =========================================================================
-  // DP parity check  (spec Chapter 6 – Data Parity)
+  // ERROR EVALUATION AND PACKET ASSEMBLY
   // =========================================================================
-  // DP is the even parity of the 64-bit data payload. The check validates
-  // that the received DP bit (hdr_lat_q[37]) equals the XOR-reduction of
-  // the latched data payload for every DATA64 packet, regardless of
-  // whether DP is 0 or 1.  This covers both even-parity payloads (DP=0,
-  // XOR=0) and odd-parity payloads (DP=1, XOR=1).  Non-DATA64 packets
-  // carry no payload and are not checked here.  rx_dp_err is raised for
-  // exactly one cycle, coincident with rx_pkt_vld.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity.
+  sb_packet_t     dec_pkt;
+  sb_decode_err_t dec_hdr_err;
+  logic           rsvd_opcode_err;
+  logic           cp_mismatch_err;
+  logic           dp_mismatch_err;
+  logic           upper32_err;
+  logic           format_err_comb;
+
+  always @* begin
+    // Unpack 64-bit header into typed sb_packet_t
+    dec_pkt = sb_decode_header(rx_hdr_latched_q);
+    // Pad received payload into packet data field
+    if (sb_payload_bytes(dec_pkt.opcode) > 0) begin
+      dec_pkt.data = sb_pad_data(dec_pkt.opcode, rx_pld_latched_q);
+    end else begin
+      dec_pkt.data = 64'h0;
+    end
+
+    // Opcode validation against Table 47
+    rsvd_opcode_err = !sb_opcode_supported(dec_pkt.opcode);
+
+    // Structural header checks (reserved bits, CP, illegal payload)
+    dec_hdr_err = sb_decode_error(rx_hdr_latched_q);
+
+    // CP parity check: even parity of header bits excluding DP (bit 30)
+    cp_mismatch_err = dec_hdr_err.cp_err;
+
+    // DP parity check: even parity of data payload (only for packets with data)
+    if (sb_payload_bytes(dec_pkt.opcode) > 0) begin
+      dp_mismatch_err = sb_check_dp_err(dec_pkt.opcode, rx_hdr_latched_q[30], rx_pld_latched_q);
+    end else begin
+      dp_mismatch_err = 1'b0;
+    end
+
+    // Check for nonzero upper 32 bits on 32-bit payload transfers
+    if ((sb_payload_bytes(dec_pkt.opcode) == 4) && (rx_pld_latched_q[63:32] != 32'h0)) begin
+      upper32_err = 1'b1;
+    end else begin
+      upper32_err = 1'b0;
+    end
+
+    // Format error rollup:
+    //   - Early strobe loss
+    //   - Unexpected strobe during header/payload gap
+    //   - Reserved opcode
+    //   - Nonzero upper 32 bits for 32-bit payload
+    //   - Nonzero reserved header fields
+    //   - Illegal payload combination (DP asserted with 0B payload)
+    format_err_comb = rx_strobe_loss_err_q
+                    | rx_gap_strobe_err_q
+                    | rsvd_opcode_err
+                    | upper32_err
+                    | dec_hdr_err.rsvd_field
+                    | dec_hdr_err.illegal_payload;
+  end
+
+  // Prepared entry for queue insertion
+  assign new_rx_entry.packet       = rx_strobe_loss_err_q ? '0 : dec_pkt;
+  assign new_rx_entry.format_error = format_err_comb;
+  assign new_rx_entry.cp_error     = rx_strobe_loss_err_q ? 1'b0 : cp_mismatch_err;
+  assign new_rx_entry.dp_error     = rx_strobe_loss_err_q ? 1'b0 : dp_mismatch_err;
+
   // =========================================================================
-  assign rx_dp_err = rx_pkt_vld
-                  && (hdr_lat_q[4:0] == SB_OP_MSG_DATA64)
-                  && (^data_lat_q != hdr_lat_q[37]);
+  // TWO-ENTRY COMPLETION QUEUE AND HANDSHAKE INTERFACE
+  // =========================================================================
+  // Holds up to 2 received packet events.
+  // Produces one retained packet event on {rx_valid, rx_packet, error flags}
+  // until acknowledged and popped by rx_ready.
+  // Asserts sticky rx_overflow if an incoming event arrives when full.
+  // =========================================================================
+  sb_packet_t rx_packet0_q, rx_packet1_q;
+  logic       rx_format0_q, rx_format1_q;
+  logic       rx_cp0_q, rx_cp1_q;
+  logic       rx_dp0_q, rx_dp1_q;
+  logic [1:0] rx_q_count_q;
+  logic       rx_q_rd_ptr_q;
+  logic       rx_q_wr_ptr_q;
+  logic       rx_overflow_q;
+
+  wire rx_pop  = rx_valid && rx_ready;
+  wire rx_push = rx_push_req;
+
+  always_ff @(posedge sbclk or negedge sbreset_n) begin
+    if (!sbreset_n) begin
+      rx_q_count_q  <= 2'd0;
+      rx_q_rd_ptr_q <= 1'b0;
+      rx_q_wr_ptr_q <= 1'b0;
+      rx_overflow_q <= 1'b0;
+      rx_packet0_q  <= '0;
+      rx_packet1_q  <= '0;
+      rx_format0_q  <= 1'b0;
+      rx_format1_q  <= 1'b0;
+      rx_cp0_q      <= 1'b0;
+      rx_cp1_q      <= 1'b0;
+      rx_dp0_q      <= 1'b0;
+      rx_dp1_q      <= 1'b0;
+    end else begin
+      case ({rx_push, rx_pop})
+        2'b10: begin
+          if (rx_q_count_q == 2'd2) begin
+            rx_overflow_q <= 1'b1;
+          end else if (!rx_q_wr_ptr_q) begin
+            rx_packet0_q <= new_rx_entry.packet;
+            rx_format0_q <= new_rx_entry.format_error;
+            rx_cp0_q     <= new_rx_entry.cp_error;
+            rx_dp0_q     <= new_rx_entry.dp_error;
+            rx_q_wr_ptr_q <= 1'b1;
+            rx_q_count_q <= rx_q_count_q + 1'b1;
+          end else begin
+            rx_packet1_q <= new_rx_entry.packet;
+            rx_format1_q <= new_rx_entry.format_error;
+            rx_cp1_q     <= new_rx_entry.cp_error;
+            rx_dp1_q     <= new_rx_entry.dp_error;
+            rx_q_wr_ptr_q <= 1'b0;
+            rx_q_count_q <= rx_q_count_q + 1'b1;
+          end
+        end
+        2'b01: begin
+          rx_q_rd_ptr_q <= ~rx_q_rd_ptr_q;
+          rx_q_count_q  <= rx_q_count_q - 1'b1;
+        end
+        2'b11: begin
+          if (!rx_q_wr_ptr_q) begin
+            rx_packet0_q <= new_rx_entry.packet;
+            rx_format0_q <= new_rx_entry.format_error;
+            rx_cp0_q     <= new_rx_entry.cp_error;
+            rx_dp0_q     <= new_rx_entry.dp_error;
+            rx_q_wr_ptr_q <= 1'b1;
+          end else begin
+            rx_packet1_q <= new_rx_entry.packet;
+            rx_format1_q <= new_rx_entry.format_error;
+            rx_cp1_q     <= new_rx_entry.cp_error;
+            rx_dp1_q     <= new_rx_entry.dp_error;
+            rx_q_wr_ptr_q <= 1'b0;
+          end
+          rx_q_rd_ptr_q <= ~rx_q_rd_ptr_q;
+        end
+        default: ;
+      endcase
+    end
+  end
+
+  assign rx_valid = (rx_q_count_q != 2'd0);
+  assign rx_packet = rx_q_rd_ptr_q ? rx_packet1_q : rx_packet0_q;
+  assign rx_format_error = rx_valid ? (rx_q_rd_ptr_q ? rx_format1_q : rx_format0_q) : 1'b0;
+  assign rx_cp_error = rx_valid ? (rx_q_rd_ptr_q ? rx_cp1_q : rx_cp0_q) : 1'b0;
+  assign rx_dp_error = rx_valid ? (rx_q_rd_ptr_q ? rx_dp1_q : rx_dp0_q) : 1'b0;
+  assign rx_overflow = rx_overflow_q;
 
 endmodule
 

@@ -119,7 +119,10 @@
 //                        the interface, storage, write path and output now
 //                        cite PLAN.md section 15.9 Phase C and UCIe 1.0
 //                        section 7.5.
-// ============================================================================
+//   v0.0.5  2026-09-28  Sideband protocol remediation:
+//                        - Add csr_be[7:0] port and merge enabled bytes on writes (Section 7.5).
+//                        - Preserve hardware-set and private-clear priority (Section 7.5).
+//                        - Preserve one-cycle read latency.
 `ifndef PhyCsr_SV
 `define PhyCsr_SV
 `include "ucie_pkg.sv"
@@ -133,6 +136,7 @@ module phy_csr (
   input  logic        csr_rd,
   input  logic [26:0] csr_addr,
   input  logic [63:0] csr_wdata,
+  input  logic [7:0]  csr_be,
   output logic [63:0] csr_rdata,
   output logic        csr_rdata_vld,
 
@@ -232,13 +236,21 @@ module phy_csr (
       // Private Active Entry clear. Highest priority for start_train_q.
       start_train_q <= 1'b0;
       // A sideband write to ELEC_PARAM is still honoured during the clear.
-      if (csr_wr && csr_addr == CSR_ELEC_PARAM) begin
-        elec_param_q <= csr_wdata;
+      if (csr_wr && (csr_addr == CSR_ELEC_PARAM)) begin
+        for (int b = 0; b < 8; b++) begin
+          if (csr_be[b]) elec_param_q[b*8 +: 8] <= csr_wdata[b*8 +: 8];
+        end
       end
     end else if (csr_wr) begin
       case (csr_addr)
-        CSR_TRAIN_CTL : start_train_q <= csr_wdata[0];
-        CSR_ELEC_PARAM: elec_param_q  <= csr_wdata;
+        CSR_TRAIN_CTL : begin
+          if (csr_be[0]) start_train_q <= csr_wdata[0];
+        end
+        CSR_ELEC_PARAM: begin
+          for (int b = 0; b < 8; b++) begin
+            if (csr_be[b]) elec_param_q[b*8 +: 8] <= csr_wdata[b*8 +: 8];
+          end
+        end
         default       : ;
       endcase
     end

@@ -214,9 +214,11 @@
 //                                 (param_roles, transaction_classes, arbitration,
 //                                 fatal_causes, trainerror, linkreset, disabled,
 //                                 pmnak, active_entry, pre_active_block,
-//                                 scrambling, framing_fault); implement robust
 //                                 one-shot lclk sampling and export all keys
 //                                 to coverage JSON.
+//   0.0.9 2026-09-28  Keep packet coverage on coherent lclk mailbox fields
+//                                 while the public sideband crossing uses
+//                                 scalar clock/data pins.
 // ============================================================================
 `ifndef CovMonitor_SV
 `define CovMonitor_SV

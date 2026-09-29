@@ -255,6 +255,14 @@ module ut_stall;
     .start_link_train(ad_start_link_train),
     .clear_start_link_train(ad_clear_start_link_train),
     .adapter_start_link_train(ad_adapter_start_link_train),
+    .adapter_sb_tx_ready(1'b1),
+    .adapter_sb_rx_valid(1'b0),
+    .adapter_sb_rx_packet('0),
+    .adapter_sb_rx_cp_error(1'b0),
+    .adapter_sb_rx_dp_error(1'b0),
+    .adapter_sb_rx_format_error(1'b0),
+    .phy_csr_rdata('0),
+    .phy_csr_rdata_vld(1'b0),
     .ltsm_state_obs(ad_ltsm_state_obs),
     .link_active_obs(ad_link_active_obs)
   );

@@ -222,8 +222,8 @@ module ut_ltsm;
   logic [11:0] sb_tx_addr;
   logic [63:0] sb_tx_data_in;
   logic        sb_tx_has_data;
-  logic [NC-1:0] loc_sb_data, par_sb_data;
-  logic        loc_sb_valid, par_sb_valid;
+  logic        loc_sb_clk, par_sb_clk;
+  logic        loc_sb_data, par_sb_data;
 
   // LTSM receive side (fed from the partner codec)
   logic        sb_rx_pkt_vld;
@@ -287,12 +287,13 @@ module ut_ltsm;
   logic [63:0] par_tx_data_in;
   logic        par_tx_has_data;
 
-  // Partner receive snapshot
   logic        par_rx_pkt_vld;
   logic [4:0]  par_rx_opcode;
   logic [2:0]  par_rx_srcid, par_rx_dstid;
   logic [7:0]  par_rx_msginfo, par_rx_msgcode, par_rx_msgsubcode;
   logic        par_rx_cp_err, par_rx_dp_err;
+  logic        loc_tx_ready, loc_rx_valid, par_tx_ready, par_rx_valid;
+  sb_packet_t loc_tx_packet, loc_rx_packet, par_tx_packet, par_rx_packet;
 
 // ---------------------------------------------------------------------------
 // DUT Instantiation: ltsm #(.NLANES(NLANES_MAX)) u_dut
@@ -384,24 +385,38 @@ module ut_ltsm;
   assign sb_tx_busy = tx_cdc_busy | loc_tx_busy_sync_q;
   assign sb_tx_accepted = sb_tx_load && !tx_cdc_busy;
 
+  always_comb begin
+    loc_tx_packet = '0;
+    loc_tx_packet.opcode = loc_tx_opcode;
+    loc_tx_packet.src_id = loc_tx_srcid;
+    loc_tx_packet.dst_id = loc_tx_dstid;
+    loc_tx_packet.msg_info = {8'h0, loc_tx_msginfo};
+    loc_tx_packet.msg_code = loc_tx_msgcode;
+    loc_tx_packet.msg_subcode = loc_tx_msgsubcode;
+    loc_tx_packet.be = loc_tx_be;
+    loc_tx_packet.tag = loc_tx_tag;
+    loc_tx_packet.ep = loc_tx_ep;
+    loc_tx_packet.addr = {{15{1'b0}}, loc_tx_addr};
+    loc_tx_packet.data = loc_tx_data_in;
+  end
+  assign loc_rx_pkt_vld = loc_rx_valid;
+  assign loc_rx_opcode = loc_rx_packet.opcode;
+  assign loc_rx_srcid = loc_rx_packet.src_id;
+  assign loc_rx_dstid = loc_rx_packet.dst_id;
+  assign loc_rx_msginfo = loc_rx_packet.msg_info[7:0];
+  assign loc_rx_msgcode = loc_rx_packet.msg_code;
+  assign loc_rx_msgsubcode = loc_rx_packet.msg_subcode;
+  assign loc_rx_data = loc_rx_packet.data;
+
   sb_codec u_loc (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
-    .tx_load(loc_tx_load), .tx_opcode(loc_tx_opcode),
-    .tx_srcid(loc_tx_srcid), .tx_dstid(loc_tx_dstid),
-    .tx_msginfo(loc_tx_msginfo), .tx_msgcode(loc_tx_msgcode),
-    .tx_msgsubcode(loc_tx_msgsubcode), .tx_be(loc_tx_be), .tx_cr(1'b0),
-    .tx_tag(loc_tx_tag), .tx_ep(loc_tx_ep), .tx_addr(loc_tx_addr),
-    .tx_data_in(loc_tx_data_in), .tx_has_data(loc_tx_has_data),
+    .tx_valid(loc_tx_load), .tx_ready(loc_tx_ready), .tx_packet(loc_tx_packet),
     .tx_busy(loc_tx_busy),
-    .sb_tx_data(loc_sb_data), .sb_tx_valid(loc_sb_valid),
-    .sb_rx_data(par_sb_data), .sb_rx_valid(par_sb_valid),
-    .rx_pkt_vld(loc_rx_pkt_vld), .rx_opcode(loc_rx_opcode),
-    .rx_srcid(loc_rx_srcid), .rx_dstid(loc_rx_dstid),
-    .rx_msginfo(loc_rx_msginfo), .rx_msgcode(loc_rx_msgcode),
-    .rx_msgsubcode(loc_rx_msgsubcode), .rx_cr(),
-    .rx_be(), .rx_tag(), .rx_ep(), .rx_addr(),
-    .rx_data(loc_rx_data),
-    .rx_cp_err(loc_rx_cp_err), .rx_dp_err(loc_rx_dp_err)
+    .sb_tx_clk(loc_sb_clk), .sb_tx_data(loc_sb_data),
+    .sb_rx_clk(par_sb_clk), .sb_rx_data(par_sb_data),
+    .rx_valid(loc_rx_valid), .rx_ready(!rx_cdc_busy), .rx_packet(loc_rx_packet),
+    .rx_format_error(), .rx_cp_error(loc_rx_cp_err),
+    .rx_dp_error(loc_rx_dp_err), .rx_overflow()
   );
 
   sb_cdc_mailbox #(.WIDTH(SB_RX_W)) u_rx_cdc (
@@ -444,23 +459,37 @@ module ut_ltsm;
 // closed loop allows the LTSM to complete every sideband handshake
 // without a second LTSM instance.
 //
+  always_comb begin
+    par_tx_packet = '0;
+    par_tx_packet.opcode = par_tx_opcode;
+    par_tx_packet.src_id = par_tx_srcid;
+    par_tx_packet.dst_id = par_tx_dstid;
+    par_tx_packet.msg_info = {8'h0, par_tx_msginfo};
+    par_tx_packet.msg_code = par_tx_msgcode;
+    par_tx_packet.msg_subcode = par_tx_msgsubcode;
+    par_tx_packet.be = par_tx_be;
+    par_tx_packet.tag = par_tx_tag;
+    par_tx_packet.ep = par_tx_ep;
+    par_tx_packet.addr = {{15{1'b0}}, par_tx_addr};
+    par_tx_packet.data = par_tx_data_in;
+  end
+  assign par_rx_pkt_vld = par_rx_valid;
+  assign par_rx_opcode = par_rx_packet.opcode;
+  assign par_rx_srcid = par_rx_packet.src_id;
+  assign par_rx_dstid = par_rx_packet.dst_id;
+  assign par_rx_msginfo = par_rx_packet.msg_info[7:0];
+  assign par_rx_msgcode = par_rx_packet.msg_code;
+  assign par_rx_msgsubcode = par_rx_packet.msg_subcode;
+
   sb_codec u_par (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
-    .tx_load(par_tx_load), .tx_opcode(par_tx_opcode),
-    .tx_srcid(par_tx_srcid), .tx_dstid(par_tx_dstid),
-    .tx_msginfo(par_tx_msginfo), .tx_msgcode(par_tx_msgcode),
-    .tx_msgsubcode(par_tx_msgsubcode), .tx_be(par_tx_be), .tx_cr(1'b0),
-    .tx_tag(par_tx_tag), .tx_ep(par_tx_ep), .tx_addr(par_tx_addr),
-    .tx_data_in(par_tx_data_in), .tx_has_data(par_tx_has_data),
+    .tx_valid(par_tx_load), .tx_ready(par_tx_ready), .tx_packet(par_tx_packet),
     .tx_busy(par_tx_busy),
-    .sb_tx_data(par_sb_data), .sb_tx_valid(par_sb_valid),
-    .sb_rx_data(loc_sb_data), .sb_rx_valid(loc_sb_valid),
-    .rx_pkt_vld(par_rx_pkt_vld), .rx_opcode(par_rx_opcode),
-    .rx_srcid(par_rx_srcid), .rx_dstid(par_rx_dstid),
-    .rx_msginfo(par_rx_msginfo), .rx_msgcode(par_rx_msgcode),
-    .rx_msgsubcode(par_rx_msgsubcode), .rx_cr(),
-    .rx_be(), .rx_tag(), .rx_ep(), .rx_addr(), .rx_data(),
-    .rx_cp_err(par_rx_cp_err), .rx_dp_err(par_rx_dp_err)
+    .sb_tx_clk(par_sb_clk), .sb_tx_data(par_sb_data),
+    .sb_rx_clk(loc_sb_clk), .sb_rx_data(loc_sb_data),
+    .rx_valid(par_rx_valid), .rx_ready(1'b1), .rx_packet(par_rx_packet),
+    .rx_format_error(), .rx_cp_error(par_rx_cp_err),
+    .rx_dp_error(par_rx_dp_err), .rx_overflow()
   );
 
   logic par_enable_resp;

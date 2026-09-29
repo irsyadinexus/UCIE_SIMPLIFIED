@@ -24,10 +24,10 @@ module ut_sbinit;
   logic lreset_n;
   logic sbreset_n;
 
-  logic [NC-1:0] sb_tx_data;
-  logic          sb_tx_valid;
-  logic [NC-1:0] sb_rx_data;
-  logic          sb_rx_valid;
+  logic        sb_tx_clk;
+  logic        sb_tx_data;
+  logic        sb_rx_clk;
+  logic        sb_rx_data;
 
   integer errors;
   integer tx_event_count;
@@ -48,8 +48,9 @@ module ut_sbinit;
     .sbreset_n(sbreset_n),
     .start_link_train(1'b0),
     .adapter_start_link_train(1'b0),
-    .rdi_lp_state_req(4'h0),
+    .rdi_lp_state_req('0),
     .rdi_lp_stallack(1'b0),
+    .rdi_lp_linkerror(1'b0),
     .rdi_pl_state_sts(),
     .rdi_pl_inband_pres(),
     .rdi_pl_linkerror(),
@@ -67,10 +68,26 @@ module ut_sbinit;
     .rdi_pl_speedmode(),
     .rdi_pl_stallreq(),
     .adapter_active_req(1'b0),
+    .sb_tx_clk(sb_tx_clk),
     .sb_tx_data(sb_tx_data),
-    .sb_tx_valid(sb_tx_valid),
+    .sb_rx_clk(sb_rx_clk),
     .sb_rx_data(sb_rx_data),
-    .sb_rx_valid(sb_rx_valid),
+    .adapter_sb_tx_valid(1'b0),
+    .adapter_sb_tx_ready(),
+    .adapter_sb_tx_packet('0),
+    .adapter_sb_rx_valid(),
+    .adapter_sb_rx_ready(1'b1),
+    .adapter_sb_rx_packet(),
+    .adapter_sb_rx_cp_error(),
+    .adapter_sb_rx_dp_error(),
+    .adapter_sb_rx_format_error(),
+    .phy_csr_wr(1'b0),
+    .phy_csr_rd(1'b0),
+    .phy_csr_addr('0),
+    .phy_csr_wdata('0),
+    .phy_csr_be('0),
+    .phy_csr_rdata(),
+    .phy_csr_rdata_vld(),
     .mb_tx_data(),
     .mb_tx_valid(),
     .mb_rx_data('0),
@@ -120,18 +137,17 @@ module ut_sbinit;
     integer ui;
     logic expected_bit;
     begin
-      @(posedge sb_tx_valid);
+      @(posedge sb_tx_clk);
       #0.01;
       for (ui = 0; ui < SBINIT_PATTERN_UI; ui = ui + 1) begin
-        expected_bit = ~ui[0];
-        if ((sb_tx_valid !== 1'b1) ||
-            (sb_tx_data !== {NC{expected_bit}})) begin
-          $display("FAIL ut_sbinit: TX active UI %0d got valid=%b data=%b",
-                   ui, sb_tx_valid, sb_tx_data);
+        expected_bit = (ui % 2 == 0) ? 1'b1 : 1'b0;
+        if (sb_tx_data !== expected_bit) begin
+          $display("FAIL ut_sbinit: TX active UI %0d got data=%b",
+                   ui, sb_tx_data);
           errors = errors + 1;
         end
         if (ui != (SBINIT_PATTERN_UI - 1)) begin
-          @(posedge sbclk);
+          @(posedge sb_tx_clk);
           #0.01;
         end
       end
@@ -139,7 +155,7 @@ module ut_sbinit;
       @(posedge sbclk);
       #0.01;
       for (ui = 0; ui < SBINIT_LOW_UI; ui = ui + 1) begin
-        if ((sb_tx_valid !== 1'b0) || (sb_tx_data !== {NC{1'b0}})) begin
+        if (sb_tx_data !== 1'b0) begin
           $display("FAIL ut_sbinit: TX low UI %0d was not idle-low", ui);
           errors = errors + 1;
         end
@@ -151,7 +167,7 @@ module ut_sbinit;
 
       @(posedge sbclk);
       #0.01;
-      if ((sb_tx_valid !== 1'b0) ||
+      if ((sb_tx_clk !== 1'b0) ||
           (u_dut.u_sb_init_raw.raw_tx_state_q !== 2'd0)) begin
         $display("FAIL ut_sbinit: TX did not stop at the low boundary");
         errors = errors + 1;
@@ -167,18 +183,21 @@ module ut_sbinit;
     integer ui;
     logic value;
     begin
+      @(negedge sbclk);
       for (ui = 0; ui < SBINIT_PATTERN_UI; ui = ui + 1) begin
-        @(negedge sbclk);
-        value = ~ui[0];
+        value = (ui % 2 == 0) ? 1'b1 : 1'b0;
         if (ui == flip_ui) value = ~value;
-        sb_rx_valid = 1'b1;
-        sb_rx_data  = {NC{value}};
+        sb_rx_data = value;
+        sb_rx_clk  = 1'b1;
         @(posedge sbclk);
+        sb_rx_clk  = 1'b0;
+        if (ui != (SBINIT_PATTERN_UI - 1))
+          @(negedge sbclk);
       end
       for (ui = 0; ui < SBINIT_LOW_UI; ui = ui + 1) begin
         @(negedge sbclk);
-        sb_rx_valid = 1'b0;
-        sb_rx_data  = {NC{1'b0}};
+        sb_rx_clk  = 1'b0;
+        sb_rx_data = 1'b0;
         @(posedge sbclk);
       end
     end
@@ -194,8 +213,8 @@ module ut_sbinit;
     rx_event_match[3] = 1'b0;
     lreset_n       = 1'b0;
     sbreset_n      = 1'b0;
-    sb_rx_data     = '0;
-    sb_rx_valid    = 1'b0;
+    sb_rx_clk      = 1'b0;
+    sb_rx_data     = 1'b0;
 
     force u_dut.pattern_run_enable = 1'b0;
     force u_dut.sbinit_raw_mode    = 1'b1;
@@ -211,7 +230,7 @@ module ut_sbinit;
     fork
       check_tx_iteration();
       begin
-        @(posedge sb_tx_valid);
+        @(posedge sb_tx_clk);
         repeat (4) @(posedge sbclk);
         force u_dut.pattern_run_enable = 1'b0;
       end

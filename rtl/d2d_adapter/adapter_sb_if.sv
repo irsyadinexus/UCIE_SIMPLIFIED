@@ -5,79 +5,78 @@
 // ----------------------------------------------------------------------------
 //
 // SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 3.1.1 - Stage 3: Adapter Initialization
 //   UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission
-//   UCIe 1.0 Specification, Section 6.1 - Protocol specification
-//   UCIe 1.0 Specification, Section 6.1.2 - Packet Formats
-//   UCIe 1.0 Specification, Table 47 - Sideband Opcodes
-//   UCIe 1.0 Specification, Table 48 - FDI SrcID / DstID Encodings
-//   UCIe 1.0 Specification, Tables 53-56 - Sideband Message Codes
-//   UCIe 1.0 Specification, Table 115 - FDI Signal List (lp_cfg / pl_cfg)
+//   UCIe 1.0 Specification, Section 6.1   - Sideband protocol specification
+//   UCIe 1.0 Specification, Section 6.1.1 - Sideband packet types (Table 47)
+//   UCIe 1.0 Specification, Section 6.1.2 - Packet formats (Figures 100-103)
+//   UCIe 1.0 Specification, Section 6.1.3 - Credit-based flow control
+//   UCIe 1.0 Specification, Section 7.5   - UCIe Registers (CSR definition)
+//   UCIe 1.0 Specification, Section 8.2.3 - FDI Sideband interface (Table 115)
+//   UCIe 1.0 Specification, Section 8.3.2 - State Request and Status
 //
 // DESCRIPTION
-//   Adapter-side sideband interface. This module sits on the FDI boundary
-//   and handles the Adapter's portion of the sideband communication:
+//   Adapter-side sideband interface and reduced-profile Stage 3 engine.
+//   This module connects across three distinct boundaries:
 //
-//     1. RECEIVE PATH (lp_cfg / lp_cfg_vld):
-//        Deserialises the NC-bit-per-UI sideband stream into 64-bit packet
-//        headers. The PHY delivers NC=8 bits per UI on lp_cfg; after 8 UIs
-//        (rx_ui_q counts 0-7), a complete 64-bit header is assembled in
-//        rx_hdr_q and rx_pkt_vld pulses for one cycle.
+//     1. FDI CONFIGURATION INTERFACE (lp_cfg / pl_cfg, NC=8):
+//        Assembles incoming sideband packets across 8 consecutive header phases
+//        and opcode-derived optional 8 payload phases. Enforces strict back-
+//        to-back phase transfers: any intra-transaction gap or gap before an
+//        expected payload asserts a sticky fdi_format_error. Gaps are permitted
+//        only between complete transactions. Transmits outgoing completions
+//        over pl_cfg back-to-back without internal gaps and pulses pl_cfg_crd
+//        when a slot is deallocated.
 //
-//     2. TRANSMIT PATH (pl_cfg / pl_cfg_vld):
-//        Serialises a 64-bit tx_hdr into NC-bit-per-UI chunks. tx_ui_q
-//        counts 0-7 during transmission. A 32-UI inter-packet gap
-//        (SB_GAP_UI) is enforced by gap_q, per Chapter 6 sideband framing.
+//     2. PRIVATE ADAPTER CLIENT INTERFACE (<-> logical_phy):
+//        Provides typed packet transmission and reception matching logical_phy
+//        (adapter_sb_tx_* / adapter_sb_rx_*). Connects to the logical PHY's
+//        packet arbiter and router. Completions have absolute transmission
+//        priority and are never credit-gated.
 //
-//     3. CREDIT ACCOUNTING (spec 6.1.3):
-//        - FDI credit loop (crd_fdi_q): credits owed to the local FDI
-//          (Protocol Layer). Replenished by Nop.Crd messages carrying
-//          1-4 credits in MsgInfo[2:0].
-//        - Remote credit loop (crd_remote_q): outstanding credits consumed
-//          by messages sent to the remote die. Capped at SB_CRD_MAX (4).
-//          Returned by the Cr bit in received completion packets.
+//     3. LOCAL CSR AND PHY CSR ACCESS PATH:
+//        Decodes 32/64-bit configuration reads and writes. Routes FDI destination
+//        Adapter (3'b001) to adapter_regfile and FDI destination PHY (3'b010)
+//        to a separate PHY CSR channel. Holds request metadata (address, width,
+//        data, BE, Tag, EP, source, route) until the target completes. Keeps
+//        delayed read responses until the completion packet is accepted.
 //
-//     4. REDUCED-MODEL MONITOR TIMERS:
-//        - 8 ms message timeout (C_SB_MSG cycles via ucie_timer): dormant
-//          monitor hook in this reduced endpoint (spec 6.1).
-//        - 4 ms stall keep-alive (C_STALL cycles via ucie_timer): dormant
-//          monitor hook in this reduced endpoint (spec 6.1).
-//     5. LINK MANAGEMENT REQUEST TRANSPORT:
-//        - Preserve CSR decoding and the reduced generic state-request channel.
-//        - Do not own peer Active policy. The PHY LTSM owns the sideband
-//          LinkMgmt.RDI Active exchange and its completion result.
+//     4. FOUR-ENTRY REMOTE REQUEST TABLE:
+//        Tracks outstanding remote register requests (including memory opcodes).
+//        Allocates an entry only when adapter_sb_tx_ready accepts the packet.
+//        Maintains a per-entry 8 ms message timer (C_SB_MSG). Matches received
+//        completions by Tag: Stall resets only that entry's timer; terminal
+//        completions (SC, UR, CA) or reset retire the entry. Unmatched or
+//        duplicate completions assert protocol_error and adapter_fatal.
+//        On timer expiration, returns a no-data UR completion to origin.
 //
-//     6. CSR ACCESS PATH:
-//        Sideband CfgRd/CfgWr packets addressed to SRCID_ADAPT (dstid =
-//        3'b001) are decoded and forwarded to adapter_regfile via the
-//        csr_wr/csr_rd/csr_addr/csr_wdata bus. CfgRd completions are
-//        transmitted back when csr_rdata_vld is asserted.
+//     5. EXACT COMPLETION GENERATION:
+//        Copies Tag and BE, EP=0. Generates no-data SC for writes, DATA32/DATA64
+//        SC for reads, DATA64 with original request header in data for UR/CA,
+//        no-data Stall, and no-data timeout UR. Memory requests return UR
+//        without CSR access. Completions are stored in independent always-sink
+//        queues and are never credit-gated.
 //
-//   SIMPLIFIED ENDPOINT HEADER (local 64-bit encoding):
-//     [7:0]   MsgCode    - message type identifier.
-//     [15:8]  SubCode    - message sub-type.
-//     [31:16] MsgInfo    - message-specific information.
-//     [36]    CP         - command parity (even parity over header, excl DP).
-//     [37]    DP         - data parity.
-//     [38]    Cr         - credit return bit.
-//     [50:48] SrcID      - source identifier (Table 48).
-//     [53:51] DstID      - destination identifier (Table 48).
-//     [58:54] Opcode     - operation code (Table 47).
+//     6. CREDIT ACCOUNTING:
+//        Maintains 4 independent request credits. Outgoing requests decrement
+//        credits; incoming Cr bits and NOP.Crd returns saturate at 4. Owed
+//        credit returns are piggybacked via Cr on outgoing packets or sent
+//        autonomously as NOP.Crd when no packet is pending. Messages and
+//        completions never consume or gate credits.
 //
-//   The LTSM inside logical_phy owns its own RDI-side sideband credit loop
-//   independently of this module.
-//
-// PORTS
-//   lp_cfg / lp_cfg_vld / lp_cfg_crd  - FDI sideband from Protocol Layer.
-//   pl_cfg / pl_cfg_vld / pl_cfg_crd  - FDI sideband to Protocol Layer.
-//   adapter_state_req_vld/req         - generic state request transport.
-//   csr_wr/rd/addr/wdata/rdata/vld    - CSR access bus to adapter_regfile.
-//   sb_credit_returned                - monitor: credit-return packet received.
-//   sb_stall_sent                     - monitor: stall keep-alive fired.
-//   sb_msg_timeout                    - monitor: 8 ms message timeout fired.
+//     7. REDUCED-PROFILE STAGE 3 ENGINE:
+//        Initiates after RDI reports Active. Transmits AdvCap.Adapter DATA64 with
+//        exact mask 64'h0000_0000_0000_0091. Validates peer capability fields
+//        and MsgInfo; accepts only valid capability or MsgInfo=16'hFFFF Stall.
+//        Negotiates Streaming, Raw Mode, and Stack 0; sends no FinCap.
+//        Executes Adapter0 Active exchange with reciprocal obligations and
+//        an 8 ms timer. Handles LinkReset and Disabled obligations with 8 ms
+//        timers and Disabled priority. Returns PMNAK responses for local and
+//        peer L1/L2 without entering a PM state.
 //
 // CLOCK / RESET
 //   lclk      - Main link clock (500 MHz).
-//   lreset_n  - Active-low asynchronous reset.
+//   lreset_n  - Active-low reset.
 //
 // REVISION HISTORY
 //   v0.0.1  2025-08-15  Initial creation - first commit to git.
@@ -98,462 +97,1691 @@
 //                        Logical PHY LTSM owns LinkMgmt.RDI Active policy.
 //   v0.0.7  2026-09-25  Document dormant timer hooks and reduced credit
 //                        accounting after the Phase D policy cutover.
-//
+//   v0.1.0  2026-09-28  Major architectural rewrite per UCIe 1.0 Sections 3.1.1,
+//                        6.1, 7.5, 8.2, and 8.3:
+//                        1. Add canonical typed private Adapter client interface
+//                           (adapter_sb_tx/rx) matching logical_phy.
+//                        2. Replace legacy parser with 8-phase header and optional
+//                           8-phase payload FDI phase counter with strict gap detection.
+//                        3. Implement local FDI 32/64-bit config request handling with
+//                           held metadata, explicit csr_be, and Adapter/PHY CSR target routing.
+//                        4. Add four-entry remote request table with per-entry 8 ms timers,
+//                           tag matching, stall handling, and terminal completion retirement.
+//                        5. Exact completion generator: copy Tag/BE, no-data SC writes,
+//                           DATA32/DATA64 SC reads, DATA64 original header UR/CA,
+//                           no-data Stall/timeout UR, EP=0, memory UR completion.
+//                        6. Maintain 4 independent request credits, saturate incoming
+//                           returns at 4, and generate pending Cr/NOP.Crd on slot release.
+//                        7. Implement reduced-profile Stage 3: AdvCap.Adapter DATA64 64'h91
+//                           exchange after RDI Active, capability validation, Streaming/Raw/Stack0
+//                           negotiation, separate 8 ms timers, Adapter0 Active/LinkReset/Disabled
+//                           obligations, and PMNAK responses. Expose adapter_fatal/linkerror.
+//                        8. Assign allocated tag to remote mailbox requests in
+//                           rem_table arbiter (Sections 6.1, 7.5).
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
+
 `ifndef AdapterSbIf_SV
 `define AdapterSbIf_SV
 `include "ucie_pkg.sv"
 
+import ucie_pkg::*;
+
 `timescale 1ns/1ps
-module adapter_sb_if (
-  input  logic        lclk,
-  input  logic        lreset_n,
+module adapter_sb_if #(
+  parameter int unsigned NC = 8
+) (
+  input  logic                lclk,
+  input  logic                lreset_n,
 
-  // FDI sideband (Protocol Layer -> Adapter), spec 6.1.3 / Table 115
-  input  logic [NC-1:0] lp_cfg,
-  input  logic          lp_cfg_vld,
-  input  logic          lp_cfg_crd,
-  output logic [NC-1:0] pl_cfg,
-  output logic          pl_cfg_vld,
-  output logic          pl_cfg_crd,
+  // --------------------------------------------------------------------------
+  // FDI Configuration Sideband Interface (Protocol Layer <-> Adapter)
+  // UCIe 1.0 Section 8.2.3, Table 115
+  // --------------------------------------------------------------------------
+  input  logic [NC-1:0]       lp_cfg,
+  input  logic                lp_cfg_vld,
+  input  logic                lp_cfg_crd,
+  output logic [NC-1:0]       pl_cfg,
+  output logic                pl_cfg_vld,
+  output logic                pl_cfg_crd,
 
-  // Adapter request transport remains separate from PHY-owned Active policy.
-  output logic          adapter_state_req_vld,
-  output logic [3:0]    adapter_state_req,
+  // --------------------------------------------------------------------------
+  // Private Adapter Sideband Packet Client Interface (<-> logical_phy)
+  // Matches logical_phy adapter_sb_* ports (UCIe 1.0 Section 6.1)
+  // --------------------------------------------------------------------------
+  output logic                adapter_sb_tx_valid,
+  input  logic                adapter_sb_tx_ready,
+  output sb_packet_t          adapter_sb_tx_packet,
+  input  logic                adapter_sb_rx_valid,
+  output logic                adapter_sb_rx_ready,
+  input  sb_packet_t          adapter_sb_rx_packet,
+  input  logic                adapter_sb_rx_cp_error,
+  input  logic                adapter_sb_rx_dp_error,
+  input  logic                adapter_sb_rx_format_error,
 
-  // CSR access path
-  output logic          csr_wr,
-  output logic [26:0]   csr_addr,
-  output logic [63:0]   csr_wdata,
-  output logic          csr_rd,
-  input  logic [63:0]   csr_rdata,
-  input  logic          csr_rdata_vld,
+  // --------------------------------------------------------------------------
+  // RDI / FDI State & Status Inputs (UCIe 1.0 Table 114, Table 115)
+  // --------------------------------------------------------------------------
+  input  logic [3:0]          rdi_pl_state_sts,      // RDI state status from Logical PHY
+  input  logic [3:0]          lp_state_req,          // FDI state request from Protocol Layer
 
-  // Coverage/monitor hooks
-  output logic          sb_credit_returned,
-  output logic          sb_stall_sent,
-  output logic          sb_msg_timeout
+  // --------------------------------------------------------------------------
+  // Adapter State Request Outputs (UCIe 1.0 Section 8.3.2)
+  // --------------------------------------------------------------------------
+  output logic                adapter_state_req_vld,
+  output logic [3:0]          adapter_state_req,
+
+  // --------------------------------------------------------------------------
+  // Adapter CSR Access Bus (to adapter_regfile, UCIe 1.0 Section 7.5)
+  // --------------------------------------------------------------------------
+  output logic                csr_wr,
+  output logic                csr_rd,
+  output logic [26:0]         csr_addr,
+  output logic [63:0]         csr_wdata,
+  output logic [7:0]          csr_be,
+  input  logic [63:0]         csr_rdata,
+  input  logic                csr_rdata_vld,
+
+  // --------------------------------------------------------------------------
+  // Target Select and Separate PHY CSR Access Channel (spec 7.5)
+  // --------------------------------------------------------------------------
+  output logic                csr_target,            // 1'b0: Adapter CSR, 1'b1: PHY CSR
+  output logic                phy_csr_wr,
+  output logic                phy_csr_rd,
+  output logic [26:0]         phy_csr_addr,
+  output logic [63:0]         phy_csr_wdata,
+  output logic [7:0]          phy_csr_be,
+  input  logic [63:0]         phy_csr_rdata,
+  input  logic                phy_csr_rdata_vld,
+
+  // --------------------------------------------------------------------------
+  // Remote Register Access Mailbox Channel (to/from adapter_regfile mailbox)
+  // --------------------------------------------------------------------------
+  input  logic                rem_req_vld,
+  output logic                rem_req_rdy,
+  input  sb_packet_t          rem_req_pkt,
+  output logic                rem_cpl_vld,
+  output sb_packet_t          rem_cpl_pkt,
+
+  // --------------------------------------------------------------------------
+  // Status, Error, and Monitoring Outputs
+  // --------------------------------------------------------------------------
+  output logic                adapter_fatal,
+  output logic                adapter_linkerror,
+  output logic                stage3_done,
+  output logic                protocol_error,
+  output logic                fdi_format_error,
+  output logic                sb_credit_returned,
+  output logic                sb_stall_sent,
+  output logic                sb_msg_timeout
 );
 
   import ucie_pkg::*;
+  // Local Constants and Types
+  // ==========================================================================
+  localparam bit ROUTE_ORIGIN_INTERNAL = 1'b0;
+  localparam bit ROUTE_ORIGIN_FDI      = 1'b1;
 
-  // --------------------------------------------------------------------------
-  // Credit Accounting Registers
-  // --------------------------------------------------------------------------
-  // Per spec 6.1.3, these registers retain the reduced endpoint credit state.
-  //
-  //   crd_fdi_q (2 bits) tracks credits reported by received Nop.Crd packets.
-  //   crd_remote_q (3 bits) tracks received credit-return information.
-  //   The Phase D endpoint does not initiate autonomous credit-consuming
-  //   requests, so these registers do not drive adapter state policy.
-  //
-  //   crd_return_pending: flag indicating a credit return is queued.
-  // --------------------------------------------------------------------------
-  logic [1:0] crd_fdi_q;     // credits owed to the local FDI
-  logic [2:0] crd_remote_q;  // outstanding remote credits
-  logic       crd_return_pending;
+  localparam bit TARGET_ADAPTER        = 1'b0;
+  localparam bit TARGET_PHY            = 1'b1;
 
-  // --------------------------------------------------------------------------
-  // Timer Signals
-  // --------------------------------------------------------------------------
-  // msg_timer_*   : 8 ms message timeout (C_SB_MSG cycles). Reduced-model
-  //                 monitor hook for sideband response tracking (spec 6.1).
-  //                 Runs while crd_remote_q != 0.
-  //
-  // stall_timer_* : 4 ms stall interval (C_STALL cycles). Reduced-model
-  //                 monitor hook for stall-cadence tracking (spec 6.1),
-  //                 armed after message timeout.
-  // --------------------------------------------------------------------------
-  logic       msg_timer_start;
-  logic       msg_timer_run;
-  logic       msg_timer_expired;
+  // FDI RX Phase State Machine
+  typedef enum logic [1:0] {
+    FDI_RX_IDLE,
+    FDI_RX_HDR,
+    FDI_RX_PLD
+  } fdi_rx_state_t;
 
-  logic       stall_timer_start;
-  logic       stall_timer_run;
-  logic       stall_timer_expired;
+  // FDI TX Serializer State Machine
+  typedef enum logic [1:0] {
+    PL_TX_IDLE,
+    PL_TX_HDR,
+    PL_TX_PLD
+  } pl_tx_state_t;
 
-  // -------------------------------------------------------------------------
-  // Module Instantiation: ucie_timer - dormant 8 ms monitor
-  //
-  // Instantiates the standard timer with C_SB_MSG for the reduced endpoint.
-  // Phase D ties its start and run controls low because the LTSM owns active
-  // sideband request tracking. The timer output remains a dormant monitor hook.
-  //
-  // Spec ref: UCIe 1.0 Section 6.1; PLAN.md Sections 15.5 and 15.9.
-  // -------------------------------------------------------------------------
-  ucie_timer #(.LIMIT_CYCLES(C_SB_MSG)) u_msg_timer (
-    .clk(lclk), .reset_n(lreset_n),
-    .start(msg_timer_start), .running(msg_timer_run),
-    .expired(msg_timer_expired)
+  // Local CSR Engine State Machine
+  typedef enum logic [1:0] {
+    CSR_ST_IDLE,
+    CSR_ST_WR_HOLD,
+    CSR_ST_RD_WAIT,
+    CSR_ST_RD_HOLD
+  } csr_state_t;
+
+  // Reduced-Profile Stage 3 State Machine
+  typedef enum logic [3:0] {
+    S3_RESET,
+    S3_ADVCAP_SEND,
+    S3_ADVCAP_WAIT,
+    S3_ACTIVE_SEND,
+    S3_ACTIVE_WAIT,
+    S3_ACTIVE,
+    S3_LINKRESET_SEND,
+    S3_LINKRESET_WAIT,
+    S3_DISABLED_SEND,
+    S3_DISABLED_WAIT,
+    S3_FATAL
+  } stage3_state_t;
+
+  // Remote Request Table Entry Type (UCIe 1.0 Section 6.1)
+  typedef struct packed {
+    logic        valid;
+    sb_packet_t  packet;
+    logic [31:0] timer;
+    logic        origin_route; // 0: Internal Mailbox, 1: FDI
+  } rem_table_entry_t;
+
+  // Held CSR Request Metadata Type (UCIe 1.0 Section 6.1.2.1, 7.5)
+  typedef struct packed {
+    logic        active;
+    logic        target;       // 0: Adapter CSR, 1: PHY CSR
+    logic        is_wr;        // 1: Write, 0: Read
+    logic        is_64b;       // 1: 64-bit access, 0: 32-bit access
+    logic [26:0] addr;
+    logic [63:0] wdata;
+    logic [7:0]  be;
+    logic [4:0]  tag;
+    logic        ep;
+    logic [2:0]  src_id;
+    logic        route;        // 0: Internal/Remote, 1: FDI
+    logic [63:0] orig_hdr;
+  } csr_held_req_t;
+
+  // ==========================================================================
+  // Pure Function: Completion Builder
+  // UCIe 1.0 Section 6.1.2.1 (Figure 101, Table 50, Table 52)
+  // ==========================================================================
+  function automatic sb_packet_t make_cpl_packet(
+    input sb_packet_t  req_pkt,
+    input logic [63:0] req_hdr,
+    input sb_status_t  status,
+    input logic [63:0] rdata,
+    input logic        is_timeout
   );
+    sb_packet_t cpl;
+    logic [63:0] hdr_payload;
 
-  // -------------------------------------------------------------------------
-  // Module Instantiation: ucie_timer - dormant 4 ms monitor
-  //
-  // Instantiates the standard timer with C_STALL for the reduced endpoint.
-  // Phase D ties its start and run controls low because this block does not
-  // generate autonomous stall keep-alive packets.
-  //
-  // Spec ref: UCIe 1.0 Section 6.1; PLAN.md Sections 15.5 and 15.9.
-  // -------------------------------------------------------------------------
-  ucie_timer #(.LIMIT_CYCLES(C_STALL)) u_stall_timer (
-    .clk(lclk), .reset_n(lreset_n),
-    .start(stall_timer_start), .running(stall_timer_run),
-    .expired(stall_timer_expired)
-  );
+    cpl = '0;
+    cpl.tag    = req_pkt.tag;
+    cpl.be     = req_pkt.be;
+    cpl.ep     = 1'b0; // EP=0 always per UCIe 1.0 spec
+    cpl.status = status;
+    cpl.src_id = req_pkt.dst_id;
+    cpl.dst_id = req_pkt.src_id;
 
-  // --------------------------------------------------------------------------
-  // Receive Path: Packet Deserialiser
-  // --------------------------------------------------------------------------
-  // The PHY delivers NC=8 bits per UI on lp_cfg while lp_cfg_vld is high.
-  // Over 8 consecutive UIs (rx_ui_q counts 0 through 7), a complete 64-bit
-  // sideband packet header is assembled by shifting lp_cfg into rx_hdr_q
-  // from the LSB side. When rx_ui_q reaches 7, rx_complete asserts and
-  // rx_pkt_vld pulses for one cycle on the following clock edge, indicating
-  // that rx_hdr_q holds a valid, fully-assembled packet header ready for
-  // field extraction and decoding.
-  // --------------------------------------------------------------------------
-  logic [63:0] rx_hdr_q;
-  logic [3:0]  rx_ui_q;
-  logic        rx_pkt_vld;
+    hdr_payload = (req_hdr != 64'h0) ? req_hdr : sb_encode_header(req_pkt);
 
-  // -------------------------------------------------------------------------
-  // assign: Receive Header Shift and Completion Detect
-  //
-  // rx_hdr_d shifts the existing 56 MSBs of rx_hdr_q down and inserts the
-  // new NC-bit lp_cfg chunk into the MSB position, building the 64-bit
-  // header over 8 UIs.
-  //
-  // rx_complete is high when rx_ui_q == 7 (the 8th and final UI of the
-  // packet), indicating the header assembly is done.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission (Figures 46-47);
-  //           Section 6.1.2 - Packet Formats.
-  // -------------------------------------------------------------------------
-  wire [63:0] rx_hdr_d = {rx_hdr_q[55:0], lp_cfg};
-  wire        rx_complete = (rx_ui_q == 4'd7);
-
-  // -------------------------------------------------------------------------
-  // always_ff: Receive Deserialiser State
-  //
-  // On every rising edge of lclk (or asynchronous reset), this block
-  // manages the packet receive state machine:
-  //
-  //   Reset: rx_hdr_q, rx_ui_q, and rx_pkt_vld are cleared to zero.
-  //
-  //   When lp_cfg_vld is asserted (a valid sideband UI is present):
-  //     - rx_hdr_q is updated with the shifted header (rx_hdr_d), appending
-  //       the new NC-bit chunk.
-  //     - rx_ui_q increments, counting UIs 0 through 7. The counter wraps
-  //       naturally at 4 bits but rx_complete gates the valid pulse at 7.
-  //     - rx_pkt_vld is set to rx_complete (true only on the 8th UI).
-  //
-  //   When lp_cfg_vld is deasserted:
-  //     - rx_pkt_vld is cleared. rx_hdr_q and rx_ui_q hold their values,
-  //       preserving partial packet state across idle gaps.
-  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission;
-  //           Section 6.1.2 - Packet Formats.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      rx_hdr_q  <= 64'h0;
-      rx_ui_q   <= 4'h0;
-      rx_pkt_vld <= 1'b0;
-    end else if (lp_cfg_vld) begin
-      rx_hdr_q  <= rx_hdr_d;
-      rx_ui_q   <= rx_ui_q + 1'b1;
-      rx_pkt_vld <= rx_complete;
+    if (status == SB_STS_STALL || is_timeout) begin
+      // No-data Stall and no-data timeout Unsupported Request
+      cpl.opcode = SB_OP_CPL_NODATA;
+      cpl.data   = 64'h0;
+    end else if (status == SB_STS_UR || status == SB_STS_CA) begin
+      // DATA64 with original request header as data for UR and CA
+      cpl.opcode = SB_OP_CPL_DATA64;
+      cpl.data   = hdr_payload;
     end else begin
-      rx_pkt_vld <= 1'b0;
+      // Successful Completion (SC)
+      if (req_pkt.opcode == SB_OP_CFG_WRITE32 || req_pkt.opcode == SB_OP_CFG_WRITE64 ||
+          req_pkt.opcode == SB_OP_MEM_WRITE32 || req_pkt.opcode == SB_OP_MEM_WRITE64) begin
+        // No-data SC for writes
+        cpl.opcode = SB_OP_CPL_NODATA;
+        cpl.data   = 64'h0;
+      end else if (req_pkt.opcode == SB_OP_CFG_READ32 || req_pkt.opcode == SB_OP_MEM_READ32) begin
+        // DATA32 SC for 32-bit reads
+        cpl.opcode = SB_OP_CPL_DATA32;
+        cpl.data   = {32'h0, rdata[31:0]};
+      end else begin
+        // DATA64 SC for 64-bit reads
+        cpl.opcode = SB_OP_CPL_DATA64;
+        cpl.data   = rdata;
+      end
+    end
+
+    return cpl;
+  endfunction
+
+  // ==========================================================================
+  // Registers and Signals Declaration
+  // ==========================================================================
+
+  // --- FDI RX Phase Counter and Assembly Registers ---
+  fdi_rx_state_t fdi_rx_state_q, fdi_rx_state_d;
+  logic [2:0]    fdi_rx_cnt_q,   fdi_rx_cnt_d;
+  logic [63:0]   fdi_rx_hdr_q,   fdi_rx_hdr_d;
+  logic [63:0]   fdi_rx_pld_q,   fdi_rx_pld_d;
+
+  logic          fdi_rx_complete_pulse;
+  sb_packet_t    fdi_rx_pkt;
+  sb_packet_t    fdi_rx_pkt_header;
+  logic [63:0]   fdi_rx_pkt_data;
+  logic [63:0]   fdi_rx_hdr_complete;
+  logic [63:0]   fdi_rx_pld_complete;
+
+  // Sticky error and protocol status registers
+  logic          fdi_format_err_q, fdi_format_err_d;
+  logic          protocol_err_q,   protocol_err_d;
+  logic          adapter_fatal_q,  adapter_fatal_d;
+
+  logic          fdi_rx_format_err_event;
+  logic          fdi_decode_format_err_event;
+  logic          fdi_protocol_err_event;
+  logic          rem_protocol_err_event;
+  logic          fdi_fatal_event;
+  logic          rem_fatal_event;
+  logic          s3_fatal_event;
+
+  // --- FDI Credit Accounting Registers ---
+  logic [2:0]    fdi_rx_crd_q,     fdi_rx_crd_d;   // Inbound request capacity (init 4)
+  logic [2:0]    fdi_tx_crd_q,     fdi_tx_crd_d;   // Protocol Layer credits for Adapter TX (init 4)
+  logic          fdi_req_reserve_event;
+  logic          fdi_req_release_event;
+
+  // --- Remote Credit Accounting Registers (spec 6.1.3) ---
+  logic [2:0]    remote_req_crd_q, remote_req_crd_d; // Outgoing remote credits (init 4, max 4)
+  logic [2:0]    pending_cr_q,     pending_cr_d;     // Credits owed to remote partner
+
+  // --- Four-Entry Remote Request Table ---
+  logic [3:0]  rem_table_valid_q, rem_table_valid_d;
+  sb_packet_t  rem_table_pkt_q   [4];
+  sb_packet_t  rem_table_pkt_d   [4];
+  logic [31:0] rem_table_timer_q [4];
+  logic [31:0] rem_table_timer_d [4];
+  logic [3:0]  rem_table_route_q, rem_table_route_d;
+
+  // --- Local CSR Engine Registers ---
+  csr_state_t    csr_fsm_q,        csr_fsm_d;
+  csr_held_req_t csr_held_q,       csr_held_d;
+  logic [63:0]   csr_held_rdata_q, csr_held_rdata_d;
+  logic          csr_rd_pulse_q,   csr_rd_pulse_d;
+
+  // --- Independent Completion Queues (Always-Sink, Never Credit-Gated) ---
+  // FDI Completion Queue (outgoing on pl_cfg)
+  sb_packet_t    fdi_cpl_q [4];
+  logic [1:0]    fdi_cpl_wr_ptr_q, fdi_cpl_wr_ptr_d;
+  logic [1:0]    fdi_cpl_rd_ptr_q, fdi_cpl_rd_ptr_d;
+  logic [2:0]    fdi_cpl_count_q,  fdi_cpl_count_d;
+
+  logic          csr_fdi_cpl_push;
+  sb_packet_t    csr_fdi_cpl_push_pkt;
+  logic          rem_fdi_cpl_push;
+  sb_packet_t    rem_fdi_cpl_push_pkt;
+  logic          fdi_cpl_push;
+  sb_packet_t    fdi_cpl_push_pkt;
+
+  // Remote Completion Queue (outgoing on adapter_sb_tx)
+  sb_packet_t    rem_cpl_fifo_q [4];
+  logic [1:0]    rem_cpl_wr_ptr_q, rem_cpl_wr_ptr_d;
+  logic [1:0]    rem_cpl_rd_ptr_q, rem_cpl_rd_ptr_d;
+  logic [2:0]    rem_cpl_count_q,  rem_cpl_count_d;
+
+  logic          csr_rem_cpl_push;
+  sb_packet_t    csr_rem_cpl_push_pkt;
+  logic          rem_cpl_push;
+  sb_packet_t    rem_cpl_push_pkt;
+
+  // --- FDI TX Serializer Registers (pl_cfg) ---
+  pl_tx_state_t  pl_tx_state_q,    pl_tx_state_d;
+  logic [2:0]    pl_tx_cnt_q,      pl_tx_cnt_d;
+  logic [NC-1:0] pl_cfg_q,         pl_cfg_d;
+  logic          pl_cfg_vld_q,     pl_cfg_vld_d;
+  logic          pl_cfg_crd_q,     pl_cfg_crd_d;
+
+  // --- Reduced-Profile Stage 3 State Machine Registers ---
+  stage3_state_t s3_state_q,       s3_state_d;
+  logic [31:0]   cap_timer_q,      cap_timer_d;
+  logic [31:0]   ad0_timer_q,      ad0_timer_d;
+  logic [31:0]   lm_timer_q,       lm_timer_d;
+
+  logic          local_act_req_sent_q, local_act_req_sent_d;
+  logic          local_act_rsp_rcvd_q, local_act_rsp_rcvd_d;
+  logic          peer_act_req_rcvd_q,  peer_act_req_rcvd_d;
+  logic          peer_act_rsp_sent_q,  peer_act_rsp_sent_d;
+
+  logic          owed_rsp_pmnak_q,     owed_rsp_pmnak_d;
+  logic          owed_rsp_dis_q,       owed_rsp_dis_d;
+  logic          owed_rsp_lr_q,        owed_rsp_lr_d;
+
+  logic          stage3_done_q,        stage3_done_d;
+  logic          state_req_vld_q,      state_req_vld_d;
+  logic [3:0]    state_req_q,          state_req_d;
+
+  // Remote Mailbox Client Completion Registers
+  logic          rem_cpl_vld_q,        rem_cpl_vld_d;
+  sb_packet_t    rem_cpl_pkt_q,        rem_cpl_pkt_d;
+
+  // Monitor pulse flags
+  logic          sb_credit_ret_pulse;
+  logic          sb_stall_sent_pulse;
+  logic          rem_timeout_pulse;
+  logic          s3_timeout_pulse;
+
+  // ==========================================================================
+  // Section 1: FDI Configuration Ingress Phase Counter and Parser
+  // UCIe 1.0 Section 8.2.3, Section 6.1.1, 6.1.2 (Figures 100-103)
+  // ==========================================================================
+  // Assembles 8 consecutive header phases (lp_cfg[7:0]) and opcode-derived
+  // optional 8 payload phases. Enforces strict back-to-back transfer:
+  // any gap inside a transaction or before an expected payload asserts sticky
+  // fdi_format_error. Gaps permitted only between complete transactions.
+  // ==========================================================================
+  always @* begin
+    fdi_rx_state_d          = fdi_rx_state_q;
+    fdi_rx_cnt_d            = fdi_rx_cnt_q;
+    fdi_rx_hdr_d            = fdi_rx_hdr_q;
+    fdi_rx_pld_d            = fdi_rx_pld_q;
+    fdi_rx_format_err_event = 1'b0;
+    fdi_rx_complete_pulse   = 1'b0;
+
+    case (fdi_rx_state_q)
+      FDI_RX_IDLE: begin
+        fdi_rx_cnt_d = 3'd0;
+        if (lp_cfg_vld) begin
+          // Phase 0: header[7:0]
+          fdi_rx_hdr_d[7:0] = lp_cfg;
+          fdi_rx_cnt_d      = 3'd1;
+          fdi_rx_state_d    = FDI_RX_HDR;
+        end
+      end
+
+      FDI_RX_HDR: begin
+        if (!lp_cfg_vld) begin
+          // Intra-transaction gap inside 8-phase header is a format error
+          fdi_rx_format_err_event = 1'b1;
+          fdi_rx_state_d          = FDI_RX_IDLE;
+          fdi_rx_cnt_d            = 3'd0;
+        end else begin
+          case (fdi_rx_cnt_q)
+            3'd0: fdi_rx_hdr_d[7:0]   = lp_cfg;
+            3'd1: fdi_rx_hdr_d[15:8]  = lp_cfg;
+            3'd2: fdi_rx_hdr_d[23:16] = lp_cfg;
+            3'd3: fdi_rx_hdr_d[31:24] = lp_cfg;
+            3'd4: fdi_rx_hdr_d[39:32] = lp_cfg;
+            3'd5: fdi_rx_hdr_d[47:40] = lp_cfg;
+            3'd6: fdi_rx_hdr_d[55:48] = lp_cfg;
+            3'd7: fdi_rx_hdr_d[63:56] = lp_cfg;
+            default: ;
+          endcase
+          if (fdi_rx_cnt_q == 3'd7) begin
+            // 8th header phase received. Evaluate payload requirement from opcode.
+            if (sb_payload_bytes(fdi_rx_hdr_d[4:0]) > 0) begin
+              fdi_rx_state_d = FDI_RX_PLD;
+              fdi_rx_cnt_d   = 3'd0;
+            end else begin
+              fdi_rx_complete_pulse = 1'b1;
+              fdi_rx_state_d        = FDI_RX_IDLE;
+              fdi_rx_cnt_d          = 3'd0;
+            end
+          end else begin
+            fdi_rx_cnt_d = fdi_rx_cnt_q + 1'b1;
+          end
+        end
+      end
+
+      FDI_RX_PLD: begin
+        if (!lp_cfg_vld) begin
+          // Gap immediately before or inside payload phases is a format error
+          fdi_rx_format_err_event = 1'b1;
+          fdi_rx_state_d          = FDI_RX_IDLE;
+          fdi_rx_cnt_d            = 3'd0;
+        end else begin
+          case (fdi_rx_cnt_q)
+            3'd0: fdi_rx_pld_d[7:0]   = lp_cfg;
+            3'd1: fdi_rx_pld_d[15:8]  = lp_cfg;
+            3'd2: fdi_rx_pld_d[23:16] = lp_cfg;
+            3'd3: fdi_rx_pld_d[31:24] = lp_cfg;
+            3'd4: fdi_rx_pld_d[39:32] = lp_cfg;
+            3'd5: fdi_rx_pld_d[47:40] = lp_cfg;
+            3'd6: fdi_rx_pld_d[55:48] = lp_cfg;
+            3'd7: fdi_rx_pld_d[63:56] = lp_cfg;
+            default: ;
+          endcase
+          if (fdi_rx_cnt_q == 3'd7) begin
+            fdi_rx_complete_pulse = 1'b1;
+            fdi_rx_state_d        = FDI_RX_IDLE;
+            fdi_rx_cnt_d          = 3'd0;
+          end else begin
+            fdi_rx_cnt_d = fdi_rx_cnt_q + 1'b1;
+          end
+        end
+      end
+
+      default: begin
+        fdi_rx_state_d = FDI_RX_IDLE;
+        fdi_rx_cnt_d   = 3'd0;
+      end
+    endcase
+  end
+
+  assign fdi_rx_hdr_complete = (fdi_rx_state_q == FDI_RX_HDR && fdi_rx_cnt_q == 3'd7) ?
+                               {lp_cfg, fdi_rx_hdr_q[55:0]} : fdi_rx_hdr_q;
+  assign fdi_rx_pld_complete = (fdi_rx_state_q == FDI_RX_PLD && fdi_rx_cnt_q == 3'd7) ?
+                               {lp_cfg, fdi_rx_pld_q[55:0]} : fdi_rx_pld_q;
+
+  // Unpack decoded FDI packet
+  assign fdi_rx_pkt_header = sb_decode_header(fdi_rx_hdr_complete);
+  assign fdi_rx_pkt_data = (sb_payload_bytes(fdi_rx_pkt_header.opcode) > 0) ?
+                           sb_pad_data(fdi_rx_pkt_header.opcode, fdi_rx_pld_complete) :
+                           64'h0;
+  assign fdi_rx_pkt = {fdi_rx_pkt_header[151:64], fdi_rx_pkt_data};
+
+  // ==========================================================================
+  // Section 2: FDI Packet Validation and Decode Checking
+  // UCIe 1.0 Section 6.1.2.1, Table 48 (FDI IDs), Table 50, Table 52
+  // ==========================================================================
+  sb_decode_err_t fdi_dec_err;
+  logic           fdi_dp_err;
+  logic           fdi_is_msg;
+  logic           fdi_non_stack0;
+  logic           fdi_illegal_dst;
+  logic           fdi_is_mem;
+
+  always @* begin
+    fdi_dec_err     = sb_decode_error(fdi_rx_hdr_complete);
+    fdi_dp_err      = (sb_payload_bytes(fdi_rx_pkt.opcode) > 0) &&
+                      sb_check_dp_err(fdi_rx_pkt.opcode, fdi_rx_hdr_complete[30], fdi_rx_pkt.data);
+    fdi_is_msg      = (sb_packet_kind(fdi_rx_pkt.opcode) == SB_PKT_MESSAGE);
+    fdi_non_stack0  = (fdi_rx_pkt.src_id != FDI_SRCID_STACK0);
+    fdi_illegal_dst = (fdi_rx_pkt.dst_id != FDI_DSTID_ADAPTER && fdi_rx_pkt.dst_id != FDI_DSTID_PHY);
+    fdi_is_mem      = (fdi_rx_pkt.opcode == SB_OP_MEM_READ32  || fdi_rx_pkt.opcode == SB_OP_MEM_WRITE32 ||
+                       fdi_rx_pkt.opcode == SB_OP_MEM_READ64  || fdi_rx_pkt.opcode == SB_OP_MEM_WRITE64);
+  end
+
+  // ==========================================================================
+  // Section 3: Inbound Request Slot Accounting and Local CSR Request Engine
+  // UCIe 1.0 Section 6.1.3, Section 7.5
+  // ==========================================================================
+  // Tracks available FDI request capacity (init 4). Reserves 1 slot at phase 0
+  // of a register request. Releases slot and pulses pl_cfg_crd when completion
+  // is transmitted over pl_cfg.
+  // ==========================================================================
+  assign fdi_req_reserve_event = (fdi_rx_state_q == FDI_RX_IDLE) && lp_cfg_vld &&
+                                 (sb_packet_kind(lp_cfg[4:0]) == SB_PKT_REG_REQ);
+
+  always @* begin
+    fdi_rx_crd_d          = fdi_rx_crd_q;
+    fdi_tx_crd_d          = fdi_tx_crd_q;
+    fdi_fatal_event       = 1'b0;
+
+    // Slot reservation at Phase 0
+    if (fdi_req_reserve_event && !fdi_req_release_event) begin
+      if (fdi_rx_crd_q > 3'd0) begin
+        fdi_rx_crd_d = fdi_rx_crd_q - 1'b1;
+      end else begin
+        fdi_fatal_event = 1'b1;
+      end
+    end else if (!fdi_req_reserve_event && fdi_req_release_event) begin
+      if (fdi_rx_crd_q < 3'd4) begin
+        fdi_rx_crd_d = fdi_rx_crd_q + 1'b1;
+      end
+    end
+
+    // Protocol Layer credit returns for outgoing FDI requests
+    if (lp_cfg_crd) begin
+      if (fdi_tx_crd_q < 3'd4) begin
+        fdi_tx_crd_d = fdi_tx_crd_q + 1'b1;
+      end
     end
   end
 
-  // -------------------------------------------------------------------------
-  // assign: Parsed Header Fields
-  //
-  // Extracts individual fields from the fully-assembled 64-bit header
-  // (rx_hdr_q) for use by the decode logic. This endpoint uses the local
-  // simplified field placement below:
-  //
-  //   rx_msgcode [7:0]   - Message code identifying the message type
-  //                         (e.g. MC_NOP_CRD, MC_LM_RDI_REQ). Tables 53-56.
-  //   rx_subcode [15:8]  - Sub-code qualifying the message code
-  //                         (e.g. MS_LM_ACTIVE for Active request).
-  //   rx_msginfo [31:16] - Message-specific information field.
-  //   rx_cp      [36]    - Command parity (even parity over header excl. DP).
-  //   rx_dp      [37]    - Data parity.
-  //   rx_cr      [38]    - Credit return bit. When set, this packet returns
-  //                         one credit to the sender (spec 6.1.3).
-  //   rx_srcid   [50:48] - Source ID (Table 48).
-  //   rx_dstid   [53:51] - Destination ID (Table 48). SRCID_ADAPT = 3'b001
-  //                         addresses the Adapter's CSR space.
-  //   rx_opcode  [58:54] - Operation code (Table 47). Used to distinguish
-  //                         message-no-data, message-with-data, CfgRd, CfgWr.
-  //
-  // Spec context: UCIe 1.0, Section 6.1.1 - Packet Types; Section 6.1.2 -
-  //               Packet Formats; Table 47 (opcodes); Table 48 (FDI IDs).
-  // -------------------------------------------------------------------------
-  wire [7:0]  rx_msgcode = rx_hdr_q[7:0];
-  wire [7:0]  rx_subcode = rx_hdr_q[15:8];
-  wire [15:0] rx_msginfo = rx_hdr_q[31:16];
-  wire        rx_cp      = rx_hdr_q[36];
-  wire        rx_dp      = rx_hdr_q[37];
-  wire        rx_cr      = rx_hdr_q[38];
-  wire [2:0]  rx_srcid   = rx_hdr_q[50:48];
-  wire [2:0]  rx_dstid   = rx_hdr_q[53:51];
-  wire [4:0]  rx_opcode  = rx_hdr_q[58:54];
+  // --- CSR Engine Control & Delayed Read Response Holding ---
+  logic [63:0] r_hdr;
+  sb_packet_t  wr_pkt;
+  logic        target_vld;
+  logic [63:0] target_data;
+  sb_packet_t  rd_pkt;
 
-  // -------------------------------------------------------------------------
-  // assign: Command Parity Calculation
-  //
-  // Computes a local CP-check value over the 64-bit endpoint header. The local
-  // mask clears only the local DP bit (bit 37) and retains the local CP bit
-  // (bit 36). This local encoding does not model the completion CP exclusion.
-  //
-  // In this simplified endpoint, CP is computed for potential future use
-  // (error detection) but is not currently checked against rx_cp. The
-  // parity infrastructure is retained so that a full implementation can
-  // add CP checking without restructuring.
-  //
-  // Spec context: UCIe 1.0, Section 6.1.2.1 - Register Access Packets,
-  // Table 50 (CP excludes DP); Table 52 (completion CP excludes DP and CP).
-  // -------------------------------------------------------------------------
-  wire [63:0] hdr_for_cp = {rx_hdr_q[63:38], 1'b0, rx_hdr_q[36:0]};
-  wire        cp_calc    = ^hdr_for_cp;
+  always @* begin
+    csr_fsm_d                   = csr_fsm_q;
+    csr_held_d                  = csr_held_q;
+    csr_held_rdata_d            = csr_held_rdata_q;
+    csr_rd_pulse_d              = 1'b0;
+    fdi_decode_format_err_event = 1'b0;
+    fdi_protocol_err_event      = 1'b0;
 
-  // --------------------------------------------------------------------------
-  // Transmit Path: Packet Serialiser
-  // --------------------------------------------------------------------------
-  // tx_hdr holds the 64-bit packet header to be transmitted. tx_send is
-  // asserted for 8 consecutive UIs while tx_ui_q counts 0 through 7,
-  // driving NC bits per UI onto pl_cfg. After each complete packet, a
-  // 32-UI inter-packet gap is enforced by gap_q (SB_GAP_UI = 32).
-  // --------------------------------------------------------------------------
-  logic [63:0] tx_hdr;
-  logic        tx_send;
-  logic [3:0]  tx_ui_q;
+    csr_fdi_cpl_push            = 1'b0;
+    csr_fdi_cpl_push_pkt        = '0;
+    csr_rem_cpl_push            = 1'b0;
+    csr_rem_cpl_push_pkt        = '0;
+    r_hdr                       = '0;
+    wr_pkt                      = '0;
+    target_vld                  = 1'b0;
+    target_data                 = '0;
+    rd_pkt                      = '0;
+    case (csr_fsm_q)
+      CSR_ST_IDLE: begin
+        // Check for newly completed FDI register request
+        if (fdi_rx_complete_pulse) begin
+          if (fdi_dec_err.any_err || fdi_dp_err) begin
+            fdi_decode_format_err_event = 1'b1;
+            if (fdi_dec_err.cp_err) fdi_protocol_err_event = 1'b1;
+          end else if (fdi_is_msg) begin
+            // FDI messages strictly rejected
+            fdi_protocol_err_event = 1'b1;
+          end else if (sb_packet_kind(fdi_rx_pkt.opcode) == SB_PKT_REG_REQ) begin
+            if (fdi_non_stack0 || fdi_illegal_dst) begin
+              // Non-Stack0 or illegal destination returns Unsupported Request
+              csr_fdi_cpl_push     = 1'b1;
+              csr_fdi_cpl_push_pkt = make_cpl_packet(fdi_rx_pkt, fdi_rx_hdr_complete, SB_STS_UR, 64'h0, 1'b0);
+            end else if (fdi_is_mem) begin
+              // Memory requests return Unsupported Request without CSR access
+              csr_fdi_cpl_push     = 1'b1;
+              csr_fdi_cpl_push_pkt = make_cpl_packet(fdi_rx_pkt, fdi_rx_hdr_complete, SB_STS_UR, 64'h0, 1'b0);
+            end else begin
+              // Latch valid Configuration Read / Write request
+              csr_held_d.active   = 1'b1;
+              csr_held_d.target   = (fdi_rx_pkt.dst_id == FDI_DSTID_PHY) ? TARGET_PHY : TARGET_ADAPTER;
+              csr_held_d.is_wr    = (fdi_rx_pkt.opcode == SB_OP_CFG_WRITE32 || fdi_rx_pkt.opcode == SB_OP_CFG_WRITE64);
+              csr_held_d.is_64b   = (fdi_rx_pkt.opcode == SB_OP_CFG_READ64  || fdi_rx_pkt.opcode == SB_OP_CFG_WRITE64);
+              csr_held_d.addr     = fdi_rx_pkt.addr;
+              csr_held_d.wdata    = fdi_rx_pkt.data;
+              csr_held_d.be       = fdi_rx_pkt.be;
+              csr_held_d.tag      = fdi_rx_pkt.tag;
+              csr_held_d.ep       = fdi_rx_pkt.ep;
+              csr_held_d.src_id   = fdi_rx_pkt.src_id;
+              csr_held_d.route    = ROUTE_ORIGIN_FDI;
+              csr_held_d.orig_hdr = fdi_rx_hdr_complete;
 
-  // -------------------------------------------------------------------------
-  // always_ff: Transmit UI Counter
+              if (fdi_rx_pkt.opcode == SB_OP_CFG_WRITE32 || fdi_rx_pkt.opcode == SB_OP_CFG_WRITE64) begin
+                csr_fsm_d = CSR_ST_WR_HOLD;
+              end else begin
+                csr_fsm_d      = CSR_ST_RD_WAIT;
+                csr_rd_pulse_d = 1'b1;
+              end
+            end
+          end
+        end
+        // Check for inbound Configuration Request from remote partner (adapter_sb_rx)
+        else if (adapter_sb_rx_valid && adapter_sb_rx_ready &&
+                 (sb_packet_kind(adapter_sb_rx_packet.opcode) == SB_PKT_REG_REQ)) begin
+          r_hdr = sb_encode_header(adapter_sb_rx_packet);
+
+          if (adapter_sb_rx_packet.opcode == SB_OP_MEM_READ32  || adapter_sb_rx_packet.opcode == SB_OP_MEM_WRITE32 ||
+              adapter_sb_rx_packet.opcode == SB_OP_MEM_READ64  || adapter_sb_rx_packet.opcode == SB_OP_MEM_WRITE64) begin
+            // Memory requests return Unsupported Request without touching CSR
+            csr_rem_cpl_push     = 1'b1;
+            csr_rem_cpl_push_pkt = make_cpl_packet(adapter_sb_rx_packet, r_hdr, SB_STS_UR, 64'h0, 1'b0);
+          end else if (adapter_sb_rx_packet.dst_id == RDI_DSTID_LOCAL_PHY ||
+                       adapter_sb_rx_packet.dst_id == RDI_DSTID_REMOTE_PHY) begin
+            // Inbound configuration request targeting PHY CSR
+            csr_held_d.active   = 1'b1;
+            csr_held_d.target   = TARGET_PHY;
+            csr_held_d.is_wr    = (adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE32 || adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE64);
+            csr_held_d.is_64b   = (adapter_sb_rx_packet.opcode == SB_OP_CFG_READ64  || adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE64);
+            csr_held_d.addr     = adapter_sb_rx_packet.addr;
+            csr_held_d.wdata    = adapter_sb_rx_packet.data;
+            csr_held_d.be       = adapter_sb_rx_packet.be;
+            csr_held_d.tag      = adapter_sb_rx_packet.tag;
+            csr_held_d.ep       = adapter_sb_rx_packet.ep;
+            csr_held_d.src_id   = adapter_sb_rx_packet.src_id;
+            csr_held_d.route    = ROUTE_ORIGIN_INTERNAL;
+            csr_held_d.orig_hdr = r_hdr;
+
+            if (adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE32 || adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE64) begin
+              csr_fsm_d = CSR_ST_WR_HOLD;
+            end else begin
+              csr_fsm_d      = CSR_ST_RD_WAIT;
+              csr_rd_pulse_d = 1'b1;
+            end
+          end else begin
+            // Inbound configuration request targeting Adapter CSR
+            csr_held_d.active   = 1'b1;
+            csr_held_d.target   = TARGET_ADAPTER;
+            csr_held_d.is_wr    = (adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE32 || adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE64);
+            csr_held_d.is_64b   = (adapter_sb_rx_packet.opcode == SB_OP_CFG_READ64  || adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE64);
+            csr_held_d.addr     = adapter_sb_rx_packet.addr;
+            csr_held_d.wdata    = adapter_sb_rx_packet.data;
+            csr_held_d.be       = adapter_sb_rx_packet.be;
+            csr_held_d.tag      = adapter_sb_rx_packet.tag;
+            csr_held_d.ep       = adapter_sb_rx_packet.ep;
+            csr_held_d.src_id   = adapter_sb_rx_packet.src_id;
+            csr_held_d.route    = ROUTE_ORIGIN_INTERNAL;
+            csr_held_d.orig_hdr = r_hdr;
+
+            if (adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE32 || adapter_sb_rx_packet.opcode == SB_OP_CFG_WRITE64) begin
+              csr_fsm_d = CSR_ST_WR_HOLD;
+            end else begin
+              csr_fsm_d      = CSR_ST_RD_WAIT;
+              csr_rd_pulse_d = 1'b1;
+            end
+          end
+        end
+      end
+
+      CSR_ST_WR_HOLD: begin
+        // Synchronous write takes 1 cycle. Generate no-data SC completion.
+        wr_pkt = '0;
+        wr_pkt.opcode = csr_held_q.is_64b ? SB_OP_CFG_WRITE64 : SB_OP_CFG_WRITE32;
+        wr_pkt.tag    = csr_held_q.tag;
+        wr_pkt.be     = csr_held_q.be;
+        wr_pkt.src_id = csr_held_q.src_id;
+        wr_pkt.dst_id = csr_held_q.target ? FDI_DSTID_PHY : FDI_DSTID_ADAPTER;
+
+        if (csr_held_q.route == ROUTE_ORIGIN_FDI) begin
+          csr_fdi_cpl_push     = 1'b1;
+          csr_fdi_cpl_push_pkt = make_cpl_packet(wr_pkt, csr_held_q.orig_hdr, SB_STS_SC, 64'h0, 1'b0);
+        end else begin
+          csr_rem_cpl_push     = 1'b1;
+          csr_rem_cpl_push_pkt = make_cpl_packet(wr_pkt, csr_held_q.orig_hdr, SB_STS_SC, 64'h0, 1'b0);
+        end
+
+        csr_held_d.active = 1'b0;
+        csr_fsm_d         = CSR_ST_IDLE;
+      end
+
+      CSR_ST_RD_WAIT: begin
+        // Wait for target to return valid read data
+
+        target_vld  = (csr_held_q.target == TARGET_PHY) ? phy_csr_rdata_vld : csr_rdata_vld;
+        target_data = (csr_held_q.target == TARGET_PHY) ? phy_csr_rdata     : csr_rdata;
+
+        if (target_vld) begin
+          csr_held_rdata_d = target_data;
+          csr_fsm_d        = CSR_ST_RD_HOLD;
+        end
+      end
+
+      CSR_ST_RD_HOLD: begin
+        // Hold delayed read response until completion packet is accepted into queue
+        rd_pkt = '0;
+        rd_pkt.opcode = csr_held_q.is_64b ? SB_OP_CFG_READ64 : SB_OP_CFG_READ32;
+        rd_pkt.tag    = csr_held_q.tag;
+        rd_pkt.be     = csr_held_q.be;
+        rd_pkt.src_id = csr_held_q.src_id;
+        rd_pkt.dst_id = csr_held_q.target ? FDI_DSTID_PHY : FDI_DSTID_ADAPTER;
+
+        if (csr_held_q.route == ROUTE_ORIGIN_FDI) begin
+          if (fdi_cpl_count_q < 3'd4) begin
+            csr_fdi_cpl_push     = 1'b1;
+            csr_fdi_cpl_push_pkt = make_cpl_packet(rd_pkt, csr_held_q.orig_hdr, SB_STS_SC, csr_held_rdata_q, 1'b0);
+            csr_held_d.active    = 1'b0;
+            csr_fsm_d            = CSR_ST_IDLE;
+          end
+        end else begin
+          if (rem_cpl_count_q < 3'd4) begin
+            csr_rem_cpl_push     = 1'b1;
+            csr_rem_cpl_push_pkt = make_cpl_packet(rd_pkt, csr_held_q.orig_hdr, SB_STS_SC, csr_held_rdata_q, 1'b0);
+            csr_held_d.active    = 1'b0;
+            csr_fsm_d            = CSR_ST_IDLE;
+          end
+        end
+      end
+
+      default: csr_fsm_d = CSR_ST_IDLE;
+    endcase
+  end
+
+  // Drive CSR ports
+  assign csr_target    = csr_held_q.target;
+  assign csr_addr      = csr_held_q.addr;
+  assign csr_wdata     = csr_held_q.wdata;
+  assign csr_be        = csr_held_q.be;
+  assign csr_wr        = (csr_fsm_q == CSR_ST_WR_HOLD) && (csr_held_q.target == TARGET_ADAPTER);
+  assign csr_rd        = csr_rd_pulse_q && (csr_held_q.target == TARGET_ADAPTER);
+
+  assign phy_csr_addr  = csr_held_q.addr;
+  assign phy_csr_wdata = csr_held_q.wdata;
+  assign phy_csr_be    = csr_held_q.be;
+  assign phy_csr_wr    = (csr_fsm_q == CSR_ST_WR_HOLD) && (csr_held_q.target == TARGET_PHY);
+  assign phy_csr_rd    = csr_rd_pulse_q && (csr_held_q.target == TARGET_PHY);
+
+  // ==========================================================================
+  // Section 4: Four-Entry Remote Request Table & Tag Matcher
+  // UCIe 1.0 Section 6.1.1, 6.1.2, 6.1.3
+  // ==========================================================================
+  // Tracks remote register requests (including memory opcodes). Consumes one
+  // entry only when adapter_sb_tx_ready accepts the request. Matches completions
+  // by Tag. Stall resets only that timer. Terminal completions (SC/UR/CA) or
+  // reset retire the entry. Unmatched/duplicate terminal completions assert
+  // protocol_error and adapter_fatal.
+  // ==========================================================================
+  logic [3:0] rem_slot_free;
+  int rem_free_idx;
+  always @* begin
+    rem_slot_free = ~rem_table_valid_q;
+    rem_free_idx = 0;
+    if      (rem_slot_free[0]) rem_free_idx = 0;
+    else if (rem_slot_free[1]) rem_free_idx = 1;
+    else if (rem_slot_free[2]) rem_free_idx = 2;
+    else if (rem_slot_free[3]) rem_free_idx = 3;
+  end
+
+  // Completion Tag Matching across all 4 entries
+  sb_packet_t rem_tbl_0, rem_tbl_1, rem_tbl_2, rem_tbl_3;
+  assign rem_tbl_0 = rem_table_pkt_q[0];
+  assign rem_tbl_1 = rem_table_pkt_q[1];
+  assign rem_tbl_2 = rem_table_pkt_q[2];
+  assign rem_tbl_3 = rem_table_pkt_q[3];
+
+  logic [3:0] rem_tag_match;
+  always @* begin
+    rem_tag_match[0] = rem_table_valid_q[0] && (rem_tbl_0.tag == adapter_sb_rx_packet.tag);
+    rem_tag_match[1] = rem_table_valid_q[1] && (rem_tbl_1.tag == adapter_sb_rx_packet.tag);
+    rem_tag_match[2] = rem_table_valid_q[2] && (rem_tbl_2.tag == adapter_sb_rx_packet.tag);
+    rem_tag_match[3] = rem_table_valid_q[3] && (rem_tbl_3.tag == adapter_sb_rx_packet.tag);
+  end
+  int rem_match_cnt;
+  assign rem_match_cnt = rem_tag_match[0] + rem_tag_match[1] + rem_tag_match[2] + rem_tag_match[3];
+
+  int rem_match_idx;
+  always @* begin
+    rem_match_idx = 0;
+    if      (rem_tag_match[0]) rem_match_idx = 0;
+    else if (rem_tag_match[1]) rem_match_idx = 1;
+    else if (rem_tag_match[2]) rem_match_idx = 2;
+    else if (rem_tag_match[3]) rem_match_idx = 3;
+  end
+
+  // Remote Table Sequential & Timer Update Process
+  always @(rdi_pl_state_sts,
+           rem_table_valid_q[0], rem_table_valid_q[1], rem_table_valid_q[2], rem_table_valid_q[3],
+           rem_table_route_q[0], rem_table_route_q[1], rem_table_route_q[2], rem_table_route_q[3],
+           rem_table_pkt_q[0], rem_table_pkt_q[1], rem_table_pkt_q[2], rem_table_pkt_q[3],
+           rem_table_timer_q[0], rem_table_timer_q[1], rem_table_timer_q[2], rem_table_timer_q[3],
+           adapter_sb_rx_valid, adapter_sb_rx_ready, adapter_sb_rx_packet,
+           rem_match_cnt, rem_match_idx,
+           adapter_sb_tx_valid, adapter_sb_tx_ready, adapter_sb_tx_packet,
+           rem_free_idx, C_SB_MSG) begin
+    rem_table_valid_d = rem_table_valid_q;
+    rem_table_route_d = rem_table_route_q;
+    for (int i = 0; i < 4; i++) begin
+      rem_table_pkt_d[i]   = rem_table_pkt_q[i];
+      rem_table_timer_d[i] = rem_table_timer_q[i];
+    end
+
+    rem_cpl_vld_d          = 1'b0;
+    rem_cpl_pkt_d          = '0;
+    rem_timeout_pulse      = 1'b0;
+    sb_stall_sent_pulse    = 1'b0;
+    rem_fdi_cpl_push       = 1'b0;
+    rem_fdi_cpl_push_pkt   = '0;
+    rem_protocol_err_event = 1'b0;
+    rem_fatal_event        = 1'b0;
+
+    // Per-entry 8 ms message timer (counts while RDI is Active)
+    if (rdi_pl_state_sts == RDI_STS_ACTIVE) begin
+      for (int i = 0; i < 4; i++) begin
+        if (rem_table_valid_q[i]) begin
+          if (rem_table_timer_q[i] >= C_SB_MSG) begin
+            // 8 ms timeout: retire entry and generate no-data UR completion to origin
+            rem_table_valid_d[i] = 1'b0;
+            rem_timeout_pulse    = 1'b1;
+
+            if (rem_table_route_q[i] == ROUTE_ORIGIN_FDI) begin
+              rem_fdi_cpl_push     = 1'b1;
+              rem_fdi_cpl_push_pkt = make_cpl_packet(rem_table_pkt_q[i], 64'h0, SB_STS_UR, 64'h0, 1'b1);
+            end else begin
+              rem_cpl_vld_d = 1'b1;
+              rem_cpl_pkt_d = make_cpl_packet(rem_table_pkt_q[i], 64'h0, SB_STS_UR, 64'h0, 1'b1);
+            end
+          end else begin
+            rem_table_timer_d[i] = rem_table_timer_q[i] + 1'b1;
+          end
+        end
+      end
+    end
+
+    // Process Received Completions from peer on adapter_sb_rx
+    if (adapter_sb_rx_valid && adapter_sb_rx_ready &&
+        (sb_packet_kind(adapter_sb_rx_packet.opcode) == SB_PKT_COMPLETION)) begin
+      if (rem_match_cnt == 0) begin
+        // Unmatched completion is a protocol error and fatal
+        rem_protocol_err_event = 1'b1;
+        rem_fatal_event        = 1'b1;
+      end else if (rem_match_cnt > 1) begin
+        // Duplicate active terminal completion
+        rem_protocol_err_event = 1'b1;
+        rem_fatal_event        = 1'b1;
+      end else begin
+        // Unique match found
+        if (adapter_sb_rx_packet.status == SB_STS_STALL) begin
+          // Stall resets only that timer and retains the entry
+          rem_table_timer_d[rem_match_idx] = 32'd0;
+          sb_stall_sent_pulse              = 1'b1;
+        end else if (adapter_sb_rx_packet.status == SB_STS_SC ||
+                     adapter_sb_rx_packet.status == SB_STS_UR ||
+                     adapter_sb_rx_packet.status == SB_STS_CA) begin
+          // Terminal completion retires table entry
+          rem_table_valid_d[rem_match_idx] = 1'b0;
+
+          if (rem_table_route_q[rem_match_idx] == ROUTE_ORIGIN_FDI) begin
+            rem_fdi_cpl_push     = 1'b1;
+            rem_fdi_cpl_push_pkt = adapter_sb_rx_packet;
+          end else begin
+            rem_cpl_vld_d = 1'b1;
+            rem_cpl_pkt_d = adapter_sb_rx_packet;
+          end
+        end else begin
+          // Reserved completion status encoding
+          rem_protocol_err_event = 1'b1;
+          rem_fatal_event        = 1'b1;
+        end
+      end
+    end
+
+    // Allocate table entry when adapter_sb_tx accepts an outbound remote request
+    if (adapter_sb_tx_valid && adapter_sb_tx_ready &&
+        (sb_packet_kind(adapter_sb_tx_packet.opcode) == SB_PKT_REG_REQ)) begin
+      rem_table_valid_d[rem_free_idx] = 1'b1;
+      rem_table_pkt_d[rem_free_idx]   = adapter_sb_tx_packet;
+      rem_table_timer_d[rem_free_idx] = 32'd0;
+      rem_table_route_d[rem_free_idx] = ROUTE_ORIGIN_INTERNAL;
+    end
+  end
+
+  // Multiplex completion pushes into FIFO queues
+  assign fdi_cpl_push     = csr_fdi_cpl_push | rem_fdi_cpl_push;
+  assign fdi_cpl_push_pkt = csr_fdi_cpl_push ? csr_fdi_cpl_push_pkt : rem_fdi_cpl_push_pkt;
+
+  assign rem_cpl_push     = csr_rem_cpl_push;
+  assign rem_cpl_push_pkt = csr_rem_cpl_push_pkt;
+
+  // Single-driver sticky error updates
+  assign fdi_format_err_d = fdi_format_err_q | fdi_rx_format_err_event | fdi_decode_format_err_event;
+  assign protocol_err_d   = protocol_err_q   | fdi_protocol_err_event  | rem_protocol_err_event;
+  assign adapter_fatal_d  = adapter_fatal_q  | fdi_fatal_event         | rem_fatal_event | s3_fatal_event;
+
+  // ==========================================================================
+  // Section 5: Remote Credit Accounting (UCIe 1.0 Section 6.1.3)
+  // ==========================================================================
+  // Maintains 4 independent remote request credits. Gated by remote_req_crd_q > 0.
+  // Replenished by Cr bit and NOP.Crd returns (saturates at 4). Freed inbound
+  // slots generate pending Cr return on outgoing packets or autonomous NOP.Crd.
+  // Messages and completions are never credit-gated.
+  // ==========================================================================
+  int add_crd;
+  always @* begin
+    remote_req_crd_d    = remote_req_crd_q;
+    pending_cr_d        = pending_cr_q;
+    sb_credit_ret_pulse = 1'b0;
+    add_crd             = 0;
+
+    // Incoming Credit Returns on adapter_sb_rx
+    if (adapter_sb_rx_valid && adapter_sb_rx_ready) begin
+      if (adapter_sb_rx_packet.cr) begin
+        add_crd = add_crd + 1;
+      end
+
+      if (adapter_sb_rx_packet.opcode == SB_OP_MSG_NODATA &&
+          adapter_sb_rx_packet.msg_code == MC_NOP_CRD) begin
+        add_crd = add_crd + adapter_sb_rx_packet.msg_info[2:0];
+      end
+
+      if (add_crd > 0) begin
+        sb_credit_ret_pulse = 1'b1;
+        if (remote_req_crd_q + add_crd > 3'd4) begin
+          remote_req_crd_d = 3'd4;
+        end else begin
+          remote_req_crd_d = remote_req_crd_q + add_crd[2:0];
+        end
+      end
+    end
+
+    // Decrement credits when outbound remote register request is accepted
+    if (adapter_sb_tx_valid && adapter_sb_tx_ready &&
+        (sb_packet_kind(adapter_sb_tx_packet.opcode) == SB_PKT_REG_REQ)) begin
+      if (remote_req_crd_d > 3'd0) begin
+        remote_req_crd_d = remote_req_crd_d - 1'b1;
+      end
+    end
+
+    // Generate pending credit return when an inbound remote request completes
+    if (rem_cpl_push) begin
+      if (pending_cr_q < 3'd4) begin
+        pending_cr_d = pending_cr_q + 1'b1;
+      end
+    end
+
+    // Piggyback Cr bit on outgoing packet or clear on autonomous NOP.Crd
+    if (adapter_sb_tx_valid && adapter_sb_tx_ready) begin
+      if (adapter_sb_tx_packet.opcode == SB_OP_MSG_NODATA &&
+          adapter_sb_tx_packet.msg_code == MC_NOP_CRD) begin
+        pending_cr_d = 3'd0;
+      end else if (adapter_sb_tx_packet.cr) begin
+        if (pending_cr_d > 3'd0) begin
+          pending_cr_d = pending_cr_d - 1'b1;
+        end
+      end
+    end
+  end
+
+  // ==========================================================================
+  // Section 6: Independent Completion FIFO Queues
+  // ==========================================================================
+  // Inbound requests and delayed read responses place completions here.
+  // Completions are always-sink and never credit-gated.
+  // ==========================================================================
+  sb_packet_t cur_fdi_cpl;
+  assign cur_fdi_cpl = fdi_cpl_q[fdi_cpl_rd_ptr_q];
+
+  always @* begin
+    fdi_cpl_wr_ptr_d = fdi_cpl_wr_ptr_q;
+    fdi_cpl_rd_ptr_d = fdi_cpl_rd_ptr_q;
+    fdi_cpl_count_d  = fdi_cpl_count_q;
+
+    if (fdi_cpl_push && (fdi_cpl_count_q < 3'd4)) begin
+      fdi_cpl_wr_ptr_d = fdi_cpl_wr_ptr_q + 1'b1;
+      fdi_cpl_count_d  = fdi_cpl_count_q + 1'b1;
+    end
+
+    if (pl_tx_state_q == PL_TX_HDR && pl_tx_cnt_q == 3'd7 &&
+        (sb_payload_bytes(cur_fdi_cpl.opcode) == 0)) begin
+      fdi_cpl_rd_ptr_d = fdi_cpl_rd_ptr_q + 1'b1;
+      fdi_cpl_count_d  = fdi_cpl_count_d - 1'b1;
+    end else if (pl_tx_state_q == PL_TX_PLD && pl_tx_cnt_q == 3'd7) begin
+      fdi_cpl_rd_ptr_d = fdi_cpl_rd_ptr_q + 1'b1;
+      fdi_cpl_count_d  = fdi_cpl_count_d - 1'b1;
+    end
+  end
+
+  sb_packet_t cur_rem_fifo_cpl;
+  assign cur_rem_fifo_cpl = rem_cpl_fifo_q[rem_cpl_rd_ptr_q];
+
+  always @* begin
+    rem_cpl_wr_ptr_d = rem_cpl_wr_ptr_q;
+    rem_cpl_rd_ptr_d = rem_cpl_rd_ptr_q;
+    rem_cpl_count_d  = rem_cpl_count_q;
+
+    if (rem_cpl_push && (rem_cpl_count_q < 3'd4)) begin
+      rem_cpl_wr_ptr_d = rem_cpl_wr_ptr_q + 1'b1;
+      rem_cpl_count_d  = rem_cpl_count_q + 1'b1;
+    end
+
+    if (adapter_sb_tx_valid && adapter_sb_tx_ready && (rem_cpl_count_q > 3'd0) &&
+        (adapter_sb_tx_packet.tag == cur_rem_fifo_cpl.tag) &&
+        (sb_packet_kind(adapter_sb_tx_packet.opcode) == SB_PKT_COMPLETION)) begin
+      rem_cpl_rd_ptr_d = rem_cpl_rd_ptr_q + 1'b1;
+      rem_cpl_count_d  = rem_cpl_count_d - 1'b1;
+    end
+  end
+
+  // ==========================================================================
+  // Section 7: FDI Transmit Serializer (pl_cfg, pl_cfg_vld, pl_cfg_crd)
+  // UCIe 1.0 Section 8.2.3
+  // ==========================================================================
+  // Serializes 64-bit completion headers over 8 consecutive phases, followed
+  // by optional 8 payload phases. Transfers all phases back-to-back without
+  // internal gaps. Deallocates request slot and pulses pl_cfg_crd on completion.
+  // ==========================================================================
+  sb_packet_t  cur_fdi_tx_pkt;
+  logic [63:0] cur_fdi_tx_hdr;
+  logic [63:0] cur_fdi_tx_pld;
+  logic        cur_fdi_tx_has_pld;
+
+  always @(fdi_cpl_q[0], fdi_cpl_q[1], fdi_cpl_q[2], fdi_cpl_q[3],
+           fdi_cpl_rd_ptr_q) begin
+    cur_fdi_tx_pkt     = fdi_cpl_q[fdi_cpl_rd_ptr_q];
+    cur_fdi_tx_hdr     = sb_encode_header(cur_fdi_tx_pkt);
+    cur_fdi_tx_has_pld = (sb_payload_bytes(cur_fdi_tx_pkt.opcode) > 0);
+    cur_fdi_tx_pld     = sb_pad_data(cur_fdi_tx_pkt.opcode, cur_fdi_tx_pkt.data);
+  end
+
+  always @* begin
+    pl_tx_state_d         = pl_tx_state_q;
+    pl_tx_cnt_d           = pl_tx_cnt_q;
+    pl_cfg_d              = 8'h0;
+    pl_cfg_vld_d          = 1'b0;
+    pl_cfg_crd_d          = 1'b0;
+    fdi_req_release_event = 1'b0;
+
+    case (pl_tx_state_q)
+      PL_TX_IDLE: begin
+        pl_tx_cnt_d = 3'd0;
+        if (fdi_cpl_count_q > 3'd0) begin
+          pl_cfg_d      = cur_fdi_tx_hdr[7:0];
+          pl_cfg_vld_d  = 1'b1;
+          pl_tx_cnt_d   = 3'd1;
+          pl_tx_state_d = PL_TX_HDR;
+        end
+      end
+
+      PL_TX_HDR: begin
+        pl_cfg_d     = cur_fdi_tx_hdr[pl_tx_cnt_q * 8 +: 8];
+        pl_cfg_vld_d = 1'b1;
+
+        if (pl_tx_cnt_q == 3'd7) begin
+          if (cur_fdi_tx_has_pld) begin
+            pl_tx_cnt_d   = 3'd0;
+            pl_tx_state_d = PL_TX_PLD;
+          end else begin
+            // Transaction finished: release slot, pulse credit
+            pl_tx_state_d         = PL_TX_IDLE;
+            pl_tx_cnt_d           = 3'd0;
+            pl_cfg_crd_d          = 1'b1;
+            fdi_req_release_event = 1'b1;
+          end
+        end else begin
+          pl_tx_cnt_d = pl_tx_cnt_q + 1'b1;
+        end
+      end
+
+      PL_TX_PLD: begin
+        pl_cfg_d     = cur_fdi_tx_pld[pl_tx_cnt_q * 8 +: 8];
+        pl_cfg_vld_d = 1'b1;
+
+        if (pl_tx_cnt_q == 3'd7) begin
+          // Transaction finished: release slot, pulse credit
+          pl_tx_state_d         = PL_TX_IDLE;
+          pl_tx_cnt_d           = 3'd0;
+          pl_cfg_crd_d          = 1'b1;
+          fdi_req_release_event = 1'b1;
+        end else begin
+          pl_tx_cnt_d = pl_tx_cnt_q + 1'b1;
+        end
+      end
+
+      default: pl_tx_state_d = PL_TX_IDLE;
+    endcase
+  end
+
+  assign pl_cfg     = pl_cfg_q;
+  assign pl_cfg_vld = pl_cfg_vld_q;
+  assign pl_cfg_crd = pl_cfg_crd_q;
+
+  // ==========================================================================
+  // Section 8: Reduced-Profile Stage 3 Engine
+  // UCIe 1.0 Section 3.1.1, Section 6.1 (Tables 53, 54, 56)
+  // ==========================================================================
+  // After RDI reports Active, sends AdvCap.Adapter DATA64 with exact mask 64'h91.
+  // Validates peer fields: requires clean CP/DP, MsgInfo=0, Data[63:23]=0,
+  // Data[11]=0, Data[20:12]=0, (Data & 64'h91)==64'h91. MsgInfo=16'hFFFF resets
+  // 8 ms capability timer as Stall. Negotiates Streaming/Raw/Stack0 without FinCap.
+  // Completes Adapter0 Active reciprocal obligations. PMNAK handles L1/L2.
+  // ==========================================================================
+  sb_packet_t advcap_tx_pkt;
+  always @* begin
+    advcap_tx_pkt             = '0;
+    advcap_tx_pkt.opcode      = SB_OP_MSG_DATA64;
+    advcap_tx_pkt.src_id      = RDI_SRCID_ADAPTER;
+    advcap_tx_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    advcap_tx_pkt.msg_code    = MC_ADVCAP_ADAPTER;
+    advcap_tx_pkt.msg_subcode = 8'h00;
+    advcap_tx_pkt.msg_info    = 16'h0000;
+    advcap_tx_pkt.data        = 64'h0000_0000_0000_0091; // Raw(bit 0), Streaming(bit 4), Stack0(bit 7)
+    if (!lreset_n) advcap_tx_pkt = advcap_tx_pkt;
+  end
+
+  sb_packet_t ad0_active_req_pkt;
+  always @* begin
+    ad0_active_req_pkt             = '0;
+    ad0_active_req_pkt.opcode      = SB_OP_MSG_NODATA;
+    ad0_active_req_pkt.src_id      = RDI_SRCID_ADAPTER;
+    ad0_active_req_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    ad0_active_req_pkt.msg_code    = MC_LM_RDI_REQ;
+    ad0_active_req_pkt.msg_subcode = MS_LM_ACTIVE;
+    if (!lreset_n) ad0_active_req_pkt = ad0_active_req_pkt;
+  end
+
+  sb_packet_t ad0_active_rsp_pkt;
+  always @* begin
+    ad0_active_rsp_pkt             = '0;
+    ad0_active_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
+    ad0_active_rsp_pkt.src_id      = RDI_SRCID_ADAPTER;
+    ad0_active_rsp_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    ad0_active_rsp_pkt.msg_code    = MC_LM_RDI_RSP;
+    ad0_active_rsp_pkt.msg_subcode = MS_LM_ACTIVE;
+    if (!lreset_n) ad0_active_rsp_pkt = ad0_active_rsp_pkt;
+  end
+
+  sb_packet_t pmnak_rsp_pkt;
+  always @* begin
+    pmnak_rsp_pkt             = '0;
+    pmnak_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
+    pmnak_rsp_pkt.src_id      = RDI_SRCID_ADAPTER;
+    pmnak_rsp_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    pmnak_rsp_pkt.msg_code    = MC_LM_RDI_RSP;
+    pmnak_rsp_pkt.msg_subcode = MS_LM_PMNAK;
+    if (!lreset_n) pmnak_rsp_pkt = pmnak_rsp_pkt;
+  end
+
+  sb_packet_t linkreset_req_pkt;
+  always @* begin
+    linkreset_req_pkt             = '0;
+    linkreset_req_pkt.opcode      = SB_OP_MSG_NODATA;
+    linkreset_req_pkt.src_id      = RDI_SRCID_ADAPTER;
+    linkreset_req_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    linkreset_req_pkt.msg_code    = MC_LM_RDI_REQ;
+    linkreset_req_pkt.msg_subcode = MS_LM_LINKRESET;
+    if (!lreset_n) linkreset_req_pkt = linkreset_req_pkt;
+  end
+
+  sb_packet_t linkreset_rsp_pkt;
+  always @* begin
+    linkreset_rsp_pkt             = '0;
+    linkreset_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
+    linkreset_rsp_pkt.src_id      = RDI_SRCID_ADAPTER;
+    linkreset_rsp_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    linkreset_rsp_pkt.msg_code    = MC_LM_RDI_RSP;
+    linkreset_rsp_pkt.msg_subcode = MS_LM_LINKRESET;
+    if (!lreset_n) linkreset_rsp_pkt = linkreset_rsp_pkt;
+  end
+
+  sb_packet_t disabled_req_pkt;
+  always @* begin
+    disabled_req_pkt             = '0;
+    disabled_req_pkt.opcode      = SB_OP_MSG_NODATA;
+    disabled_req_pkt.src_id      = RDI_SRCID_ADAPTER;
+    disabled_req_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    disabled_req_pkt.msg_code    = MC_LM_RDI_REQ;
+    disabled_req_pkt.msg_subcode = MS_LM_DISABLE;
+    if (!lreset_n) disabled_req_pkt = disabled_req_pkt;
+  end
+
+  sb_packet_t disabled_rsp_pkt;
+  always @* begin
+    disabled_rsp_pkt             = '0;
+    disabled_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
+    disabled_rsp_pkt.src_id      = RDI_SRCID_ADAPTER;
+    disabled_rsp_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    disabled_rsp_pkt.msg_code    = MC_LM_RDI_RSP;
+    disabled_rsp_pkt.msg_subcode = MS_LM_DISABLE;
+    if (!lreset_n) disabled_rsp_pkt = disabled_rsp_pkt;
+  end
+
+  // Stage 3 Sequential Control
+  always @* begin
+    s3_state_d           = s3_state_q;
+    cap_timer_d          = cap_timer_q;
+    ad0_timer_d          = ad0_timer_q;
+    lm_timer_d           = lm_timer_q;
+
+    local_act_req_sent_d = local_act_req_sent_q;
+    local_act_rsp_rcvd_d = local_act_rsp_rcvd_q;
+    peer_act_req_rcvd_d  = peer_act_req_rcvd_q;
+    peer_act_rsp_sent_d  = peer_act_rsp_sent_q;
+
+    owed_rsp_pmnak_d     = owed_rsp_pmnak_q;
+    owed_rsp_dis_d       = owed_rsp_dis_q;
+    owed_rsp_lr_d        = owed_rsp_lr_q;
+
+    stage3_done_d        = stage3_done_q;
+    state_req_vld_d      = state_req_vld_q;
+    state_req_d          = state_req_q;
+    s3_fatal_event       = 1'b0;
+    s3_timeout_pulse     = 1'b0;
+
+    // Reset Stage 3 state whenever RDI exits Active
+    if (rdi_pl_state_sts != RDI_STS_ACTIVE) begin
+      s3_state_d           = S3_RESET;
+      cap_timer_d          = 32'd0;
+      ad0_timer_d          = 32'd0;
+      lm_timer_d           = 32'd0;
+      local_act_req_sent_d = 1'b0;
+      local_act_rsp_rcvd_d = 1'b0;
+      peer_act_req_rcvd_d  = 1'b0;
+      peer_act_rsp_sent_d  = 1'b0;
+      owed_rsp_pmnak_d     = 1'b0;
+      owed_rsp_dis_d       = 1'b0;
+      owed_rsp_lr_d        = 1'b0;
+      stage3_done_d        = 1'b0;
+      state_req_vld_d      = 1'b0;
+      state_req_d          = RDI_REQ_NOP;
+    end else begin
+      case (s3_state_q)
+        S3_RESET: begin
+          // Start Stage 3 after RDI reports Active
+          s3_state_d  = S3_ADVCAP_SEND;
+          cap_timer_d = 32'd0;
+        end
+
+        S3_ADVCAP_SEND: begin
+          if (cap_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            cap_timer_d = cap_timer_q + 1'b1;
+          end
+
+          if (adapter_sb_tx_valid && adapter_sb_tx_ready &&
+              (adapter_sb_tx_packet.msg_code == MC_ADVCAP_ADAPTER)) begin
+            s3_state_d = S3_ADVCAP_WAIT;
+          end
+        end
+
+        S3_ADVCAP_WAIT: begin
+          if (cap_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            cap_timer_d = cap_timer_q + 1'b1;
+          end
+
+          // Incoming Peer AdvCap.Adapter Validation
+          if (adapter_sb_rx_valid && adapter_sb_rx_ready &&
+              (adapter_sb_rx_packet.msg_code == MC_ADVCAP_ADAPTER)) begin
+            if (adapter_sb_rx_cp_error || adapter_sb_rx_dp_error || adapter_sb_rx_format_error) begin
+              s3_fatal_event = 1'b1;
+              s3_state_d     = S3_FATAL;
+            end else if (adapter_sb_rx_packet.msg_info == 16'hFFFF) begin
+              // Peer Stall: reset 8 ms capability timer
+              cap_timer_d = 32'd0;
+            end else if (adapter_sb_rx_packet.msg_info == 16'h0000) begin
+              // Validate peer capability payload fields
+              if ((adapter_sb_rx_packet.opcode == SB_OP_MSG_DATA64) &&
+                  (adapter_sb_rx_packet.data[63:23] == 41'h0) &&
+                  (adapter_sb_rx_packet.data[11] == 1'b0) &&
+                  (adapter_sb_rx_packet.data[20:12] == 9'h0) &&
+                  ((adapter_sb_rx_packet.data & 64'h91) == 64'h91)) begin
+                // Capability negotiation succeeded: Streaming, Raw Mode, Stack 0
+                s3_state_d  = S3_ACTIVE_SEND;
+                ad0_timer_d = 32'd0;
+              end else begin
+                // Incompatible capability
+                s3_fatal_event = 1'b1;
+                s3_state_d     = S3_FATAL;
+              end
+            end else begin
+              // Illegal MsgInfo
+              s3_fatal_event = 1'b1;
+              s3_state_d     = S3_FATAL;
+            end
+          end
+        end
+
+        S3_ACTIVE_SEND: begin
+          if (ad0_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            ad0_timer_d = ad0_timer_q + 1'b1;
+          end
+
+          if (adapter_sb_tx_valid && adapter_sb_tx_ready &&
+              (adapter_sb_tx_packet.msg_code == MC_LM_RDI_REQ) &&
+              (adapter_sb_tx_packet.msg_subcode == MS_LM_ACTIVE)) begin
+            local_act_req_sent_d = 1'b1;
+            s3_state_d           = S3_ACTIVE_WAIT;
+          end
+        end
+
+        S3_ACTIVE_WAIT: begin
+          if (ad0_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            ad0_timer_d = ad0_timer_q + 1'b1;
+          end
+
+          if (local_act_req_sent_d && local_act_rsp_rcvd_d &&
+              peer_act_req_rcvd_d  && peer_act_rsp_sent_d) begin
+            // Reciprocal obligations complete: enter Active state
+            s3_state_d      = S3_ACTIVE;
+            stage3_done_d   = 1'b1;
+            state_req_vld_d = 1'b1;
+            state_req_d     = RDI_REQ_ACTIVE;
+          end
+        end
+
+        S3_ACTIVE: begin
+          // Local State Change Requests (Disabled has priority over LinkReset)
+          if (lp_state_req == FDI_REQ_DISABLED) begin
+            s3_state_d  = S3_DISABLED_SEND;
+            lm_timer_d  = 32'd0;
+          end else if (lp_state_req == FDI_REQ_LINKRESET) begin
+            s3_state_d  = S3_LINKRESET_SEND;
+            lm_timer_d  = 32'd0;
+          end
+        end
+
+        S3_DISABLED_SEND: begin
+          if (lm_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            lm_timer_d = lm_timer_q + 1'b1;
+          end
+
+          if (adapter_sb_tx_valid && adapter_sb_tx_ready &&
+              (adapter_sb_tx_packet.msg_code == MC_LM_RDI_REQ) &&
+              (adapter_sb_tx_packet.msg_subcode == MS_LM_DISABLE)) begin
+            s3_state_d = S3_DISABLED_WAIT;
+          end
+        end
+
+        S3_DISABLED_WAIT: begin
+          if (lm_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            lm_timer_d = lm_timer_q + 1'b1;
+          end
+
+          // Exit when peer response acknowledged
+          if (state_req_d == RDI_REQ_DISABLED) begin
+            state_req_vld_d = 1'b1;
+          end
+        end
+
+        S3_LINKRESET_SEND: begin
+          if (lm_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            lm_timer_d = lm_timer_q + 1'b1;
+          end
+
+          if (adapter_sb_tx_valid && adapter_sb_tx_ready &&
+              (adapter_sb_tx_packet.msg_code == MC_LM_RDI_REQ) &&
+              (adapter_sb_tx_packet.msg_subcode == MS_LM_LINKRESET)) begin
+            s3_state_d = S3_LINKRESET_WAIT;
+          end
+        end
+
+        S3_LINKRESET_WAIT: begin
+          if (lm_timer_q >= C_SB_MSG) begin
+            s3_fatal_event   = 1'b1;
+            s3_timeout_pulse = 1'b1;
+            s3_state_d       = S3_FATAL;
+          end else begin
+            lm_timer_d = lm_timer_q + 1'b1;
+          end
+
+          if (state_req_d == RDI_REQ_LINKRESET) begin
+            state_req_vld_d = 1'b1;
+          end
+        end
+
+        S3_FATAL: begin
+          s3_fatal_event  = 1'b1;
+          state_req_vld_d = 1'b0;
+        end
+
+        default: s3_state_d = S3_RESET;
+      endcase
+
+      // Track incoming Link Management packets on adapter_sb_rx
+      if (adapter_sb_rx_valid && adapter_sb_rx_ready &&
+          (sb_packet_kind(adapter_sb_rx_packet.opcode) == SB_PKT_MESSAGE)) begin
+        if (adapter_sb_rx_packet.msg_code == MC_LM_RDI_REQ) begin
+          case (adapter_sb_rx_packet.msg_subcode)
+            MS_LM_ACTIVE:    peer_act_req_rcvd_d = 1'b1;
+            MS_LM_L1,
+            MS_LM_L2:        owed_rsp_pmnak_d    = 1'b1; // PMNAK response obligation
+            MS_LM_DISABLE:   owed_rsp_dis_d      = 1'b1;
+            MS_LM_LINKRESET: owed_rsp_lr_d       = 1'b1;
+            default: ;
+          endcase
+        end else if (adapter_sb_rx_packet.msg_code == MC_LM_RDI_RSP) begin
+          case (adapter_sb_rx_packet.msg_subcode)
+            MS_LM_ACTIVE:    local_act_rsp_rcvd_d = 1'b1;
+            MS_LM_PMNAK:     /* PM rejection received; remain Active */ ;
+            MS_LM_DISABLE:   begin
+              state_req_vld_d = 1'b1;
+              state_req_d     = RDI_REQ_DISABLED;
+            end
+            MS_LM_LINKRESET: begin
+              state_req_vld_d = 1'b1;
+              state_req_d     = RDI_REQ_LINKRESET;
+            end
+            default: ;
+          endcase
+        end
+      end
+
+      // Clear owed responses upon transmission acceptance
+      if (adapter_sb_tx_valid && adapter_sb_tx_ready &&
+          (adapter_sb_tx_packet.msg_code == MC_LM_RDI_RSP)) begin
+        case (adapter_sb_tx_packet.msg_subcode)
+          MS_LM_ACTIVE:    peer_act_rsp_sent_d = 1'b1;
+          MS_LM_PMNAK:     owed_rsp_pmnak_d    = 1'b0;
+          MS_LM_DISABLE:   owed_rsp_dis_d      = 1'b0;
+          MS_LM_LINKRESET: owed_rsp_lr_d       = 1'b0;
+          default: ;
+        endcase
+      end
+    end
+  end
+
+  assign adapter_state_req_vld = state_req_vld_q;
+  assign adapter_state_req     = state_req_q;
+  assign stage3_done           = stage3_done_q;
+
+  // ==========================================================================
+  // Section 9: Transmit Arbiter for adapter_sb_tx (<-> logical_phy)
+  // UCIe 1.0 Section 6.1
+  // ==========================================================================
+  // Strictly non-blocking priority arbitration:
+  //   1. Remote Completions (rem_cpl_fifo_q) - HIGHEST, never credit-gated.
+  //   2. Stage 3 & Link Management responses (PMNAK, Active, LR, Dis).
+  //   3. Stage 3 & Link Management requests (AdvCap, Active, LR, Dis).
+  //   4. Autonomous NOP.Crd (when pending_cr_q > 0 and no packet pending).
+  //   5. Remote register requests (gated by remote_req_crd_q > 0 and rem_table).
   //
-  // Counts the 8 UIs (0 through 7) of an outgoing sideband packet. The
-  // counter increments while tx_send is asserted. After reaching UI 7, the
-  // gap counter (gap_q) is loaded and tx_send is deasserted by the transmit
-  // control logic until the gap expires.
-  //
-  // On reset, the counter is cleared to zero.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission (Figures 46-47).
-  // -------------------------------------------------------------------------
+  // Piggybacks Cr bit whenever pending_cr_q > 0.
+  // ==========================================================================
+  sb_packet_t nop_crd_pkt;
+  always @* begin
+    nop_crd_pkt             = '0;
+    nop_crd_pkt.opcode      = SB_OP_MSG_NODATA;
+    nop_crd_pkt.src_id      = RDI_SRCID_ADAPTER;
+    nop_crd_pkt.dst_id      = RDI_DSTID_REMOTE_ADAPT;
+    nop_crd_pkt.msg_code    = MC_NOP_CRD;
+    nop_crd_pkt.msg_info    = {13'h0, pending_cr_q};
+  end
+
+  always @(rem_cpl_fifo_q[0], rem_cpl_fifo_q[1], rem_cpl_fifo_q[2], rem_cpl_fifo_q[3],
+           rem_cpl_rd_ptr_q, rem_cpl_count_q,
+           owed_rsp_dis_q, owed_rsp_lr_q, owed_rsp_pmnak_q,
+           peer_act_req_rcvd_q, peer_act_rsp_sent_q,
+           s3_state_q,
+           rem_req_vld, rem_req_rdy, rem_req_pkt, rem_slot_free, remote_req_crd_q,
+           pending_cr_q, adapter_sb_tx_ready,
+           disabled_rsp_pkt, linkreset_rsp_pkt, pmnak_rsp_pkt,
+           ad0_active_rsp_pkt, advcap_tx_pkt, ad0_active_req_pkt,
+           disabled_req_pkt, linkreset_req_pkt, nop_crd_pkt) begin
+    adapter_sb_tx_valid  = 1'b0;
+    adapter_sb_tx_packet = '0;
+    rem_req_rdy          = 1'b0;
+
+    // 1. Remote Completions (Highest Priority, Never Credit-Gated)
+    if (rem_cpl_count_q > 3'd0) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = rem_cpl_fifo_q[rem_cpl_rd_ptr_q];
+    end
+    // 2. Owed LM Responses
+    else if (owed_rsp_dis_q) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = disabled_rsp_pkt;
+    end else if (owed_rsp_lr_q) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = linkreset_rsp_pkt;
+    end else if (owed_rsp_pmnak_q) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = pmnak_rsp_pkt;
+    end else if (peer_act_req_rcvd_q && !peer_act_rsp_sent_q) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = ad0_active_rsp_pkt;
+    end
+    // 3. Stage 3 & LM Requests
+    else if (s3_state_q == S3_ADVCAP_SEND) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = advcap_tx_pkt;
+    end else if (s3_state_q == S3_ACTIVE_SEND) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = ad0_active_req_pkt;
+    end else if (s3_state_q == S3_DISABLED_SEND) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = disabled_req_pkt;
+    end else if (s3_state_q == S3_LINKRESET_SEND) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = linkreset_req_pkt;
+    end
+    // 4. Remote Register Request from Mailbox Client
+    else if (rem_req_vld && (|rem_slot_free) && (remote_req_crd_q > 3'd0)) begin
+      adapter_sb_tx_valid      = 1'b1;
+      adapter_sb_tx_packet     = rem_req_pkt;
+      adapter_sb_tx_packet.tag = rem_free_idx[4:0];
+      rem_req_rdy              = adapter_sb_tx_ready;
+    end
+    // 5. Autonomous NOP.Crd Return
+    else if (pending_cr_q > 3'd0) begin
+      adapter_sb_tx_valid  = 1'b1;
+      adapter_sb_tx_packet = nop_crd_pkt;
+    end
+
+    // Piggyback Cr bit on outgoing packet
+    if (adapter_sb_tx_valid && (pending_cr_q > 3'd0) &&
+        !(adapter_sb_tx_packet.opcode == SB_OP_MSG_NODATA && adapter_sb_tx_packet.msg_code == MC_NOP_CRD)) begin
+      adapter_sb_tx_packet.cr = 1'b1;
+    end
+  end
+
+  // Always sink incoming packets on adapter_sb_rx
+  assign adapter_sb_rx_ready = 1'b1;
+
+  // Remote Mailbox Client Completion Handshake
+  assign rem_cpl_vld = rem_cpl_vld_q;
+  assign rem_cpl_pkt = rem_cpl_pkt_q;
+
+  // ==========================================================================
+  // Section 10: Status, Fatal, and Monitor Outputs
+  // ==========================================================================
+  assign adapter_fatal      = adapter_fatal_q;
+  assign adapter_linkerror  = adapter_fatal_q;
+  assign protocol_error     = protocol_err_q;
+  assign fdi_format_error   = fdi_format_err_q;
+  assign sb_credit_returned = sb_credit_ret_pulse;
+  assign sb_stall_sent      = sb_stall_sent_pulse;
+  assign sb_msg_timeout     = rem_timeout_pulse | s3_timeout_pulse;
+
+  // ==========================================================================
+  // Section 11: Sequential State Registers
+  // ==========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      tx_ui_q <= 4'h0;
-    end else if (tx_send) begin
-      tx_ui_q <= tx_ui_q + 1'b1;
+      fdi_rx_state_q        <= FDI_RX_IDLE;
+      fdi_rx_cnt_q          <= 3'd0;
+      fdi_rx_hdr_q          <= 64'h0;
+      fdi_rx_pld_q          <= 64'h0;
+
+      fdi_format_err_q      <= 1'b0;
+      protocol_err_q        <= 1'b0;
+      adapter_fatal_q       <= 1'b0;
+
+      fdi_rx_crd_q          <= 3'd4;
+      fdi_tx_crd_q          <= 3'd4;
+      remote_req_crd_q      <= 3'd4;
+      pending_cr_q          <= 3'd0;
+
+      rem_table_valid_q     <= 4'b0;
+      rem_table_route_q     <= 4'b0;
+      for (int i = 0; i < 4; i++) begin
+        rem_table_pkt_q[i]   <= '0;
+        rem_table_timer_q[i] <= 32'd0;
+      end
+
+      csr_fsm_q             <= CSR_ST_IDLE;
+      csr_held_q            <= '0;
+      csr_held_rdata_q      <= 64'h0;
+      csr_rd_pulse_q        <= 1'b0;
+
+      for (int i = 0; i < 4; i++) begin
+        fdi_cpl_q[i]      <= '0;
+        rem_cpl_fifo_q[i] <= '0;
+      end
+      fdi_cpl_wr_ptr_q      <= 2'd0;
+      fdi_cpl_rd_ptr_q      <= 2'd0;
+      fdi_cpl_count_q       <= 3'd0;
+      rem_cpl_wr_ptr_q      <= 2'd0;
+      rem_cpl_rd_ptr_q      <= 2'd0;
+      rem_cpl_count_q       <= 3'd0;
+
+      pl_tx_state_q         <= PL_TX_IDLE;
+      pl_tx_cnt_q           <= 3'd0;
+      pl_cfg_q              <= {NC{1'b0}};
+      pl_cfg_vld_q          <= 1'b0;
+      pl_cfg_crd_q          <= 1'b0;
+
+      s3_state_q            <= S3_RESET;
+      cap_timer_q           <= 32'd0;
+      ad0_timer_q           <= 32'd0;
+      lm_timer_q            <= 32'd0;
+      local_act_req_sent_q  <= 1'b0;
+      local_act_rsp_rcvd_q  <= 1'b0;
+      peer_act_req_rcvd_q   <= 1'b0;
+      peer_act_rsp_sent_q   <= 1'b0;
+      owed_rsp_pmnak_q      <= 1'b0;
+      owed_rsp_dis_q        <= 1'b0;
+      owed_rsp_lr_q         <= 1'b0;
+
+      stage3_done_q         <= 1'b0;
+      state_req_vld_q       <= 1'b0;
+      state_req_q           <= RDI_REQ_NOP;
+
+      rem_cpl_vld_q         <= 1'b0;
+      rem_cpl_pkt_q         <= '0;
+    end else begin
+      fdi_rx_state_q        <= fdi_rx_state_d;
+      fdi_rx_cnt_q          <= fdi_rx_cnt_d;
+      fdi_rx_hdr_q          <= fdi_rx_hdr_d;
+      fdi_rx_pld_q          <= fdi_rx_pld_d;
+
+      fdi_format_err_q      <= fdi_format_err_d;
+      protocol_err_q        <= protocol_err_d;
+      adapter_fatal_q       <= adapter_fatal_d;
+
+      fdi_rx_crd_q          <= fdi_rx_crd_d;
+      fdi_tx_crd_q          <= fdi_tx_crd_d;
+      remote_req_crd_q      <= remote_req_crd_d;
+      pending_cr_q          <= pending_cr_d;
+
+      rem_table_valid_q     <= rem_table_valid_d;
+      rem_table_route_q     <= rem_table_route_d;
+      for (int i = 0; i < 4; i++) begin
+        rem_table_pkt_q[i]   <= rem_table_pkt_d[i];
+        rem_table_timer_q[i] <= rem_table_timer_d[i];
+      end
+
+      csr_fsm_q             <= csr_fsm_d;
+      csr_held_q            <= csr_held_d;
+      csr_held_rdata_q      <= csr_held_rdata_d;
+      csr_rd_pulse_q        <= csr_rd_pulse_d;
+
+      if (fdi_cpl_push && (fdi_cpl_count_q < 3'd4)) begin
+        fdi_cpl_q[fdi_cpl_wr_ptr_q] <= fdi_cpl_push_pkt;
+      end
+      fdi_cpl_wr_ptr_q      <= fdi_cpl_wr_ptr_d;
+      fdi_cpl_rd_ptr_q      <= fdi_cpl_rd_ptr_d;
+      fdi_cpl_count_q       <= fdi_cpl_count_d;
+
+      if (rem_cpl_push && (rem_cpl_count_q < 3'd4)) begin
+        rem_cpl_fifo_q[rem_cpl_wr_ptr_q] <= rem_cpl_push_pkt;
+      end
+      rem_cpl_wr_ptr_q      <= rem_cpl_wr_ptr_d;
+      rem_cpl_rd_ptr_q      <= rem_cpl_rd_ptr_d;
+      rem_cpl_count_q       <= rem_cpl_count_d;
+
+      pl_tx_state_q         <= pl_tx_state_d;
+      pl_tx_cnt_q           <= pl_tx_cnt_d;
+      pl_cfg_q              <= pl_cfg_d;
+      pl_cfg_vld_q          <= pl_cfg_vld_d;
+      pl_cfg_crd_q          <= pl_cfg_crd_d;
+
+      s3_state_q            <= s3_state_d;
+      cap_timer_q           <= cap_timer_d;
+      ad0_timer_q           <= ad0_timer_d;
+      lm_timer_q            <= lm_timer_d;
+      local_act_req_sent_q  <= local_act_req_sent_d;
+      local_act_rsp_rcvd_q  <= local_act_rsp_rcvd_d;
+      peer_act_req_rcvd_q   <= peer_act_req_rcvd_d;
+      peer_act_rsp_sent_q   <= peer_act_rsp_sent_d;
+      owed_rsp_pmnak_q      <= owed_rsp_pmnak_d;
+      owed_rsp_dis_q        <= owed_rsp_dis_d;
+      owed_rsp_lr_q         <= owed_rsp_lr_d;
+
+      stage3_done_q         <= stage3_done_d;
+      state_req_vld_q       <= state_req_vld_d;
+      state_req_q           <= state_req_d;
+
+      rem_cpl_vld_q         <= rem_cpl_vld_d;
+      rem_cpl_pkt_q         <= rem_cpl_pkt_d;
     end
-  end
-
-  // -------------------------------------------------------------------------
-  // always_ff: Inter-Packet Gap Counter
-  //
-  // Enforces this endpoint's SB_GAP_UI (32) UI inter-packet gap between
-  // consecutive sideband packets. The gap counter is loaded with
-  // SB_GAP_UI[5:0] when the last UI of a packet (tx_ui_q == 7) is
-  // transmitted, then decrements each cycle until it reaches zero.
-  //
-  // The in_gap wire is true whenever gap_q != 0, preventing the transmit
-  // control logic from starting a new packet during the gap.
-  //
-  // Spec context: UCIe 1.0, Section 4.1.5 - Sideband transmission (Figure 47).
-  // -------------------------------------------------------------------------
-  logic [5:0] gap_q;
-  wire       in_gap = (gap_q != 6'h00);
-
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      gap_q <= 6'h00;
-    end else if (tx_send && tx_ui_q == 4'd7) begin
-      gap_q <= SB_GAP_UI[5:0];
-    end else if (in_gap) begin
-      gap_q <= gap_q - 1'b1;
-    end
-  end
-
-  // -------------------------------------------------------------------------
-  // always_comb: Transmit Output Drivers
-  //
-  // Drives the three pl_cfg outputs to the Protocol Layer:
-  //   pl_cfg     - the NC-bit slice of tx_hdr corresponding to the current
-  //                transmit UI (tx_ui_q). Uses a variable part-select to
-  //                extract bits [8*tx_ui_q +: NC] from the 64-bit header.
-  //   pl_cfg_vld - asserted while tx_send is active (8 UIs per packet).
-  //   pl_cfg_crd - tied to 1'b0; credit returns are carried in the Cr bit
-  //                of packet headers, not on the dedicated credit wire.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.3 (credit model), Table 115 (FDI signals).
-  // -------------------------------------------------------------------------
-  always_comb begin
-    pl_cfg     = tx_hdr[8*tx_ui_q +: NC];
-    pl_cfg_vld = tx_send;
-    pl_cfg_crd = 1'b0;
-  end
-
-  // --------------------------------------------------------------------------
-  // Credit Accounting
-  // --------------------------------------------------------------------------
-
-  // -------------------------------------------------------------------------
-  // always_ff: FDI and Remote Credit Registers
-  //
-  // Maintains the two independent credit loops per spec 6.1.3:
-  //
-  //   crd_fdi_q (FDI credit loop):
-  //     Replenished when a received packet with opcode SB_OP_MSG_NODATA and
-  //     msgcode MC_NOP_CRD is decoded. The MsgInfo[2:0] field carries the
-  //     number of credits (1-4) to add to crd_fdi_q. These credits allow
-  //     the Protocol Layer to send additional sideband packets to the
-  //     Adapter.
-  //   crd_remote_q (remote credit loop):
-  //     Decremented when a received packet has the Cr (credit return) bit
-  //     set, indicating the remote die has consumed a credit and is
-  //     returning it. The decrement is guarded (crd_remote_q > 0) to
-  //     prevent underflow.
-  // On reset, both counters are cleared to zero (no credits available).
-  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity
-  //           (sideband credit model, max SB_CRD_MAX = 4).
-  // -------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      crd_fdi_q   <= 2'h0;
-      crd_remote_q<= 3'h0;
-    end else if (rx_pkt_vld && rx_cr) begin
-      // Cr is a credit return to the requester, which is the Adapter.
-      crd_remote_q <= (crd_remote_q > 0) ? crd_remote_q - 1'b1 : crd_remote_q;
-    end else if (rx_pkt_vld && rx_opcode == SB_OP_MSG_NODATA &&
-                 rx_msgcode == MC_NOP_CRD) begin
-      // Nop.Crd carries 1-4 credits in MsgInfo.
-      crd_fdi_q <= crd_fdi_q + rx_msginfo[2:0];
-    end
-  end
-
-  // -------------------------------------------------------------------------
-  // assign: Credit Return Monitor Hook
-  //
-  // sb_credit_returned is asserted for one cycle whenever a received packet
-  // carries either a Cr bit (credit return) or a Nop.Crd message. This
-  // output is a coverage/monitor hook used by the testbench to track
-  // sideband credit flow without adding probe logic.
-  //
-  // Spec ref: UCIe 1.0, Section 6.1.3 - Flow Control and Data Integrity
-  //           (credit return mechanism).
-  // -------------------------------------------------------------------------
-  assign sb_credit_returned = rx_pkt_vld && (rx_cr ||
-                            (rx_opcode == SB_OP_MSG_NODATA && rx_msgcode == MC_NOP_CRD));
-
-
-  // -------------------------------------------------------------------------
-  // always_ff: Adapter State Request Channel (Reduced Scope)
-  //
-  // In a full implementation, this register would capture general state
-  // requests generated by the Adapter in response to Protocol Layer
-  // directives or sideband negotiations. In this reduced-scope design,
-  // the register is reset to invalid (adapter_state_req_vld = 0,
-  // adapter_state_req = RDI_REQ_NOP) and is never set to a valid value.
-  //
-  // The port exists so that the d2d_adapter interconnect is structurally
-  // complete for future expansion.
-  //
-  // Spec ref: UCIe 1.0, Section 8.3.2 - State Request and Status.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      adapter_state_req_vld <= 1'b0;
-      adapter_state_req     <= RDI_REQ_NOP;
-    end
-  end
-
-  // --------------------------------------------------------------------------
-  // Timer Control Logic
-  // --------------------------------------------------------------------------
-
-  // -------------------------------------------------------------------------
-  // assign: Dormant Monitor Timer Hooks
-  //
-  // In this simplified endpoint, the adapter responds to CfgRd completions
-  // but does not autonomously initiate credit-consuming sideband requests.
-  // The message timeout and stall keep-alive timers are dormant monitor stubs
-  // tied low; active sideband request tracking is owned by the LTSM (spec 6.1).
-  //
-  //   msg_timer_start/run   - held low (no autonomous adapter requests).
-  //   stall_timer_start/run - held low (no stall packet generation).
-  //   sb_msg_timeout        - dormant monitor hook (tied low).
-  //   sb_stall_sent         - dormant monitor hook (tied low).
-  //
-  // Spec ref: UCIe 1.0, Section 6.1 (sideband protocol & timers).
-  // -------------------------------------------------------------------------
-  assign msg_timer_start   = 1'b0;
-  assign msg_timer_run     = 1'b0;
-  assign stall_timer_start = 1'b0;
-  assign stall_timer_run   = 1'b0;
-  assign sb_msg_timeout    = 1'b0;
-  assign sb_stall_sent     = 1'b0;
-
-  // --------------------------------------------------------------------------
-  // CSR Access Path and Transmit Control
-  // --------------------------------------------------------------------------
-
-  // -------------------------------------------------------------------------
-  // assign: CSR Address and Write Data Extraction
-  //
-  // Extracts the CSR address and write data from the received packet header
-  // for forwarding to adapter_regfile:
-  //
-  //   csr_addr  = rx_hdr_q[26:0]: the 27-bit byte address within the
-  //               Adapter CSR space. The sideband packet encodes the
-  //               target register offset in the lower 27 bits of the header.
-  //
-  //   csr_wdata = rx_hdr_q[63:0]: for CfgWr packets, the entire 64-bit
-  //               header is used as write data. (In a full implementation,
-  //               a separate data payload would carry the write value;
-  //               this simplified design overloads the header.)
-  //
-  // These are implemented as continuous assigns rather than inside an
-  // always_* process because Icarus Verilog 12 does not evaluate constant
-  // part-selects correctly inside always_* blocks.
-  // Spec context: UCIe 1.0, Section 6.1.2.1 - Register Access Packets,
-  // Tables 50-51. The bit placement is this endpoint's local encoding.
-  // -------------------------------------------------------------------------
-  assign csr_addr  = rx_hdr_q[26:0];
-  assign csr_wdata = rx_hdr_q[63:0];
-
-  // -------------------------------------------------------------------------
-  // always_comb: CSR Read/Write Decode and Transmit Control
-  //
-  // Decodes received packets addressed to the Adapter (dstid == SRCID_ADAPT)
-  // and classifies them:
-  //   csr_wr - CfgWr (5'b00001) or CfgWr-with-data (5'b00101): writes the
-  //            addressed CSR.
-  //   csr_rd - CfgRd (5'b00100) or CfgRd-with-type (5'b01100): starts a read.
-  //   tx_send - asserted when a CfgRd is outstanding AND the register file
-  //             has returned csr_rdata_vld; triggers the serialiser to send
-  //             the completion packet.
-  //   tx_hdr  - the 64-bit completion header: csr_rdata in the payload plus
-  //             a fixed completion opcode and routing (dstid SRCID_ADAPT).
-  //             Simplified encoding: one 64-bit header, read data embedded.
-  //
-  // Spec context: UCIe 1.0, Section 6.1.2 - Packet Formats, Table 47
-  // (opcodes), and Table 48 (FDI srcid/dstid). This endpoint uses a local
-  // simplified completion encoding.
-  // -------------------------------------------------------------------------
-  always_comb begin
-    csr_wr    = rx_pkt_vld && (rx_dstid == SRCID_ADAPT) &&
-                (rx_opcode == 5'b00001 || rx_opcode == 5'b00101);
-    csr_rd    = rx_pkt_vld && (rx_dstid == SRCID_ADAPT) &&
-                (rx_opcode == 5'b00100 || rx_opcode == 5'b01100);
-    tx_send   = csr_rd && csr_rdata_vld;
-    tx_hdr    = {csr_rdata, 27'h0, 5'b10001, 3'b000, 3'b001, 3'b0, 3'b0, 5'b10000};
   end
 
 endmodule

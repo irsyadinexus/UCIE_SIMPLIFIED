@@ -248,6 +248,9 @@
 //   v0.0.15 2026-09-25  Sample framing-fault evidence from both logical-PHY
 //                        receive paths so the injected Die 1 fault appears
 //                        in coverage.json.
+//   v0.0.16 2026-09-28  Migrate sideband crossings to scalar clock/data pins
+//                        and park the forwarded mainband clock without idle
+//                        event churn.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -307,7 +310,14 @@ module tb_loopback_top;
   // Spec ref: UCIe 1.0 Sections 4.1.3 and 5.2; PLAN.md Section 15.6.
   // -------------------------------------------------------------------------
   // -------------------------------------------------------------------------
-  always #0.25 mbclk = mbclk_en ? ~mbclk : 1'b0;
+  always begin
+    if (mbclk_en === 1'b1) begin
+      #0.25 mbclk = ~mbclk;
+    end else begin
+      mbclk = 1'b0;
+      @(mbclk_en);
+    end
+  end
   // -------------------------------------------------------------------------
   // initial: sbclk Generator
   //
@@ -352,8 +362,8 @@ module tb_loopback_top;
   end
 
   // ------------------------------------------------------- die crossing
-  logic [NC-1:0]        sb_a2b_data, sb_b2a_data;
-  logic                 sb_a2b_valid, sb_b2a_valid;
+  logic                 sb_a2b_clk, sb_b2a_clk;
+  logic                 sb_a2b_data, sb_b2a_data;
   logic [NLANES_MAX-1:0] mb_a2b_data, mb_b2a_data;
   logic                 mb_a2b_valid, mb_b2a_valid;
   wire  [NLANES_MAX-1:0] mb_a2b_wire, mb_b2a_wire;
@@ -524,7 +534,7 @@ module tb_loopback_top;
   // loopback topology. All RDI protocol-layer signals are prefixed `d0_`
   // and driven by the BFM stimulus. The sideband and main-band ports are
   // cross-connected to dut_b:
-  //   - dut_a.sb_tx_data/valid  ->  dut_b.sb_rx_data/valid  (via sb_b2a)
+  //   - dut_a.sb_tx_clk/data  ->  dut_b.sb_rx_clk/data  (via sb_b2a)
   //   - dut_a.mb_tx_data/valid  ->  dut_b.mb_rx_data/valid  (via mb_b2a)
   //   - dut_a.sb_rx             <-  dut_b.sb_tx             (via sb_a2b)
   //   - dut_a.mb_rx             <-  dut_b.mb_tx             (via mb_a2b)
@@ -561,10 +571,10 @@ module tb_loopback_top;
     .pl_inband_pres  (),
     .pl_stallreq     (d0_pl_stallreq),
     .lp_linkerror    (),
+    .sb_tx_clk       (sb_b2a_clk),
     .sb_tx_data      (sb_b2a_data),
-    .sb_tx_valid     (sb_b2a_valid),
+    .sb_rx_clk       (sb_a2b_clk),
     .sb_rx_data      (sb_a2b_data),
-    .sb_rx_valid     (sb_a2b_valid),
     .mb_tx_data      (mb_b2a_data),
     .mb_tx_valid     (mb_b2a_valid),
     .mb_rx_data      (mb_a2b_wire),
@@ -578,7 +588,7 @@ module tb_loopback_top;
   // loopback topology. All RDI protocol-layer signals are prefixed `d1_`
   // and driven by the BFM stimulus. The sideband and main-band ports are
   // cross-connected to dut_a (the mirror of dut_a's connections):
-  //   - dut_b.sb_tx_data/valid  ->  dut_a.sb_rx_data/valid  (via sb_a2b)
+  //   - dut_b.sb_tx_clk/data  ->  dut_a.sb_rx_clk/data  (via sb_a2b)
   //   - dut_b.mb_tx_data/valid  ->  dut_a.mb_rx_data/valid  (via mb_a2b)
   //   - dut_b.sb_rx             <-  dut_a.sb_tx             (via sb_b2a)
   //   - dut_b.mb_rx             <-  dut_a.mb_tx             (via mb_b2a)
@@ -615,10 +625,10 @@ module tb_loopback_top;
     .pl_inband_pres  (),
     .pl_stallreq     (d1_pl_stallreq),
     .lp_linkerror    (),
+    .sb_tx_clk       (sb_a2b_clk),
     .sb_tx_data      (sb_a2b_data),
-    .sb_tx_valid     (sb_a2b_valid),
+    .sb_rx_clk       (sb_b2a_clk),
     .sb_rx_data      (sb_b2a_data),
-    .sb_rx_valid     (sb_b2a_valid),
     .mb_tx_data      (mb_a2b_data),
     .mb_tx_valid     (mb_a2b_valid),
     .mb_rx_data      (mb_b2a_wire),

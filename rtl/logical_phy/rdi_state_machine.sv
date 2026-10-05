@@ -107,6 +107,8 @@
 //                        keeping the Phase D Active policy independent of it.
 //   v0.0.6  2026-09-25  Add explicit lint consumption for the preserved
 //                        policy-inert adapter_active_req input.
+//   v0.0.7  2026-10-02  Define rdi_pl_inband_pres as the LTSM
+//                        training-complete indication required by Table 114.
 // ============================================================================
 `ifndef RdiStateMachine_SV
 `define RdiStateMachine_SV
@@ -138,7 +140,7 @@ module rdi_state_machine (
   input  logic        phy_link_reset,        // physical RESET event
   input  logic        phy_retrain_req,       // PHYRETRAIN requested by adapter
   input  logic        phy_train_error,       // unrecoverable training failure
-  input  logic        phy_inband_pres,       // partner present (sideband alive)
+  input  logic        phy_inband_pres,       // LTSM training complete
   input  logic        cerror,                // correctable error
   input  logic        nferror,               // non-fatal error
   input  logic        stall_req,             // local stall request
@@ -260,7 +262,7 @@ module rdi_state_machine (
   // RDI output assignments  (spec 8.1 / Table 114)
   // =========================================================================
   // rdi_pl_state_sts    : Current state encoding, registered.   Table 114.
-  // rdi_pl_inband_pres  : Partner is present on sideband.       Table 114.
+  // rdi_pl_inband_pres  : Link training complete and ready for RDI ACTIVE.
   // rdi_pl_linkerror    : Asserted in LINKERROR state.          Table 114.
   // rdi_pl_phyinrecenter: Retrain indication, never asserted in the fixed
   //                       profile.                            Table 114.
@@ -274,8 +276,9 @@ module rdi_state_machine (
   //
   // These six signals are driven to the D2D Adapter through the RDI and
   // reflect either registered state or pass-through PHY events:
-  //   rdi_pl_inband_pres   - forwarded from phy_inband_pres; indicates the
-  //                          partner die is present on sideband (Table 114).
+  //   rdi_pl_inband_pres   - training-complete indication from the LTSM.
+  //                          It asserts before RDI ACTIVE and stays high
+  //                          until the link enters RESET or TRAINERROR.
   //   rdi_pl_linkerror     - asserted when state_q == LINKERROR, telling
   //                          the adapter that recovery is required (8.1.5).
   //   rdi_pl_phyinrecenter - retrain indication. The fixed profile does not

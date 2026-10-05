@@ -113,8 +113,10 @@
 #                   golden vectors (tb_sideband_peer).
 #   unit          - Build and run every tb/unit/*.sv testbench; clears stale
 #                   evidence and produces Phase F unit evidence fragments.
-#   loopback  - Build and run the two-die bring-up plus streaming test;
-#               records LTSM/RDI states and Phase F event coverage.
+#   loopback      - Build and run the two-die bring-up plus streaming test;
+#                   records LTSM/RDI states and Phase F event coverage.
+#   sbinit-wave   - Build and run the two-die RESET-to-SBINIT test; writes
+#                   logs/sbinit.vcd with sideband, mainband, FDI, RDI, and state signals.
 #   coverage  - Run unit and loopback, then report merged Phase F coverage
 #               via cov_report.py (requires 100% reachable states and events).
 #   clean     - Remove out/ and logs/. Purges compiled simulation binaries,
@@ -203,6 +205,8 @@ VVP         ?= vvp
 PYTHON      ?= python3
 # Maximum wall-clock time for the slow full-link loopback simulation.
 SIM_TIMEOUT ?= 900
+# Maximum wall-clock time for the focused RESET-to-SBINIT waveform run.
+SBINIT_TIMEOUT ?= 180
 
 
 ROOT    := ..
@@ -223,7 +227,7 @@ INCLUDES := -I $(RTL)/rtl_common -I $(TB)/monitors
 # Ensure all files explicitly compile warning-free without suppression
 FILTER  := cat
 
-.PHONY: all compile unit sideband-unit sideband-peer loopback coverage clean
+.PHONY: all compile unit sideband-unit sideband-peer loopback sbinit-wave coverage clean
 
 # ------------------------------------------------------------- all
 # Final integration gate. Executes the complete verification cascade:
@@ -350,6 +354,29 @@ loopback: compile
 	@grep -q "^TEST PASSED" $(LOGS)/loopback_run.txt || \
 	  { echo "LOOPBACK FAILED"; exit 1; }
 	@echo "LOOPBACK OK"
+
+# ----------------------------------------------------------- sbinit-wave
+# Two real ucie_main instances crossed die-to-die. The run stops when both
+# LTSMs enter MBINIT.PARAM, immediately after SBINIT completion.
+sbinit-wave: compile
+	@mkdir -p $(OUT) $(LOGS)
+	@echo "== RESET-to-SBINIT waveform"
+	@$(IVERILOG) -g2012 -Wall $(INCLUDES) -o $(OUT)/sbinit.vvp \
+	    $(TB)/sbinit/tb_reset_to_sbinit.sv $(RTL_TOP) $(RTL_PHY) \
+	    $(RTL_COMMON) $(RTL_ADAPT) > $(LOGS)/sbinit_comp.txt 2>&1; \
+	  status=$$?; \
+	  if [ $$status -ne 0 ] || [ -s $(LOGS)/sbinit_comp.txt ]; then \
+	    cat $(LOGS)/sbinit_comp.txt; \
+	    echo "SBINIT WAVEFORM FAILED (compile/warnings)"; exit 1; \
+	  fi
+	@timeout $(SBINIT_TIMEOUT)s $(VVP) $(OUT)/sbinit.vvp \
+	    +wave=$(LOGS)/sbinit.vcd 2>&1 | tee $(LOGS)/sbinit_run.txt
+	@grep -q "^TEST PASSED tb_reset_to_sbinit" $(LOGS)/sbinit_run.txt || \
+	  { echo "SBINIT WAVEFORM FAILED"; exit 1; }
+	@test -s $(LOGS)/sbinit.vcd || \
+	  { echo "SBINIT WAVEFORM FAILED: VCD is empty"; exit 1; }
+	@gzip -c $(LOGS)/sbinit.vcd > $(LOGS)/sbinit.vcd.gz
+	@echo "SBINIT WAVEFORM OK: $(LOGS)/sbinit.vcd"
 
 # ------------------------------------------------------------- coverage
 # Aggregates multi-source Phase F coverage via cov_report.py.

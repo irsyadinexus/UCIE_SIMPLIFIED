@@ -255,8 +255,7 @@ module fdi_state_machine (
   // always_comb: In-Band Presence Next-State Logic
   //
   // In-band presence (pl_inband_pres) is a sticky-high flag per spec 8.2:
-  //   - It sets to 1 when the RDI reports rdi_inband_pres (the PHY has
-  //     detected in-band signalling from the remote die).
+  //   - It sets to 1 when the RDI reports completed link training.
   //   - It clears to 0 when the FDI enters F_RESET, F_LINKERROR, or
   //     F_DISABLED (these states invalidate any prior presence detection).
   //   - Otherwise, it holds its current registered value (sticky).

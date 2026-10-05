@@ -142,7 +142,7 @@
 //                        and clarify that lp_state_req is Section 8.3.2.
 //   v0.0.9  2026-09-23  Req.3: add paired asynchronous mailboxes between the
 //                        lclk LTSM and the 800 MHz sbclk codec. Synchronize
-//                        codec busy and sideband presence back to lclk.
+//                        codec busy back to lclk.
 //   v0.0.10 2026-09-24  Add the UI-exact Standard Package SBINIT waveform,
 //                        raw/packet mux, and atomic iteration CDC mailboxes.
 //   v0.0.11 2026-09-24  Phase A: widen the private RX packet mailbox to
@@ -202,6 +202,8 @@
   // v0.0.25 2026-09-28  Connect separate PHY CSR channel (phy_csr_*) to u_phy_csr
   //                        with byte enables (Sections 6.1, 7.5). Add private
   //                        rdi_lp_linkerror input (Section 8.1).
+  // v0.0.26 2026-10-02  Drive RDI pl_inband_pres from LTSM training
+  //                        completion instead of packet reception during SBINIT.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -424,10 +426,6 @@ module logical_phy #(
   logic        adapter_rx_dp_err_q;
   logic        adapter_rx_fmt_err_q;
 
-  // Sideband presence tracking
-  logic        sb_rx_present_s;
-  logic        sb_rx_present_meta_q;
-  logic        sb_rx_present_sync_q;
   logic        sb_msg_timeout;
   logic        sb_stall_sent;
   // --------------------------------------- LTSM <-> raw SBINIT primitive
@@ -777,19 +775,14 @@ module logical_phy #(
     .dst_data   (codec_tx_cdc_data),
     .dst_valid  (codec_tx_cdc_valid)
   );
-
-  // Synchronize codec busy and sideband packet presence into lclk
+  // Synchronize codec busy into lclk.
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_busy_meta_q <= 1'b0;
       codec_tx_busy_sync_q <= 1'b0;
-      sb_rx_present_meta_q <= 1'b0;
-      sb_rx_present_sync_q <= 1'b0;
     end else begin
       codec_tx_busy_meta_q <= codec_tx_busy_combined;
       codec_tx_busy_sync_q <= codec_tx_busy_meta_q;
-      sb_rx_present_meta_q <= sb_rx_present_s;
-      sb_rx_present_sync_q <= sb_rx_present_meta_q;
     end
   end
 
@@ -835,17 +828,6 @@ module logical_phy #(
   assign codec_tx_valid         = codec_tx_pending_q;
   assign codec_tx_pkt           = codec_tx_packet_q;
   assign codec_tx_busy_combined = codec_tx_busy || codec_tx_pending_q;
-
-  // Track sideband presence in packet mode
-  always_ff @(posedge sbclk or negedge sbreset_n) begin
-    if (!sbreset_n) begin
-      sb_rx_present_s <= 1'b0;
-    end else if (!codec_packet_ready_s) begin
-      sb_rx_present_s <= 1'b0;
-    end else if (codec_rx_valid) begin
-      sb_rx_present_s <= 1'b1;
-    end
-  end
 
   // ===========================================================================
   // Sideband Physical Codec Instantiation (sb_codec)
@@ -1125,7 +1107,9 @@ module logical_phy #(
   //
   // In this build:
   //   - phy_retrain_req is derived from the adapter requesting RDI_REQ_RETRAIN.
-//   - phy_inband_pres indicates partner present in packet mode.
+  //   - phy_inband_pres is the LTSM training-complete indication. It must not
+  //     use packet reception, because SBINIT packet exchanges precede training
+  //     completion and must not assert the Table 114 signal.
   //   - cerror, nferror, and stall_req are tied to zero.
   //   - rdi_pl_state_sts is the registered RDI state and drives the public
   //     status output directly, so the Adapter observes the published state.
@@ -1151,7 +1135,7 @@ module logical_phy #(
     .phy_link_reset  (link_reset_out),
     .phy_retrain_req (rdi_lp_state_req == ucie_pkg::RDI_REQ_RETRAIN),
     .phy_train_error (train_error),
-    .phy_inband_pres (sb_rx_present_sync_q),
+    .phy_inband_pres (link_trained),
     .cerror          (1'b0),
     .nferror         (1'b0),
     .stall_req       (1'b0),

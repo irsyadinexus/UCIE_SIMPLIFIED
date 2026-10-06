@@ -141,6 +141,7 @@ module ut_rdi_sm;
   logic [3:0]  rdi_lp_state_req;
   logic        adapter_active_req;
   logic        rdi_lp_stallack;
+  logic        rdi_lp_linkerror;
   logic [3:0]  rdi_pl_state_sts;
   logic        rdi_pl_inband_pres;
   logic        rdi_pl_linkerror;
@@ -156,6 +157,7 @@ module ut_rdi_sm;
   logic        phy_inband_pres;
   logic        cerror, nferror;
   logic        stall_req, stall_ack;
+  logic        stall_complete;
   logic        local_active_req;
   int          errors;
 
@@ -180,6 +182,7 @@ module ut_rdi_sm;
   rdi_state_machine u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
     .rdi_lp_state_req(rdi_lp_state_req),
+    .rdi_lp_linkerror(rdi_lp_linkerror),
     .adapter_active_req(adapter_active_req),
     .rdi_lp_stallack(rdi_lp_stallack),
     .rdi_pl_state_sts(rdi_pl_state_sts),
@@ -197,6 +200,7 @@ module ut_rdi_sm;
     .phy_inband_pres(phy_inband_pres),
     .cerror(cerror), .nferror(nferror),
     .stall_req(stall_req), .stall_ack(stall_ack),
+    .stall_complete(stall_complete),
     .local_active_req(local_active_req)
   );
 
@@ -292,6 +296,7 @@ module ut_rdi_sm;
     cerror          = 1'b0;
     nferror         = 1'b0;
     stall_req       = 1'b0;
+    rdi_lp_linkerror= 1'b0;
 
     #5 lreset_n = 1'b1;
     @(negedge lclk);
@@ -371,6 +376,14 @@ module ut_rdi_sm;
     // LINKRESET holds until the LTSM RESET result (PLAN.md Phase D)
     // =======================================================================
     rdi_lp_state_req = RDI_REQ_LINKRESET;
+    hold_to("linkreset blocked before stall", RDI_STS_ACTIVE, 4);
+    stall_req = 1'b1;
+    @(posedge lclk); #0.1;
+    rdi_lp_stallack = 1'b1;
+    @(posedge lclk); #0.1;
+    stall_req = 1'b0;
+    @(posedge lclk); #0.1;
+    rdi_lp_stallack = 1'b0;
     step_to("linkreset", RDI_STS_LINKRESET);
     // An adapter ACTIVE request alone may not release LinkReset.
     rdi_lp_state_req = RDI_REQ_ACTIVE;
@@ -383,12 +396,13 @@ module ut_rdi_sm;
     @(posedge lclk); #0.1;
     chk("linkreset to reset", RDI_STS_RESET);
     phy_link_reset = 1'b0;
-    hold_to("reset holds", RDI_STS_RESET, 2);
-
+    hold_to("holding active in reset stays in reset", RDI_STS_RESET, 4);
+    rdi_lp_state_req = RDI_REQ_NOP;
+    @(posedge lclk); #0.1;
+    rdi_lp_state_req = RDI_REQ_ACTIVE;
     phy_link_trained      = 1'b1;
     phy_active_entry_done = 1'b1;
     step_to("active4", RDI_STS_ACTIVE);
-
     // =======================================================================
     // TRAINERROR preempts every state; LinkError recovers only via LinkReset
     // =======================================================================
@@ -416,15 +430,25 @@ module ut_rdi_sm;
     @(posedge lclk); #0.1;
     chk("recover reset", RDI_STS_RESET);
     phy_link_reset = 1'b0;
+    rdi_lp_state_req = RDI_REQ_NOP;
+    @(posedge lclk); #0.1;
+    rdi_lp_state_req = RDI_REQ_ACTIVE;
     phy_link_trained      = 1'b1;
     phy_active_entry_done = 1'b1;
-    rdi_lp_state_req      = RDI_REQ_ACTIVE;
     step_to("active5", RDI_STS_ACTIVE);
 
     // =======================================================================
     // DISABLED holds until the LTSM RESET result (PLAN.md Phase D)
     // =======================================================================
     rdi_lp_state_req = RDI_REQ_DISABLED;
+    hold_to("disabled blocked before stall", RDI_STS_ACTIVE, 4);
+    stall_req = 1'b1;
+    @(posedge lclk); #0.1;
+    rdi_lp_stallack = 1'b1;
+    @(posedge lclk); #0.1;
+    stall_req = 1'b0;
+    @(posedge lclk); #0.1;
+    rdi_lp_stallack = 1'b0;
     step_to("disabled", RDI_STS_DISABLED);
     rdi_lp_state_req = RDI_REQ_ACTIVE;
     hold_to("disabled held", RDI_STS_DISABLED, 6);
@@ -435,8 +459,9 @@ module ut_rdi_sm;
     @(posedge lclk); #0.1;
     chk("disabled to reset", RDI_STS_RESET);
     phy_link_reset = 1'b0;
-    hold_to("reset after disabled", RDI_STS_RESET, 2);
-
+    rdi_lp_state_req = RDI_REQ_NOP;
+    @(posedge lclk); #0.1;
+    rdi_lp_state_req = RDI_REQ_ACTIVE;
     phy_link_trained      = 1'b1;
     phy_active_entry_done = 1'b1;
     step_to("active6", RDI_STS_ACTIVE);
@@ -506,6 +531,39 @@ module ut_rdi_sm;
       $display("FAIL ut_rdi_sm: inband_pres not forwarded");
       errors = errors + 1;
     end
+    // =======================================================================
+    // P0-2: Adapter LinkError (rdi_lp_linkerror) priority to LINKERROR
+    // =======================================================================
+    rdi_lp_linkerror = 1'b1;
+    step_to("adapter fatal enters linkerror", RDI_STS_LINKERROR);
+    rdi_lp_linkerror = 1'b0;
+    hold_to("adapter linkerror holds without linkreset", RDI_STS_LINKERROR, 4);
+    rdi_lp_state_req = RDI_REQ_LINKRESET;
+    step_to("adapter linkerror recovers to linkreset", RDI_STS_LINKRESET);
+    phy_link_trained      = 1'b0;
+    phy_active_entry_done = 1'b0;
+    phy_link_reset        = 1'b1;
+    @(posedge lclk); #0.1;
+    chk("fatal recovery to reset", RDI_STS_RESET);
+    phy_link_reset = 1'b0;
+    rdi_lp_state_req = RDI_REQ_NOP;
+    @(posedge lclk); #0.1;
+
+    // =======================================================================
+    // P0-4: Direct transition from RESET to LINKRESET after sampled NOP
+    // =======================================================================
+    rdi_lp_state_req = RDI_REQ_LINKRESET;
+    step_to("reset to linkreset", RDI_STS_LINKRESET);
+    phy_link_reset = 1'b1;
+    @(posedge lclk); #0.1;
+    chk("return to reset from linkreset", RDI_STS_RESET);
+    phy_link_reset = 1'b0;
+    rdi_lp_state_req = RDI_REQ_NOP;
+    @(posedge lclk); #0.1;
+    rdi_lp_state_req = RDI_REQ_ACTIVE;
+    phy_link_trained      = 1'b1;
+    phy_active_entry_done = 1'b1;
+    step_to("active final", RDI_STS_ACTIVE);
 
     // Phase F: export unit evidence JSON upon clean zero-error completion.
     // Spec ref: UCIe 1.0 Section 8.1.5, Section 8.1.7, Table 114, and

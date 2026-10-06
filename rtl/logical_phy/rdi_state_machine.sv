@@ -124,6 +124,7 @@ module rdi_state_machine (
 
   // ---- Adapter side (RDI). Table 114, the subset this project implements.
   input  rdi_req_t    rdi_lp_state_req,
+  input  logic        rdi_lp_linkerror = 1'b0, // Adapter fatal indication
   input  logic        adapter_active_req, // public compatibility, policy-inert
   output rdi_sts_t    rdi_pl_state_sts,
   input  logic        rdi_lp_stallack,
@@ -145,7 +146,7 @@ module rdi_state_machine (
   input  logic        nferror,               // non-fatal error
   input  logic        stall_req,             // local stall request
   output logic        stall_ack,             // registered stall acknowledgement
-
+  output logic        stall_complete,        // four-phase handshake complete
   // ---- Active-entry result
   output logic        local_active_req     // completed local ACTIVE result
 );
@@ -153,6 +154,8 @@ module rdi_state_machine (
   import ucie_pkg::*;
 
   rdi_sts_t state_q, state_d;
+  logic     reset_req_sampled_q, reset_req_sampled_d;
+
 
   // =========================================================================
   // Completed Active Entry qualification  (spec 8.1.6)
@@ -177,8 +180,13 @@ module rdi_state_machine (
   // value computed by the always_comb block is registered.
   // =========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) state_q <= RDI_STS_RESET;
-    else           state_q <= state_d;
+    if (!lreset_n) begin
+      state_q             <= RDI_STS_RESET;
+      reset_req_sampled_q <= 1'b0;
+    end else begin
+      state_q             <= state_d;
+      reset_req_sampled_q <= reset_req_sampled_d;
+    end
   end
 
   // =========================================================================
@@ -203,32 +211,50 @@ module rdi_state_machine (
   //   register value outside the set above falls back to RESET.
   // =========================================================================
   always_comb begin
-    state_d = state_q;
+    state_d             = state_q;
+    reset_req_sampled_d = reset_req_sampled_q;
+
+    if (state_q != RDI_STS_RESET) begin
+      reset_req_sampled_d = 1'b0;
+    end else if (rdi_lp_state_req == RDI_REQ_NOP) begin
+      reset_req_sampled_d = 1'b1;
+    end
 
     if (phy_train_error) begin
       state_d = RDI_STS_LINKERROR;
     end else if (phy_link_reset) begin
       state_d = RDI_STS_RESET;
+    end else if ((state_q == RDI_STS_LINKERROR) &&
+                 (rdi_lp_state_req == RDI_REQ_LINKRESET)) begin
+      state_d = RDI_STS_LINKRESET;
+    end else if (rdi_lp_linkerror && (state_q != RDI_STS_LINKRESET)) begin
+      state_d = RDI_STS_LINKERROR;
     end else begin
       case (state_q)
         RDI_STS_RESET: begin
-          // Adapter must drive a stable request to leave RESET, and the
-          // logical PHY must have completed Active Entry.
-          if (rdi_lp_state_req == RDI_REQ_ACTIVE && active_entry_complete)
+          // Adapter must drive a stable request to leave RESET after sampling NOP,
+          // and the logical PHY must have completed Active Entry.
+          if (reset_req_sampled_q &&
+              rdi_lp_state_req == RDI_REQ_ACTIVE &&
+              active_entry_complete)
             state_d = RDI_STS_ACTIVE;
-          else if (rdi_lp_state_req == RDI_REQ_DISABLED)
+          else if (reset_req_sampled_q &&
+                   rdi_lp_state_req == RDI_REQ_DISABLED)
             state_d = RDI_STS_DISABLED;
+          else if (reset_req_sampled_q &&
+                   rdi_lp_state_req == RDI_REQ_LINKRESET)
+            state_d = RDI_STS_LINKRESET;
         end
 
         RDI_STS_ACTIVE: begin
           // L1 and L2 are not supported: the request is answered with PMNAK
-          // and the LTSM is not touched. RETRAIN is not supported either and
-          // is not published, so it falls into default and holds ACTIVE.
+          // and the LTSM is not touched. LinkReset and Disabled wait for the
+          // integrated four-phase stall handshake to complete.
           case (rdi_lp_state_req)
             RDI_REQ_L1,
             RDI_REQ_L2:        state_d = RDI_STS_PMNAK;
-            RDI_REQ_LINKRESET: state_d = RDI_STS_LINKRESET;
-            RDI_REQ_DISABLED:  state_d = RDI_STS_DISABLED;
+            RDI_REQ_LINKRESET: if (stall_complete) state_d = RDI_STS_LINKRESET;
+            RDI_REQ_DISABLED:  if (stall_complete) state_d = RDI_STS_DISABLED;
             default:           state_d = RDI_STS_ACTIVE;
           endcase
         end
@@ -395,6 +421,8 @@ module rdi_state_machine (
   assign stall_ack = (stall_phase_q == STALL_ACKED) ||
                      (stall_phase_q == STALL_RELEASED);
 
+  assign stall_complete = (stall_phase_q == STALL_RELEASED) &&
+                          !rdi_lp_stallack;
   // =========================================================================
   // Unused signal suppression
   // =========================================================================

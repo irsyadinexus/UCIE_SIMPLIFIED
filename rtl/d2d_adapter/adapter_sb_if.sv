@@ -210,6 +210,7 @@ module adapter_sb_if #(
   output logic                adapter_fatal,
   output logic                adapter_linkerror,
   output logic                stage3_done,
+  output logic                adapter_capability_done,
   output logic                protocol_error,
   output logic                fdi_format_error,
   output logic                sb_credit_returned,
@@ -370,6 +371,11 @@ module adapter_sb_if #(
   logic          rem_fatal_event;
   logic          s3_fatal_event;
 
+  // Packet-integrity qualification (P1-2: fatal before packet effects)
+  wire           adapter_sb_rx_integrity_err = adapter_sb_rx_cp_error || adapter_sb_rx_dp_error || adapter_sb_rx_format_error;
+  wire           adapter_sb_rx_clean         = adapter_sb_rx_valid && adapter_sb_rx_ready && !adapter_sb_rx_integrity_err;
+  wire           adapter_sb_rx_err_event     = adapter_sb_rx_valid && adapter_sb_rx_ready && adapter_sb_rx_integrity_err;
+
   // --- FDI Credit Accounting Registers ---
   logic [2:0]    fdi_rx_crd_q,     fdi_rx_crd_d;   // Inbound request capacity (init 4)
   logic [2:0]    fdi_tx_crd_q,     fdi_tx_crd_d;   // Protocol Layer credits for Adapter TX (init 4)
@@ -442,6 +448,7 @@ module adapter_sb_if #(
   logic          owed_rsp_lr_q,        owed_rsp_lr_d;
 
   logic          stage3_done_q,        stage3_done_d;
+  logic          adapter_capability_done_q, adapter_capability_done_d;
   logic          state_req_vld_q,      state_req_vld_d;
   logic [3:0]    state_req_q,          state_req_d;
 
@@ -691,7 +698,7 @@ module adapter_sb_if #(
           end
         end
         // Check for inbound Configuration Request from remote partner (adapter_sb_rx)
-        else if (adapter_sb_rx_valid && adapter_sb_rx_ready &&
+        else if (adapter_sb_rx_clean &&
                  (sb_packet_kind(adapter_sb_rx_packet.opcode) == SB_PKT_REG_REQ)) begin
           r_hdr = sb_encode_header(adapter_sb_rx_packet);
 
@@ -898,7 +905,7 @@ module adapter_sb_if #(
     rem_fatal_event        = 1'b0;
 
     // Per-entry 8 ms message timer (counts while RDI is Active)
-    if (rdi_pl_state_sts == RDI_STS_ACTIVE) begin
+    if (rdi_pl_state_sts == RDI_STS_ACTIVE || rdi_pl_state_sts == RDI_STS_PMNAK) begin
       for (int i = 0; i < 4; i++) begin
         if (rem_table_valid_q[i]) begin
           if (rem_table_timer_q[i] >= C_SB_MSG) begin
@@ -921,7 +928,7 @@ module adapter_sb_if #(
     end
 
     // Process Received Completions from peer on adapter_sb_rx
-    if (adapter_sb_rx_valid && adapter_sb_rx_ready &&
+    if (adapter_sb_rx_clean &&
         (sb_packet_kind(adapter_sb_rx_packet.opcode) == SB_PKT_COMPLETION)) begin
       if (rem_match_cnt == 0) begin
         // Unmatched completion is a protocol error and fatal
@@ -977,8 +984,9 @@ module adapter_sb_if #(
 
   // Single-driver sticky error updates
   assign fdi_format_err_d = fdi_format_err_q | fdi_rx_format_err_event | fdi_decode_format_err_event;
-  assign protocol_err_d   = protocol_err_q   | fdi_protocol_err_event  | rem_protocol_err_event;
-  assign adapter_fatal_d  = adapter_fatal_q  | fdi_fatal_event         | rem_fatal_event | s3_fatal_event;
+  assign protocol_err_d   = protocol_err_q   | fdi_protocol_err_event  | rem_protocol_err_event | adapter_sb_rx_err_event;
+  assign adapter_fatal_d  = (rdi_pl_state_sts == RDI_STS_RESET) ? 1'b0 :
+                           (adapter_fatal_q | fdi_fatal_event | rem_fatal_event | s3_fatal_event | adapter_sb_rx_err_event);
 
   // ==========================================================================
   // Section 5: Remote Credit Accounting (UCIe 1.0 Section 6.1.3)
@@ -996,7 +1004,7 @@ module adapter_sb_if #(
     add_crd             = 0;
 
     // Incoming Credit Returns on adapter_sb_rx
-    if (adapter_sb_rx_valid && adapter_sb_rx_ready) begin
+    if (adapter_sb_rx_clean) begin
       if (adapter_sb_rx_packet.cr) begin
         add_crd = add_crd + 1;
       end
@@ -1294,13 +1302,18 @@ module adapter_sb_if #(
     owed_rsp_lr_d        = owed_rsp_lr_q;
 
     stage3_done_d        = stage3_done_q;
+    adapter_capability_done_d = adapter_capability_done_q;
     state_req_vld_d      = state_req_vld_q;
     state_req_d          = state_req_q;
     s3_fatal_event       = 1'b0;
     s3_timeout_pulse     = 1'b0;
+    if (adapter_sb_rx_err_event) begin
+      s3_fatal_event = 1'b1;
+      s3_state_d     = S3_FATAL;
+    end
 
     // Reset Stage 3 state whenever RDI exits Active
-    if (rdi_pl_state_sts != RDI_STS_ACTIVE) begin
+    if ((rdi_pl_state_sts != RDI_STS_ACTIVE) && (rdi_pl_state_sts != RDI_STS_PMNAK)) begin
       s3_state_d           = S3_RESET;
       cap_timer_d          = 32'd0;
       ad0_timer_d          = 32'd0;
@@ -1313,6 +1326,7 @@ module adapter_sb_if #(
       owed_rsp_dis_d       = 1'b0;
       owed_rsp_lr_d        = 1'b0;
       stage3_done_d        = 1'b0;
+      adapter_capability_done_d = 1'b0;
       state_req_vld_d      = 1'b0;
       state_req_d          = RDI_REQ_NOP;
     end else begin
@@ -1365,6 +1379,7 @@ module adapter_sb_if #(
                   ((adapter_sb_rx_packet.data & 64'h91) == 64'h91)) begin
                 // Capability negotiation succeeded: Streaming, Raw Mode, Stack 0
                 s3_state_d  = S3_ACTIVE_SEND;
+                adapter_capability_done_d = 1'b1;
                 ad0_timer_d = 32'd0;
               end else begin
                 // Incompatible capability
@@ -1496,7 +1511,7 @@ module adapter_sb_if #(
       endcase
 
       // Track incoming Link Management packets on adapter_sb_rx
-      if (adapter_sb_rx_valid && adapter_sb_rx_ready &&
+      if (adapter_sb_rx_clean &&
           (sb_packet_kind(adapter_sb_rx_packet.opcode) == SB_PKT_MESSAGE)) begin
         if (adapter_sb_rx_packet.msg_code == MC_LM_RDI_REQ) begin
           case (adapter_sb_rx_packet.msg_subcode)
@@ -1541,6 +1556,7 @@ module adapter_sb_if #(
   assign adapter_state_req_vld = state_req_vld_q;
   assign adapter_state_req     = state_req_q;
   assign stage3_done           = stage3_done_q;
+  assign adapter_capability_done = adapter_capability_done_q;
 
   // ==========================================================================
   // Section 9: Transmit Arbiter for adapter_sb_tx (<-> logical_phy)
@@ -1711,6 +1727,7 @@ module adapter_sb_if #(
       owed_rsp_lr_q         <= 1'b0;
 
       stage3_done_q         <= 1'b0;
+      adapter_capability_done_q <= 1'b0;
       state_req_vld_q       <= 1'b0;
       state_req_q           <= RDI_REQ_NOP;
 
@@ -1776,6 +1793,7 @@ module adapter_sb_if #(
       owed_rsp_lr_q         <= owed_rsp_lr_d;
 
       stage3_done_q         <= stage3_done_d;
+      adapter_capability_done_q <= adapter_capability_done_d;
       state_req_vld_q       <= state_req_vld_d;
       state_req_q           <= state_req_d;
 

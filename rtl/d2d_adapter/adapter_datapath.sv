@@ -128,15 +128,12 @@ module adapter_datapath #(
   // --------------------------------------------------------------------------
   // Pipeline Registers
   // --------------------------------------------------------------------------
-  // tx_data_q / tx_valid_q : FDI -> RDI direction. Registered for timing;
-  //   the single register stage satisfies the Stage 1+ requirement of
-  //   spec 8.1. tx_valid_q captures the conjunction of lp_valid, lp_irdy,
-  //   and !stall_active so that a valid beat is only forwarded when the
-  //   handshake is complete and the link is not stalled.
+  // tx_data_q / tx_valid_q : FDI -> RDI direction one-entry elastic stage.
+  // Holds data and valid together. While the transfer is blocked (rdi_pl_trdy=0
+  // or stall_active=1), the stored tuple is held stable and pl_trdy is de-asserted.
+  // A new transfer is accepted from FDI only when empty or simultaneously draining.
   //
-  // rx_data_q / rx_valid_q : RDI -> FDI direction. Registered. Captures
-  //   rdi_pl_data and rdi_pl_valid unconditionally (the PHY controls when
-  //   valid data appears on the RDI).
+  // rx_data_q / rx_valid_q : RDI -> FDI direction registered pipeline stage.
   // --------------------------------------------------------------------------
   logic [NBYTES*8-1:0] tx_data_q;
   logic                tx_valid_q;
@@ -144,22 +141,12 @@ module adapter_datapath #(
   logic [NBYTES*8-1:0] rx_data_q;
   logic                rx_valid_q;
 
+  wire rdi_tx_transfer = rdi_lp_valid && rdi_lp_irdy && rdi_pl_trdy;
+  wire tx_ready        = (!tx_valid_q || rdi_tx_transfer) && !stall_active;
+  wire fdi_tx_transfer = lp_valid && lp_irdy && pl_trdy;
+
   // -------------------------------------------------------------------------
-  // always_ff: Tx/Rx Pipeline Registers
-  //
-  // Registers the Tx (FDI -> RDI) and Rx (RDI -> FDI) data paths on lclk;
-  // reset clears all four registers so no spurious data is driven during
-  // reset.
-  //
-  //   tx_data_q  <= lp_data
-  //   tx_valid_q <= lp_valid && lp_irdy && !stall_active
-  //     The conjunction requires valid data, Protocol Layer ready, and an
-  //     inactive stall gate. The data registers still capture source values
-  //     while stalled, but output valid and ready prevent transfer.
-  //   rx_data_q  <= rdi_pl_data ; rx_valid_q <= rdi_pl_valid
-  //
-  // Spec ref: 8.1 (pipeline stage), 4.1.x (byte/valid framing),
-  //           8.3.1 (stall behaviour).
+  // always_ff: One-entry Elastic Stage & RX Pipeline Register
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -168,33 +155,25 @@ module adapter_datapath #(
       rx_data_q  <= {NBYTES*8{1'b0}};
       rx_valid_q <= 1'b0;
     end else begin
-      // Data registers continue to capture source values while stalled.
-      // Output valid and ready gates prevent transfer in ACKED or RELEASED.
-      tx_data_q  <= lp_data;
-      tx_valid_q <= lp_valid && lp_irdy && !stall_active;
+      if (fdi_tx_transfer) begin
+        tx_valid_q <= 1'b1;
+        tx_data_q  <= lp_data;
+      end else if (rdi_tx_transfer) begin
+        tx_valid_q <= 1'b0;
+      end
+
       rx_data_q  <= rdi_pl_data;
       rx_valid_q <= rdi_pl_valid;
     end
   end
 
   // -------------------------------------------------------------------------
-  // always_comb: Output Multiplexing and x8 Width Degrade
-  //
-  // Single combinational driver for every datapath output, so there are no
-  // multi-driver conflicts.
-  //
-  // FDI -> RDI: rdi_lp_irdy and rdi_lp_valid are both suppressed while the
-  // registered Adapter stall handshake is ACKED or RELEASED.
-  // RDI -> FDI: pl_trdy is also suppressed during both phases.
-  //
-  // Spec ref: 4.1.1 (Byte to Lane Mapping), 4.1.2 (Valid Framing),
-  //           4.3.7 (Width Degrade in Standard Package Interfaces),
-  //           8.3.1 (stall gating).
+  // always_comb: Output Multiplexing and Gating
   // -------------------------------------------------------------------------
   always_comb begin
     // FDI -> RDI
-    rdi_lp_irdy  = lp_irdy && !stall_active;
     rdi_lp_valid = tx_valid_q && !stall_active;
+    rdi_lp_irdy  = tx_valid_q && !stall_active;
     rdi_lp_data  = tx_data_q;
 
     // x8 width degrade narrows the usable byte field to lanes 0-7.
@@ -203,10 +182,10 @@ module adapter_datapath #(
     end
 
     // RDI -> FDI
+    pl_trdy      = tx_ready;
     pl_valid     = rx_valid_q;
     pl_data      = rx_data_q;
-    pl_trdy      = rdi_pl_trdy && !stall_active;
-    pl_stream    = lp_stream;
+    pl_stream    = STREAM_ID_S0_STREAMING;
   end
 
   // -------------------------------------------------------------------------
@@ -221,6 +200,10 @@ module adapter_datapath #(
   // -------------------------------------------------------------------------
   logic unused_stallack;
   assign unused_stallack = lp_stallack;
+  logic [7:0] unused_lp_stream;
+  assign unused_lp_stream = lp_stream;
+  logic unused_rx_active_sts;
+  assign unused_rx_active_sts = lp_rx_active_sts;
 
 endmodule
 

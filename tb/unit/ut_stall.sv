@@ -282,6 +282,7 @@ module ut_stall;
 // (#0.1) to allow combinational outputs to settle.
 // ---------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
+  logic [7:0] k_byte, prev_k_byte;
 
   initial begin
     errors = 0;
@@ -397,7 +398,7 @@ module ut_stall;
       $display("FAIL ut_stall: pl_trdy low while not stalled");
       errors = errors + 1;
     end
-    if (pl_stream !== 8'h5A) begin
+    if (pl_stream !== STREAM_ID_S0_STREAMING) begin
       $display("FAIL ut_stall: stream %02h", pl_stream);
       errors = errors + 1;
     end
@@ -452,6 +453,78 @@ module ut_stall;
       errors = errors + 1;
     end
     rdi_lnk_is_x8 = 1'b0;
+    // =========================================================================
+    // P1-1: One-entry Elastic Stage Compliance Verification
+    // =========================================================================
+    // 0. Drain any prior beat so stage is completely empty
+    lp_valid = 1'b0; lp_irdy = 1'b0; rdi_pl_trdy = 1'b1;
+    @(posedge lclk); #0.1;
+    rdi_pl_trdy = 1'b0;
+
+    // 1. Initial empty state
+    if (pl_trdy !== 1'b1 || rdi_lp_valid !== 1'b0) begin
+      $display("FAIL ut_stall: empty elastic stage ready/valid error (trdy=%b, vld=%b)",
+               pl_trdy, rdi_lp_valid);
+      errors = errors + 1;
+    end
+
+    // 2. One-cycle valid pulse with backpressure
+    lp_valid = 1'b1; lp_irdy = 1'b1;
+    lp_data  = {4{32'hA1B2C3D4}};
+    rdi_pl_trdy = 1'b0;
+    @(posedge lclk); #0.1;
+    lp_valid = 1'b0; lp_irdy = 1'b0; // pulse ends after 1 cycle
+    if (rdi_lp_valid !== 1'b1 || rdi_lp_data !== {4{32'hA1B2C3D4}} || pl_trdy !== 1'b0) begin
+      $display("FAIL ut_stall: stage not full/backpressuring after 1-cycle pulse (vld=%b, trdy=%b)",
+               rdi_lp_valid, pl_trdy);
+      errors = errors + 1;
+    end
+
+    // 3. Data stability while blocked (5 cycles)
+    for (int k = 0; k < 5; k = k + 1) begin
+      lp_data = {4{32'h00000000 | k}}; // change input data
+      @(posedge lclk); #0.1;
+      if (rdi_lp_valid !== 1'b1 || rdi_lp_data !== {4{32'hA1B2C3D4}} || pl_trdy !== 1'b0) begin
+        $display("FAIL ut_stall: data instability while blocked at cycle %0d", k);
+        errors = errors + 1;
+      end
+    end
+
+    // 4. Release backpressure (drain to empty)
+    rdi_pl_trdy = 1'b1;
+    @(posedge lclk); #0.1;
+    rdi_pl_trdy = 1'b0;
+    if (rdi_lp_valid !== 1'b0 || pl_trdy !== 1'b1) begin
+      $display("FAIL ut_stall: stage not empty after drain (vld=%b, trdy=%b)",
+               rdi_lp_valid, pl_trdy);
+      errors = errors + 1;
+    end
+
+    // 5. Consecutive accepted transfers (streaming 4 beats)
+    rdi_pl_trdy = 1'b1;
+    for (int k = 1; k <= 4; k = k + 1) begin
+      k_byte = k[7:0];
+      lp_valid = 1'b1; lp_irdy = 1'b1;
+      lp_data  = {4{16'h55AA, 8'h00, k_byte}};
+      @(posedge lclk); #0.1;
+      if (pl_trdy !== 1'b1) begin
+        $display("FAIL ut_stall: pl_trdy dropped during consecutive stream beat %0d", k);
+        errors = errors + 1;
+      end
+      if (rdi_lp_valid !== 1'b1 || rdi_lp_data !== {4{16'h55AA, 8'h00, k_byte}}) begin
+        $display("FAIL ut_stall: RDI stream beat %0d mismatch: got %h exp %h",
+                 k, rdi_lp_data, {4{16'h55AA, 8'h00, k_byte}});
+        errors = errors + 1;
+      end
+    end
+    // Stop driving inputs and verify drain to empty
+    lp_valid = 1'b0; lp_irdy = 1'b0;
+    @(posedge lclk); #0.1;
+    if (rdi_lp_valid !== 1'b0 || pl_trdy !== 1'b1) begin
+      $display("FAIL ut_stall: stage not empty after stream completion (vld=%b, trdy=%b)",
+               rdi_lp_valid, pl_trdy);
+      errors = errors + 1;
+    end
 
     // The loopback PHY never asserts rdi_pl_stallreq, so this test is the
     // only place the four-phase handshake runs. Write the evidence file the

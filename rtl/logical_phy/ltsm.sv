@@ -323,6 +323,7 @@ module ltsm #(
   output logic        transition_active,    // private transition in progress
   output logic        clear_start_link_train, // one-cycle Start-copy clear
   output logic        link_trained,         // LTSM reached ACTIVE
+  output logic        phy_training_done,    // physical training reached LINKINIT
   output logic        train_error,          // unrecoverable failure
   output logic        link_reset_out,       // drives RDI RESET indication
   output logic        phy_retrain_done,     // fixed profile never retrains
@@ -337,7 +338,7 @@ module ltsm #(
   output logic [4:0]  sb_tx_opcode,
   output logic [2:0]  sb_tx_srcid,
   output logic [2:0]  sb_tx_dstid,
-  output logic [7:0]  sb_tx_msginfo,
+  output logic [15:0] sb_tx_msginfo,
   output logic [7:0]  sb_tx_msgcode,
   output logic [7:0]  sb_tx_msgsubcode,
   output logic [7:0]  sb_tx_be,
@@ -352,7 +353,7 @@ module ltsm #(
   input  logic [4:0]  sb_rx_opcode,
   input  logic [2:0]  sb_rx_srcid,
   input  logic [2:0]  sb_rx_dstid,
-  input  logic [7:0]  sb_rx_msginfo,
+  input  logic [15:0] sb_rx_msginfo,
   input  logic [7:0]  sb_rx_msgcode,
   input  logic [7:0]  sb_rx_msgsubcode,
   input  logic [63:0] sb_rx_payload,
@@ -414,6 +415,7 @@ module ltsm #(
   logic reset_min_done_q, reset_min_done_d;
   logic reset_trigger_pending_q, reset_trigger_pending_d;
   logic recovery_reset_q, recovery_reset_d;
+  logic        reset_rdi_req_sampled_q;
 
   logic [1:0]  sbinit_match_streak_q, sbinit_match_streak_d;
   logic        pattern_trigger_pending_q, pattern_trigger_pending_d;
@@ -436,7 +438,7 @@ module ltsm #(
   logic        peer_req_valid_q, peer_req_valid_d;
   logic        peer_resp_pending_q, peer_resp_pending_d;
   logic        peer_replay_pending_q, peer_replay_pending_d;
-  logic [98:0] peer_req_identity_q, peer_req_identity_d;
+  logic [106:0] peer_req_identity_q, peer_req_identity_d;
   logic        phase_b_state_complete;
 
   // ---- Phase C Active Entry state
@@ -501,7 +503,7 @@ module ltsm #(
       peer_req_valid_q                <= 1'b0;
       peer_resp_pending_q             <= 1'b0;
       peer_replay_pending_q           <= 1'b0;
-      peer_req_identity_q             <= 99'd0;
+      peer_req_identity_q             <= 107'd0;
       active_ready_q                  <= 1'b0;
       active_req_accepted_q           <= 1'b0;
       active_rsp_received_q           <= 1'b0;
@@ -582,6 +584,18 @@ module ltsm #(
     else           state_q_prev <= state_q;
   end
 
+  // A Reset epoch accepts an RDI Active edge only after it samples the
+  // equivalent of NOP. This prevents a stale held Active level from
+  // restarting the physical link after LinkReset or Disabled recovery.
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n)
+      reset_rdi_req_sampled_q <= 1'b0;
+    else if (state_q != LT_RESET)
+      reset_rdi_req_sampled_q <= 1'b0;
+    else if (!rdi_active_req && !rdi_linkreset_req && !rdi_disabled_req)
+      reset_rdi_req_sampled_q <= 1'b1;
+  end
+
   wire state_entry = (state_q != state_q_prev);
   wire reset_entry = state_entry && (state_q == LT_RESET);
 
@@ -617,47 +631,47 @@ module ltsm #(
     endcase
   endfunction
 
-  function automatic logic [7:0] msg_req_code(input ltsm_state_t s);
+  function automatic logic [7:0] expected_req_code(input ltsm_state_t s, input logic [2:0] step);
     case (s)
       LT_MBINIT_PARAM,
       LT_MBINIT_CAL,
       LT_MBINIT_RPCLK,
       LT_MBINIT_RPVAL,
       LT_MBINIT_REVMB,
-      LT_MBINIT_RPMB: msg_req_code = MC_MBINIT_REQ;
+      LT_MBINIT_RPMB:  expected_req_code = MC_MBINIT_REQ;
       LT_MB_VALVREF,
       LT_MB_DATAVREF,
       LT_MB_SPEEDIDLE,
       LT_MB_TXSELFCAL,
-      LT_MB_RXCLKCAL,
-      LT_MB_VTCENTER,
+      LT_MB_RXCLKCAL:  expected_req_code = MC_MBTRAIN_REQ;
+      LT_MB_VTCENTER:  expected_req_code = (step == 3'd1) ? 8'hBA : MC_MBTRAIN_REQ;
       LT_MB_DTVREF1,
       LT_MB_RXDESKEW,
       LT_MB_DTCENTER2,
-      LT_MB_LINKSPEED: msg_req_code = MC_MBTRAIN_REQ;
-      default:         msg_req_code = MC_NOP_CRD;
+      LT_MB_LINKSPEED: expected_req_code = 8'hBA;
+      default:         expected_req_code = MC_NOP_CRD;
     endcase
   endfunction
 
-  function automatic logic [7:0] msg_rsp_code(input ltsm_state_t s);
+  function automatic logic [7:0] expected_rsp_code(input ltsm_state_t s, input logic [2:0] step);
     case (s)
       LT_MBINIT_PARAM,
       LT_MBINIT_CAL,
       LT_MBINIT_RPCLK,
       LT_MBINIT_RPVAL,
       LT_MBINIT_REVMB,
-      LT_MBINIT_RPMB: msg_rsp_code = MC_MBINIT_RSP;
+      LT_MBINIT_RPMB:  expected_rsp_code = MC_MBINIT_RSP;
       LT_MB_VALVREF,
       LT_MB_DATAVREF,
       LT_MB_SPEEDIDLE,
       LT_MB_TXSELFCAL,
       LT_MB_RXCLKCAL,
-      LT_MB_VTCENTER,
+      LT_MB_VTCENTER:  expected_rsp_code = MC_MBTRAIN_RSP;
       LT_MB_DTVREF1,
       LT_MB_RXDESKEW,
       LT_MB_DTCENTER2,
-      LT_MB_LINKSPEED: msg_rsp_code = MC_MBTRAIN_RSP;
-      default:         msg_rsp_code = MC_NOP_CRD;
+      LT_MB_LINKSPEED: expected_rsp_code = 8'hB5;
+      default:         expected_rsp_code = MC_NOP_CRD;
     endcase
   endfunction
 
@@ -667,11 +681,11 @@ module ltsm #(
       LT_MBINIT_RPVAL,
       LT_MBINIT_REVMB,
       LT_MBINIT_RPMB:  sequence_last_step = 3'd3;
-      LT_MB_DTVREF1:   sequence_last_step = 3'd2;
       LT_MB_VALVREF,
       LT_MB_DATAVREF,
       LT_MB_RXCLKCAL,
       LT_MB_VTCENTER,
+      LT_MB_DTVREF1,
       LT_MB_RXDESKEW,
       LT_MB_DTCENTER2,
       LT_MB_LINKSPEED: sequence_last_step = 3'd1;
@@ -679,125 +693,140 @@ module ltsm #(
     endcase
   endfunction
 
-  function automatic logic [7:0] msg_subcode(
+  function automatic logic [7:0] expected_req_subcode(
     input ltsm_state_t s,
     input logic [2:0] step
   );
     case (s)
-      LT_MBINIT_PARAM: msg_subcode = MS_PARAM_CFG;
-      LT_MBINIT_CAL:   msg_subcode = MS_CAL_DONE;
+      LT_MBINIT_PARAM: expected_req_subcode = MS_PARAM_CFG;
+      LT_MBINIT_CAL:   expected_req_subcode = MS_CAL_DONE;
 
       LT_MBINIT_RPCLK: begin
         case (step)
-          3'd0: msg_subcode = MS_RPCLK_INIT;
-          3'd1: msg_subcode = MS_RPCLK_RESULT;
-          3'd2: msg_subcode = MS_RPCLK_APPLY;
-          3'd3: msg_subcode = MS_RPCLK_CHKINI;
-          3'd4: msg_subcode = MS_RPCLK_CHKRES;
-          3'd5: msg_subcode = MS_RPCLK_DONE;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_RPCLK_INIT;
+          3'd1: expected_req_subcode = MS_RPCLK_RESULT;
+          3'd2: expected_req_subcode = MS_RPCLK_APPLY;
+          3'd3: expected_req_subcode = MS_RPCLK_CHKINI;
+          3'd4: expected_req_subcode = MS_RPCLK_CHKRES;
+          3'd5: expected_req_subcode = MS_RPCLK_DONE;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MBINIT_RPVAL: begin
         case (step)
-          3'd0: msg_subcode = MS_RPVAL_INIT;
-          3'd1: msg_subcode = MS_RPVAL_RESULT;
-          3'd2: msg_subcode = MS_RPVAL_APPLY;
-          3'd3: msg_subcode = MS_RPVAL_DONE;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_RPVAL_INIT;
+          3'd1: expected_req_subcode = MS_RPVAL_RESULT;
+          3'd2: expected_req_subcode = MS_RPVAL_APPLY;
+          3'd3: expected_req_subcode = MS_RPVAL_DONE;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MBINIT_REVMB: begin
         case (step)
-          3'd0: msg_subcode = MS_REVMB_INIT;
-          3'd1: msg_subcode = MS_REVMB_CLRERR;
-          3'd2: msg_subcode = MS_REVMB_RESULT;
-          3'd3: msg_subcode = MS_REVMB_DONE;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_REVMB_INIT;
+          3'd1: expected_req_subcode = MS_REVMB_CLRERR;
+          3'd2: expected_req_subcode = MS_REVMB_RESULT;
+          3'd3: expected_req_subcode = MS_REVMB_DONE;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MBINIT_RPMB: begin
         case (step)
-          3'd0: msg_subcode = MS_RPMB_START;
-          3'd1: msg_subcode = MS_RPMB_APPLY;
-          3'd2: msg_subcode = MS_RPMB_END;
-          3'd3: msg_subcode = MS_RPMB_END2;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_RPMB_START;
+          3'd1: expected_req_subcode = MS_RPMB_APPLY;
+          3'd2: expected_req_subcode = MS_RPMB_END;
+          3'd3: expected_req_subcode = MS_RPMB_END2;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MB_VALVREF: begin
         case (step)
-          3'd0: msg_subcode = MS_VALVREF_START;
-          3'd1: msg_subcode = MS_VALVREF_END;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_VALVREF_START;
+          3'd1: expected_req_subcode = MS_VALVREF_END;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MB_DATAVREF: begin
         case (step)
-          3'd0: msg_subcode = MS_DATAVREF_START;
-          3'd1: msg_subcode = MS_DATAVREF_END;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_DATAVREF_START;
+          3'd1: expected_req_subcode = MS_DATAVREF_END;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
-      LT_MB_SPEEDIDLE: msg_subcode = MS_SPEEDIDLE_DONE;
-      LT_MB_TXSELFCAL: msg_subcode = MS_TXSELFCAL_DONE;
+      LT_MB_SPEEDIDLE: expected_req_subcode = MS_SPEEDIDLE_DONE;
+      LT_MB_TXSELFCAL: expected_req_subcode = MS_TXSELFCAL_DONE;
 
       LT_MB_RXCLKCAL: begin
         case (step)
-          3'd0: msg_subcode = MS_RXCLKCAL_START;
-          3'd1: msg_subcode = MS_RXCLKCAL_DONE;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_RXCLKCAL_START;
+          3'd1: expected_req_subcode = MS_RXCLKCAL_DONE;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MB_VTCENTER: begin
         case (step)
-          3'd0: msg_subcode = MS_VTC_START;
-          3'd1: msg_subcode = MS_VTC_DONE;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_VTC_START;
+          3'd1: expected_req_subcode = MS_VTC_DONE;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MB_DTVREF1: begin
         case (step)
-          3'd0: msg_subcode = MS_DTV_START;
-          3'd1: msg_subcode = 8'h0F;
-          3'd2: msg_subcode = MS_DTV_END;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_DTV_START;
+          3'd1: expected_req_subcode = MS_DTV_END;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MB_RXDESKEW: begin
         case (step)
-          3'd0: msg_subcode = MS_DESKEW_START;
-          3'd1: msg_subcode = MS_DESKEW_END;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_DESKEW_START;
+          3'd1: expected_req_subcode = MS_DESKEW_END;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MB_DTCENTER2: begin
         case (step)
-          3'd0: msg_subcode = MS_DTC2_START;
-          3'd1: msg_subcode = MS_DTC2_END;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_DTC2_START;
+          3'd1: expected_req_subcode = MS_DTC2_END;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
       LT_MB_LINKSPEED: begin
         case (step)
-          3'd0: msg_subcode = MS_LKS_START;
-          3'd1: msg_subcode = MS_LKS_DONE;
-          default: msg_subcode = 8'hFF;
+          3'd0: expected_req_subcode = MS_LKS_START;
+          3'd1: expected_req_subcode = MS_LKS_DONE;
+          default: expected_req_subcode = 8'hFF;
         endcase
       end
 
-      default: msg_subcode = 8'hFF;
+      default: expected_req_subcode = 8'hFF;
+    endcase
+  endfunction
+
+  function automatic logic [7:0] expected_rsp_subcode(
+    input ltsm_state_t s,
+    input logic [2:0] step
+  );
+    case (s)
+      LT_MB_DTVREF1: begin
+        case (step)
+          3'd0: expected_rsp_subcode = 8'h0F;
+          3'd1: expected_rsp_subcode = MS_DTV_END;
+          default: expected_rsp_subcode = 8'hFF;
+        endcase
+      end
+      default: expected_rsp_subcode = expected_req_subcode(s, step);
     endcase
   endfunction
 
@@ -808,8 +837,12 @@ module ltsm #(
   // Tables 53, 54, and 56.
   wire       phase_b_active  = phase_b_state_supported(state_q);
   wire [2:0] active_txn_step = state_entry ? 3'd0 : txn_step_q;
-  wire [7:0] current_subcode = msg_subcode(state_q, active_txn_step);
+  wire [7:0] current_req_code    = expected_req_code(state_q, active_txn_step);
+  wire [7:0] current_req_subcode = expected_req_subcode(state_q, active_txn_step);
+  wire [7:0] current_rsp_code    = expected_rsp_code(state_q, active_txn_step);
+  wire [7:0] current_rsp_subcode = expected_rsp_subcode(state_q, active_txn_step);
 
+  wire [7:0] current_subcode    = current_req_subcode;
   // =========================================================================
   // Sideband receive classification
   // =========================================================================
@@ -878,8 +911,7 @@ module ltsm #(
                               (sb_rx_opcode == phase_b_expected_opcode) &&
                               (sb_rx_srcid == SRCID_PHY) &&
                               (sb_rx_dstid == DSTID_REMOTE_PHY) &&
-                              (sb_rx_msginfo == 8'h00) &&
-                              (sb_rx_msgsubcode == current_subcode);
+                              (sb_rx_msginfo == 16'h0000);
 
   wire phase_b_req_payload_valid =
     (state_q != LT_MBINIT_PARAM) || param_req_valid;
@@ -887,10 +919,15 @@ module ltsm #(
     (state_q != LT_MBINIT_PARAM) || param_rsp_valid;
 
   wire phase_b_peer_req = phase_b_common_valid &&
-                          (sb_rx_msgcode == msg_req_code(state_q)) &&
-                          phase_b_req_payload_valid;
+                          (sb_rx_msgcode == current_req_code) &&
+                          (sb_rx_msgsubcode == current_req_subcode) &&
+                          phase_b_req_payload_valid &&
+                          !(phase_b_rsp_expected && !local_resp_rcvd_q &&
+                            (current_req_code == current_rsp_code) &&
+                            (current_req_subcode == current_rsp_subcode));
   wire phase_b_peer_rsp = phase_b_common_valid &&
-                          (sb_rx_msgcode == msg_rsp_code(state_q)) &&
+                          (sb_rx_msgcode == current_rsp_code) &&
+                          (sb_rx_msgsubcode == current_rsp_subcode) &&
                           phase_b_rsp_payload_valid;
   wire phase_b_packet_valid = phase_b_peer_req || phase_b_peer_rsp;
 
@@ -901,7 +938,7 @@ module ltsm #(
   // Spec refs: UCIe 1.0 Section 6.1.2 and Table 56.
   wire [63:0] peer_req_identity_payload =
     (sb_rx_opcode == SB_OP_MSG_DATA64) ? sb_rx_payload : 64'h0;
-  wire [98:0] rx_peer_req_identity = {
+  wire [106:0] rx_peer_req_identity = {
     sb_rx_opcode, sb_rx_srcid, sb_rx_dstid, sb_rx_msginfo,
     sb_rx_msgcode, sb_rx_msgsubcode, peer_req_identity_payload
   };
@@ -930,7 +967,7 @@ module ltsm #(
                               (sb_rx_opcode == SB_OP_MSG_NODATA) &&
                               (sb_rx_srcid == SRCID_PHY) &&
                               (sb_rx_dstid == DSTID_REMOTE_PHY) &&
-                              (sb_rx_msginfo == 8'h00);
+                              (sb_rx_msginfo == 16'h0000);
 
   wire rx_active_req = phase_c_common_valid &&
                        (sb_rx_msgcode == MC_LM_RDI_REQ) &&
@@ -1334,7 +1371,8 @@ module ltsm #(
     // RESET-entry cycle belongs to the transition being completed and cannot
     // trigger recovery. A later event remains pending through the 4 ms dwell.
     if ((state_q == LT_RESET) && !reset_entry &&
-        (software_start_event || rdi_active_event))
+        (software_start_event ||
+         (rdi_active_event && reset_rdi_req_sampled_q)))
       reset_trigger_pending_d = 1'b1;
 
     // LINKINIT remembers that the local RDI requested Active. This permits a
@@ -1827,7 +1865,7 @@ module ltsm #(
   // UCIe 1.0 Tables 53, 54, and 56 define these MsgInfo values.
   // UCIe 1.0 Section 4.5.3.8 defines TRAINERROR Entry.
   // PLAN.md Section 15.9 Phase C requires zero Phase C MsgInfo.
-  assign sb_tx_msginfo = sbinit_oor_send ? SBINIT_RESULT_PRIMARY : 8'h00;
+  assign sb_tx_msginfo = sbinit_oor_send ? {8'h00, SBINIT_RESULT_PRIMARY} : 16'h0000;
 
   // The selected role determines the message code. LinkMgmt responses cover
   // Active, LinkReset, and Disabled. TRAINERROR uses E5h and EAh.
@@ -1841,10 +1879,10 @@ module ltsm #(
                           tx_active_peer_resp) ? MC_LM_RDI_RSP :
                          tx_trainerror_resp ? MC_TE_RSP :
                          (tx_peer_resp || tx_dup_peer)
-                           ? msg_rsp_code(state_q) :
+                           ? current_rsp_code :
                          tx_trainerror_req ? MC_TE_REQ :
                          (tx_disabled_req || tx_linkreset_req || tx_active_req)
-                           ? MC_LM_RDI_REQ : msg_req_code(state_q);
+                           ? MC_LM_RDI_REQ : current_req_code;
 
   // The selected transition determines the Phase C message subcode.
   // Active uses 01h, LinkReset uses 09h, and Disabled uses 0Ch.
@@ -1861,7 +1899,9 @@ module ltsm #(
                             (tx_active_peer_resp || tx_active_req)
                               ? MS_LM_ACTIVE :
                             (tx_trainerror_resp || tx_trainerror_req)
-                              ? MS_TE_ENTRY : current_subcode;
+                              ? MS_TE_ENTRY :
+                            (tx_peer_resp || tx_dup_peer)
+                              ? current_rsp_subcode : current_req_subcode;
 
   // Message packets in this profile do not use byte enables.
   // PARAM carries a fixed full DATA64 payload through its message format.
@@ -2014,6 +2054,12 @@ module ltsm #(
   // UCIe 1.0 Section 8.1.6 requires the Active Entry handshake first.
   // PLAN.md Section 15.9 Phase C makes the LTSM the sole owner.
   assign link_trained = (state_q == LT_ACTIVE);
+  // phy_training_done marks the first registered LINKINIT cycle. It remains
+  // high through ACTIVE, while link_trained remains reserved for completed
+  // Active Entry and RDI Active gating.
+  // UCIe 1.0 Sections 8.1.5 and 8.1.6 require in-band presence before
+  // Active Entry, while the LTSM completes Active Entry in LINKINIT.
+  assign phy_training_done = (state_q == LT_LINKINIT) || (state_q == LT_ACTIVE);
 
   // train_error remains high throughout the public TRAINERROR hold.
   // It deasserts only after a completed LinkReset exchange enters RESET.

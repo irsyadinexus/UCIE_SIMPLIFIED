@@ -345,7 +345,7 @@ module logical_phy #(
   logic [4:0]  sb_tx_opcode;
   logic [2:0]  sb_tx_srcid;
   logic [2:0]  sb_tx_dstid;
-  logic [7:0]  sb_tx_msginfo;
+  logic [15:0] sb_tx_msginfo;
   logic [7:0]  sb_tx_msgcode;
   logic [7:0]  sb_tx_msgsubcode;
   logic [7:0]  sb_tx_be;
@@ -412,7 +412,7 @@ module logical_phy #(
   logic [4:0]  sb_rx_opcode;
   logic [2:0]  sb_rx_srcid;
   logic [2:0]  sb_rx_dstid;
-  logic [7:0]  sb_rx_msginfo;
+  logic [15:0] sb_rx_msginfo;
   logic [7:0]  sb_rx_msgcode;
   logic [7:0]  sb_rx_msgsubcode;
   logic [63:0] sb_rx_payload;
@@ -474,6 +474,7 @@ module logical_phy #(
   logic        ltsm_rdi_active_event;
   logic        ltsm_active_entry_done;
   logic        link_trained;
+  logic        phy_training_done;
   logic        train_error;
   logic        link_reset_out;
   logic        phy_retrain_done;
@@ -481,6 +482,9 @@ module logical_phy #(
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
   logic        local_active_req;
+  logic        rdi_stall_req_q, rdi_stall_req_d;
+  logic        rdi_stall_ack;
+  logic        rdi_stall_complete;
 
   // ------------------------------------------------- CSR
   logic        csr_wr;
@@ -658,7 +662,7 @@ module logical_phy #(
     ltsm_tx_packet.opcode      = sb_tx_opcode;
     ltsm_tx_packet.src_id      = sb_tx_srcid;
     ltsm_tx_packet.dst_id      = sb_tx_dstid;
-    ltsm_tx_packet.msg_info    = {8'h00, sb_tx_msginfo};
+    ltsm_tx_packet.msg_info    = sb_tx_msginfo;
     ltsm_tx_packet.msg_code    = sb_tx_msgcode;
     ltsm_tx_packet.msg_subcode = sb_tx_msgsubcode;
     ltsm_tx_packet.cr          = 1'b0;
@@ -903,7 +907,7 @@ module logical_phy #(
   assign sb_rx_opcode     = rx_cdc_packet.opcode;
   assign sb_rx_srcid      = rx_cdc_packet.src_id;
   assign sb_rx_dstid      = rx_cdc_packet.dst_id;
-  assign sb_rx_msginfo    = rx_cdc_packet.msg_info[7:0];
+  assign sb_rx_msginfo    = rx_cdc_packet.msg_info;
   assign sb_rx_msgcode    = rx_cdc_packet.msg_code;
   assign sb_rx_msgsubcode = rx_cdc_packet.msg_subcode;
   assign sb_rx_payload    = rx_cdc_packet.data;
@@ -1007,6 +1011,7 @@ module logical_phy #(
     .active_entry_done(ltsm_active_entry_done),
     .clear_start_link_train(clear_start_link_train),
     .link_trained    (link_trained),
+    .phy_training_done(phy_training_done),
     .train_error     (train_error),
     .link_reset_out  (link_reset_out),
     .phy_retrain_done(phy_retrain_done),
@@ -1121,6 +1126,7 @@ module logical_phy #(
     .lclk            (lclk),
     .lreset_n        (lreset_n),
     .rdi_lp_state_req(rdi_lp_state_req),
+    .rdi_lp_linkerror(rdi_lp_linkerror),
     .adapter_active_req(1'b0),
     .rdi_lp_stallack (rdi_lp_stallack),
     .rdi_pl_state_sts(rdi_pl_state_sts),
@@ -1135,11 +1141,12 @@ module logical_phy #(
     .phy_link_reset  (link_reset_out),
     .phy_retrain_req (rdi_lp_state_req == ucie_pkg::RDI_REQ_RETRAIN),
     .phy_train_error (train_error),
-    .phy_inband_pres (link_trained),
+    .phy_inband_pres (phy_training_done),
     .cerror          (1'b0),
     .nferror         (1'b0),
-    .stall_req       (1'b0),
-    .stall_ack       (),
+    .stall_req       (rdi_stall_req_q),
+    .stall_ack       (rdi_stall_ack),
+    .stall_complete  (rdi_stall_complete),
     .local_active_req(local_active_req)
   );
 
@@ -1266,15 +1273,32 @@ module logical_phy #(
   // -------------------------------------------------------------------------
   assign rdi_pl_speedmode= SPEED_4GT;
   // -------------------------------------------------------------------------
-  // assign: rdi_pl_stallreq – PHY stall request (disabled)
+  // assign: rdi_pl_stallreq – PHY stall request
   //
-  // Tied to 1'b0.  The PHY never initiates a stall in this build because
-  // no recalibration or power-management flow requires one.
-  //
-  // Spec ref: UCIe 1.0, Section 8.1 - Raw Die-to-Die Interface (RDI),
-  //           Table 114 - RDI Signal List.
+  // LinkReset and Disabled exits from RDI ACTIVE trigger the integrated
+  // four-phase stall handshake per Section 8.3.1.
   // -------------------------------------------------------------------------
-  assign rdi_pl_stallreq = 1'b0;
+  always_comb begin
+    rdi_stall_req_d = rdi_stall_req_q;
+    if ((rdi_pl_state_sts != RDI_STS_ACTIVE) ||
+        ((rdi_lp_state_req != RDI_REQ_LINKRESET) &&
+         (rdi_lp_state_req != RDI_REQ_DISABLED))) begin
+      rdi_stall_req_d = 1'b0;
+    end else if (rdi_lp_stallack || rdi_stall_ack) begin
+      rdi_stall_req_d = 1'b0;
+    end else begin
+      rdi_stall_req_d = 1'b1;
+    end
+  end
+
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n)
+      rdi_stall_req_q <= 1'b0;
+    else
+      rdi_stall_req_q <= rdi_stall_req_d;
+  end
+
+  assign rdi_pl_stallreq = rdi_stall_req_q;
 
   // ---------------------------------------------------------------------------
   // Legacy LTSM start-link-train OR gate removed in Phase C.
@@ -1792,7 +1816,7 @@ module logical_phy #(
   //           PLAN.md Sections 15.5 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
   logic unused;
-  assign unused = adapter_active_req | rdi_lp_linkerror |
+  assign unused = adapter_active_req | rdi_stall_complete |
                   phy_retrain_done | sb_msg_timeout |
                   sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |
                   raw_rx_result_busy | raw_tx_done_busy |

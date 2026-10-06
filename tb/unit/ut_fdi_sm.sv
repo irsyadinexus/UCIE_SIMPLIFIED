@@ -202,6 +202,7 @@ module ut_fdi_sm;
   logic        fdi_active_req;
   logic [3:0]  fdi_state_req_out;
   logic        fdi_state_req_vld;
+  logic        adapter_stage3_ready;
   logic        unsupported_seen;   // set if pl_state_sts takes L1/L2/RETRAIN
   int          errors;
 
@@ -248,6 +249,7 @@ module ut_fdi_sm;
     .adapter_state_req_vld(adapter_state_req_vld),
     .adapter_state_req(adapter_state_req),
     .fdi_active_req(fdi_active_req),
+    .adapter_stage3_ready(adapter_stage3_ready),
     .fdi_state_req_out(fdi_state_req_out),
     .fdi_state_req_vld(fdi_state_req_vld)
   );
@@ -346,6 +348,7 @@ module ut_fdi_sm;
     adapter_state_req_vld = 1'b0;
     adapter_state_req = RDI_REQ_NOP;
 
+    adapter_stage3_ready = 1'b0;
     #5 lreset_n = 1'b1;
     @(negedge lclk);
     chk("reset", 4'h0);
@@ -377,8 +380,11 @@ module ut_fdi_sm;
       $display("FAIL ut_fdi_sm: Active request not forwarded");
       errors = errors + 1;
     end
+    // P0-1: With adapter_stage3_ready=0, FDI must hold in RESET even when RDI is Active and rx_active_sts=1
+    repeat (4) @(posedge lclk); #0.1;
+    chk("fdi held in reset before stage3_ready", 4'h0);
+    adapter_stage3_ready = 1'b1;
     step_to("fdi active", RDI_STS_ACTIVE, 4'h1);
-
     // Streaming and Format 1 Raw are fixed for this PoC.
     if (pl_protocol !== PROTO_STREAMING) begin
       $display("FAIL ut_fdi_sm: protocol %01h", pl_protocol);
@@ -466,7 +472,7 @@ module ut_fdi_sm;
     // The stream id passes straight through.
     lp_stream = 8'hA5;
     @(posedge lclk); #0.1;
-    if (pl_stream !== 8'hA5) begin
+    if (pl_stream !== STREAM_ID_S0_STREAMING) begin
       $display("FAIL ut_fdi_sm: stream %02h", pl_stream);
       errors = errors + 1;
     end
@@ -507,17 +513,17 @@ module ut_fdi_sm;
     // validity flag stays low.
     lp_state_req = FDI_REQ_L1;
     repeat (2) @(posedge lclk); #0.1;
-    if (fdi_state_req_vld || fdi_state_req_out !== RDI_REQ_NOP ||
+    if (!fdi_state_req_vld || fdi_state_req_out !== FDI_REQ_L1 ||
         fdi_active_req) begin
-      $display("FAIL ut_fdi_sm: L1 request not suppressed");
+      $display("FAIL ut_fdi_sm: L1 request not forwarded");
       errors = errors + 1;
     end
 
     lp_state_req = FDI_REQ_L2;
     repeat (2) @(posedge lclk); #0.1;
-    if (fdi_state_req_vld || fdi_state_req_out !== RDI_REQ_NOP ||
+    if (!fdi_state_req_vld || fdi_state_req_out !== FDI_REQ_L2 ||
         fdi_active_req) begin
-      $display("FAIL ut_fdi_sm: L2 request not suppressed");
+      $display("FAIL ut_fdi_sm: L2 request not forwarded");
       errors = errors + 1;
     end
 

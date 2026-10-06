@@ -302,6 +302,9 @@ module d2d_adapter #(
   logic        link_status_active;
   logic        adapter_fatal, adapter_linkerror;
   logic        stage3_done;
+  logic        adapter_capability_done;
+  logic        adapter_stage3_ready;
+  assign adapter_stage3_ready = adapter_capability_done && stage3_done;
   logic        protocol_error, fdi_format_error;
   logic        rem_req_vld, rem_req_rdy;
   sb_packet_t  rem_req_pkt;
@@ -413,6 +416,8 @@ module d2d_adapter #(
       rdi_lp_state_req = RDI_REQ_LINKRESET;
     else if (fdi_state_req_vld && (fdi_state_req_out == RDI_REQ_LINKRESET))
       rdi_lp_state_req = RDI_REQ_LINKRESET;
+    else if (fdi_state_req_vld && ((fdi_state_req_out == RDI_REQ_L1) || (fdi_state_req_out == RDI_REQ_L2)))
+      rdi_lp_state_req = fdi_state_req_out;
     else if (adapter_state_req_vld && (adapter_state_req == RDI_REQ_ACTIVE))
       rdi_lp_state_req = RDI_REQ_ACTIVE;
     else
@@ -453,6 +458,7 @@ module d2d_adapter #(
     .adapter_active_req(1'b0),
     .adapter_state_req_vld(adapter_state_req_vld),
     .adapter_state_req(adapter_state_req),
+    .adapter_stage3_ready(adapter_stage3_ready),
     .fdi_active_req(fdi_active_req),
     .fdi_state_req_out(fdi_state_req_out),
     .fdi_state_req_vld(fdi_state_req_vld)
@@ -551,6 +557,7 @@ module d2d_adapter #(
     .adapter_fatal             (adapter_fatal),
     .adapter_linkerror         (adapter_linkerror),
     .stage3_done               (stage3_done),
+    .adapter_capability_done   (adapter_capability_done),
     .protocol_error            (protocol_error),
     .fdi_format_error          (fdi_format_error),
     .sb_credit_returned        (sb_credit_returned),
@@ -621,9 +628,9 @@ module d2d_adapter #(
     end else begin
       lp_clk_ack_q <= lp_clk_ack;
       pl_wake_ack  <= lp_wake_req;
-      if (rdi_pl_state_sts == RDI_STS_RESET) begin
+      if (rdi_pl_state_sts != RDI_STS_ACTIVE) begin
         protocol_vld_q <= 1'b0;
-      end else if (stage3_done) begin
+      end else if (adapter_capability_done) begin
         protocol_vld_q <= 1'b1;
       end
     end

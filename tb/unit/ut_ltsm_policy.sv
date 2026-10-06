@@ -183,7 +183,8 @@ module ut_ltsm_policy;
   logic        sb_tx_load, sb_tx_busy, sb_tx_accepted;
   logic [4:0]  sb_tx_opcode;
   logic [2:0]  sb_tx_srcid, sb_tx_dstid;
-  logic [7:0]  sb_tx_msginfo, sb_tx_msgcode, sb_tx_msgsubcode;
+  logic [15:0] sb_tx_msginfo;
+  logic [7:0]  sb_tx_msgcode, sb_tx_msgsubcode;
   logic [7:0]  sb_tx_be;
   logic [4:0]  sb_tx_tag;
   logic        sb_tx_ep;
@@ -195,7 +196,8 @@ module ut_ltsm_policy;
   logic        sb_rx_pkt_vld;
   logic [4:0]  sb_rx_opcode;
   logic [2:0]  sb_rx_srcid, sb_rx_dstid;
-  logic [7:0]  sb_rx_msginfo, sb_rx_msgcode, sb_rx_msgsubcode;
+  logic [15:0] sb_rx_msginfo;
+  logic [7:0]  sb_rx_msgcode, sb_rx_msgsubcode;
   logic [63:0] sb_rx_payload;
   logic        sb_rx_cp_err, sb_rx_dp_err;
 
@@ -263,7 +265,7 @@ module ut_ltsm_policy;
     .rdi_disabled_req(rdi_disabled_req),
     .active_entry_done(),
     .clear_start_link_train(),
-    .link_trained(link_trained), .train_error(train_error),
+    .link_trained(link_trained), .phy_training_done(), .train_error(train_error),
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
     .degrade_lanes(degrade_lanes),
@@ -341,7 +343,7 @@ module ut_ltsm_policy;
     input logic [4:0]  opcode;
     input logic [2:0]  srcid;
     input logic [2:0]  dstid;
-    input logic [7:0]  msginfo;
+    input logic [15:0] msginfo;
     input logic [7:0]  msgcode;
     input logic [7:0]  msgsubcode;
     input logic [63:0] payload;
@@ -372,7 +374,7 @@ module ut_ltsm_policy;
     input logic [7:0] msgsubcode;
     begin
       drive_rx(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
-               8'h00, msgcode, msgsubcode, 64'h0, 1'b0, 1'b0);
+               16'h0000, msgcode, msgsubcode, 64'h0, 1'b0, 1'b0);
     end
   endtask
 
@@ -383,7 +385,7 @@ module ut_ltsm_policy;
     input logic [63:0] payload;
     begin
       drive_rx(SB_OP_MSG_DATA64, SRCID_PHY, DSTID_REMOTE_PHY,
-               8'h00, msgcode, msgsubcode, payload, 1'b0, 1'b0);
+               16'h0000, msgcode, msgsubcode, payload, 1'b0, 1'b0);
     end
   endtask
 
@@ -598,15 +600,23 @@ module ut_ltsm_policy;
     end
   endtask
 
-  function automatic logic [7:0] rsp_for(input logic [7:0] code);
+  function automatic logic [7:0] rsp_code_for(input logic [7:0] code, input logic [7:0] subcode);
     case (code)
-      MC_SB_DONE_REQ:  rsp_for = MC_SB_DONE_RSP;
-      MC_MBINIT_REQ:   rsp_for = MC_MBINIT_RSP;
-      MC_MBTRAIN_REQ:  rsp_for = MC_MBTRAIN_RSP;
-      MC_LM_RDI_REQ:   rsp_for = MC_LM_RDI_RSP;
-      MC_PHYR_REQ:     rsp_for = MC_PHYR_RSP;
-      default:         rsp_for = MC_TE_RSP;
+      MC_SB_DONE_REQ:  rsp_code_for = MC_SB_DONE_RSP;
+      MC_MBINIT_REQ:   rsp_code_for = MC_MBINIT_RSP;
+      MC_MBTRAIN_REQ:  rsp_code_for = (subcode == 8'h09) ? 8'hBA : MC_MBTRAIN_RSP;
+      8'hBA:           rsp_code_for = (subcode == 8'h09) ? 8'hBA : 8'hB5;
+      MC_LM_RDI_REQ:   rsp_code_for = MC_LM_RDI_RSP;
+      MC_PHYR_REQ:     rsp_code_for = MC_PHYR_RSP;
+      default:         rsp_code_for = MC_TE_RSP;
     endcase
+  endfunction
+
+  function automatic logic [7:0] rsp_subcode_for(input logic [7:0] code, input logic [7:0] subcode);
+    if ((code == 8'hBA) && (subcode == 8'h0E))
+      rsp_subcode_for = 8'h0F;
+    else
+      rsp_subcode_for = subcode;
   endfunction
 
   // Answer the request captured by await_request with its matching
@@ -615,9 +625,9 @@ module ut_ltsm_policy;
   task reply_matching;
     begin
       if (ltsm_state == LT_MBINIT_PARAM)
-        drive_data64(rsp_for(cap_code), cap_sub, PARAM_RSP_DATA);
+        drive_data64(rsp_code_for(cap_code, cap_sub), rsp_subcode_for(cap_code, cap_sub), PARAM_RSP_DATA);
       else
-        drive_nodata(rsp_for(cap_code), cap_sub);
+        drive_nodata(rsp_code_for(cap_code, cap_sub), rsp_subcode_for(cap_code, cap_sub));
     end
   endtask
 
@@ -732,7 +742,8 @@ module ut_ltsm_policy;
   // Malformed packet fields, set by each case before the call.
   logic [4:0]  bad_opcode;
   logic [2:0]  bad_srcid, bad_dstid;
-  logic [7:0]  bad_msginfo, bad_msgcode, bad_msgsubcode;
+  logic [15:0] bad_msginfo;
+  logic [7:0]  bad_msgcode, bad_msgsubcode;
   logic [63:0] bad_payload;
   logic        bad_cp, bad_dp;
 
@@ -806,17 +817,27 @@ module ut_ltsm_policy;
 
       // Wrong MsgInfo (must always be zero after SBINIT).
       bad_opcode=SB_OP_MSG_DATA64; bad_srcid=SRCID_PHY; bad_dstid=DSTID_REMOTE_PHY;
-      bad_msginfo=8'h01; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
+      bad_msginfo=16'h0001; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
       bad_payload=PARAM_RSP_DATA; bad_cp=1'b0; bad_dp=1'b0;
       run_fatal_case(1'b1);
       if (ltsm_state != LT_TRAINERROR) begin
         $display("FAIL invalid: wrong msginfo not fatal (state %02h)", ltsm_state);
         errs = errs + 1;
       end
+      // Wrong upper MsgInfo (must always be zero after SBINIT).
+      bad_opcode=SB_OP_MSG_DATA64; bad_srcid=SRCID_PHY; bad_dstid=DSTID_REMOTE_PHY;
+      bad_msginfo=16'h0100; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
+      bad_payload=PARAM_RSP_DATA; bad_cp=1'b0; bad_dp=1'b0;
+      run_fatal_case(1'b1);
+      if (ltsm_state != LT_TRAINERROR) begin
+        $display("FAIL invalid: wrong upper msginfo not fatal (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+
 
       // CP error packet.
       bad_opcode=SB_OP_MSG_DATA64; bad_srcid=SRCID_PHY; bad_dstid=DSTID_REMOTE_PHY;
-      bad_msginfo=8'h00; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
+      bad_msginfo=16'h0000; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
       bad_payload=PARAM_RSP_DATA; bad_cp=1'b1; bad_dp=1'b0;
       run_fatal_case(1'b1);
       if (ltsm_state != LT_TRAINERROR) begin
@@ -826,7 +847,7 @@ module ut_ltsm_policy;
 
       // DP error packet.
       bad_opcode=SB_OP_MSG_DATA64; bad_srcid=SRCID_PHY; bad_dstid=DSTID_REMOTE_PHY;
-      bad_msginfo=8'h00; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
+      bad_msginfo=16'h0000; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
       bad_payload=PARAM_RSP_DATA; bad_cp=1'b0; bad_dp=1'b1;
       run_fatal_case(1'b1);
       if (ltsm_state != LT_TRAINERROR) begin
@@ -836,7 +857,7 @@ module ut_ltsm_policy;
 
       // Stale packet: the SBINIT Done response, valid in a prior state.
       bad_opcode=SB_OP_MSG_NODATA; bad_srcid=SRCID_PHY; bad_dstid=DSTID_REMOTE_PHY;
-      bad_msginfo=8'h00; bad_msgcode=MC_SB_DONE_RSP; bad_msgsubcode=MS_SB_DONE;
+      bad_msginfo=16'h0000; bad_msgcode=MC_SB_DONE_RSP; bad_msgsubcode=MS_SB_DONE;
       bad_payload=64'h0; bad_cp=1'b0; bad_dp=1'b0;
       run_fatal_case(1'b1);
       if (ltsm_state != LT_TRAINERROR) begin
@@ -847,7 +868,7 @@ module ut_ltsm_policy;
       // Early peer response: the mailbox declines the local request, so it
       // is never accepted, and the response arrives before acceptance.
       bad_opcode=SB_OP_MSG_DATA64; bad_srcid=SRCID_PHY; bad_dstid=DSTID_REMOTE_PHY;
-      bad_msginfo=8'h00; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
+      bad_msginfo=16'h0000; bad_msgcode=MC_MBINIT_RSP; bad_msgsubcode=MS_PARAM_CFG;
       bad_payload=PARAM_RSP_DATA; bad_cp=1'b0; bad_dp=1'b0;
       run_fatal_case(1'b0);
       if (ltsm_state != LT_TRAINERROR) begin
@@ -1217,7 +1238,7 @@ module ut_ltsm_policy;
       bad_opcode     = SB_OP_MSG_DATA64;
       bad_srcid      = SRCID_ADAPT;
       bad_dstid      = DSTID_REMOTE_PHY;
-      bad_msginfo    = 8'h00;
+      bad_msginfo    = 16'h0000;
       bad_msgcode    = MC_MBINIT_RSP;
       bad_msgsubcode = MS_PARAM_CFG;
       bad_payload    = PARAM_RSP_DATA;

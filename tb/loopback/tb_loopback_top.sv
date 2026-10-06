@@ -422,6 +422,7 @@ module tb_loopback_top;
   logic [DATA_W-1:0] d0_lp_data;
   logic [7:0]  d0_lp_stream;
   logic        d0_lp_stallack, d0_lp_rx_active_sts;
+  logic        d0_pl_rx_active_req, d0_pl_protocol_vld, d0_pl_inband_pres;
   logic        d0_pl_trdy, d0_pl_valid;
   logic [DATA_W-1:0] d0_pl_data;
   logic [7:0]  d0_pl_stream;
@@ -443,6 +444,7 @@ module tb_loopback_top;
   logic [7:0]  d1_lp_stream;
   logic        d1_lp_stallack, d1_lp_rx_active_sts;
   logic        d1_pl_trdy, d1_pl_valid;
+  logic        d1_pl_rx_active_req, d1_pl_protocol_vld, d1_pl_inband_pres;
   logic [DATA_W-1:0] d1_pl_data;
   logic [7:0]  d1_pl_stream;
   logic [3:0]  d1_lp_state_req, d1_pl_state_sts;
@@ -564,10 +566,11 @@ module tb_loopback_top;
     .pl_phyinrecenter(),
     .pl_protocol     (),
     .pl_protocol_flitfmt(),
-    .pl_rx_active_req(),
+    .pl_protocol_vld (d0_pl_protocol_vld),
+    .pl_rx_active_req(d0_pl_rx_active_req),
     .lp_state_req    (d0_lp_state_req),
     .pl_state_sts    (d0_pl_state_sts),
-    .pl_inband_pres  (),
+    .pl_inband_pres  (d0_pl_inband_pres),
     .pl_stallreq     (d0_pl_stallreq),
     .lp_linkerror    (),
     .sb_tx_clk       (sb_b2a_clk),
@@ -618,10 +621,11 @@ module tb_loopback_top;
     .pl_phyinrecenter(),
     .pl_protocol     (),
     .pl_protocol_flitfmt(),
-    .pl_rx_active_req(),
+    .pl_protocol_vld (d1_pl_protocol_vld),
+    .pl_rx_active_req(d1_pl_rx_active_req),
     .lp_state_req    (d1_lp_state_req),
     .pl_state_sts    (d1_pl_state_sts),
-    .pl_inband_pres  (),
+    .pl_inband_pres  (d1_pl_inband_pres),
     .pl_stallreq     (d1_pl_stallreq),
     .lp_linkerror    (),
     .sb_tx_clk       (sb_a2b_clk),
@@ -644,29 +648,67 @@ module tb_loopback_top;
   // edge, so this held level is deliberately used by the recovery scenarios:
   // it must not restart the link after a RESET dwell, and only a fresh pulse
   // may do so.
+  always @(posedge lclk or negedge d0_lreset_n) begin
+    if (!d0_lreset_n)
+      d0_lp_stallack <= 1'b0;
+    else
+      d0_lp_stallack <= d0_pl_stallreq;
+  end
+
+  always @(posedge lclk or negedge d1_lreset_n) begin
+    if (!d1_lreset_n)
+      d1_lp_stallack <= 1'b0;
+    else
+      d1_lp_stallack <= d1_pl_stallreq;
+  end
+
+  always @(posedge lclk or negedge d0_lreset_n) begin
+    if (!d0_lreset_n)
+      d0_lp_rx_active_sts <= 1'b0;
+    else if (d0_pl_rx_active_req)
+      d0_lp_rx_active_sts <= 1'b1;
+    else if (d0_pl_state_sts == FDI_STS_RESET || d0_pl_state_sts == FDI_STS_LINKRESET)
+      d0_lp_rx_active_sts <= 1'b0;
+  end
+
+  always @(posedge lclk or negedge d1_lreset_n) begin
+    if (!d1_lreset_n)
+      d1_lp_rx_active_sts <= 1'b0;
+    else if (d1_pl_rx_active_req)
+      d1_lp_rx_active_sts <= 1'b1;
+    else if (d1_pl_state_sts == FDI_STS_RESET || d1_pl_state_sts == FDI_STS_LINKRESET)
+      d1_lp_rx_active_sts <= 1'b0;
+  end
+
   initial begin
     d0_start_link_train = 1'b0;
-    d0_lp_state_req     = FDI_REQ_ACTIVE;
-    d0_lp_rx_active_sts = 1'b1;
+    d0_lp_state_req     = FDI_REQ_NOP;
     d0_lp_irdy          = 1'b0;
     d0_lp_valid         = 1'b0;
     d0_lp_data          = '0;
     d0_lp_stream        = STREAM_ID_S0_STREAMING;
-    d0_lp_stallack      = 1'b0;
 
     d1_start_link_train = 1'b0;
-    d1_lp_state_req     = FDI_REQ_ACTIVE;
-    d1_lp_rx_active_sts = 1'b1;
+    d1_lp_state_req     = FDI_REQ_NOP;
     d1_lp_irdy          = 1'b0;
     d1_lp_valid         = 1'b0;
     d1_lp_data          = '0;
     d1_lp_stream        = STREAM_ID_S0_STREAMING;
-    d1_lp_stallack      = 1'b0;
 
     wait (d0_lreset_n === 1'b1);
     @(negedge lclk);
     d0_start_link_train = 1'b1;
     d1_start_link_train = 1'b0;
+    repeat (2) @(posedge lclk);
+    @(negedge lclk);
+    d0_lp_state_req     = FDI_REQ_ACTIVE;
+  end
+
+  initial begin
+    wait (d1_lreset_n === 1'b1);
+    repeat (2) @(posedge lclk);
+    @(negedge lclk);
+    d1_lp_state_req     = FDI_REQ_ACTIVE;
   end
 
   // ------------------------------------------------------- transfer events
@@ -1193,6 +1235,36 @@ module tb_loopback_top;
       $display("FAIL tb_loopback_top: main-band valid asserted during RESET/SBINIT");
       errors = errors + 1;
       early_mainband_error_seen = 1'b1;
+    end
+
+    // P0-1: Staged FDI bring-up order checks
+    if (!link_up_seen && d0_lreset_n) begin
+      if (d0_pl_protocol_vld && !dut_a.u_adapter.adapter_capability_done) begin
+        $display("FAIL tb_loopback_top: Die 0 protocol valid preceded capability negotiation");
+        errors = errors + 1;
+      end
+      if (d0_pl_inband_pres && !d0_pl_protocol_vld) begin
+        $display("FAIL tb_loopback_top: Die 0 FDI inband presence preceded protocol valid");
+        errors = errors + 1;
+      end
+      if ((d0_pl_state_sts == FDI_STS_ACTIVE) && !dut_a.u_adapter.stage3_done) begin
+        $display("FAIL tb_loopback_top: Die 0 FDI Active preceded Stage 3 Adapter0 completion");
+        errors = errors + 1;
+      end
+    end
+    if (!link_up_seen && d1_lreset_n) begin
+      if (d1_pl_protocol_vld && !dut_b.u_adapter.adapter_capability_done) begin
+        $display("FAIL tb_loopback_top: Die 1 protocol valid preceded capability negotiation");
+        errors = errors + 1;
+      end
+      if (d1_pl_inband_pres && !d1_pl_protocol_vld) begin
+        $display("FAIL tb_loopback_top: Die 1 FDI inband presence preceded protocol valid");
+        errors = errors + 1;
+      end
+      if ((d1_pl_state_sts == FDI_STS_ACTIVE) && !dut_b.u_adapter.stage3_done) begin
+        $display("FAIL tb_loopback_top: Die 1 FDI Active preceded Stage 3 Adapter0 completion");
+        errors = errors + 1;
+      end
     end
 
     d0_prev_ltsm_state = d0_ltsm_state;
@@ -1731,6 +1803,15 @@ module tb_loopback_top;
 
     $display("LINK ACTIVE (die 0)");
     $display("LINK ACTIVE (die 1)");
+    if (!dut_a.u_adapter.adapter_capability_done ||
+        !dut_b.u_adapter.adapter_capability_done ||
+        !dut_a.u_adapter.stage3_done ||
+        !dut_b.u_adapter.stage3_done ||
+        !d0_pl_protocol_vld || !d1_pl_protocol_vld ||
+        !d0_pl_inband_pres || !d1_pl_inband_pres) begin
+      $display("FAIL tb_loopback_top: incomplete staged bring-up flags at Active");
+      errors = errors + 1;
+    end
 
     // ---- let the last LFSR training beats drain out of both RX gearboxes
     repeat (10) @(posedge lclk);
@@ -1760,12 +1841,18 @@ module tb_loopback_top;
       @(negedge lclk);
       d0_lp_state_req = RDI_REQ_L1;
       pmnak_cycles = 0;
-      while ((d0_rdi_state_sts != RDI_STS_PMNAK) && (d0_pl_state_sts != FDI_STS_PMNAK) &&
+      while (((d0_rdi_state_sts != RDI_STS_PMNAK) || (d0_pl_state_sts != FDI_STS_PMNAK)) &&
              (pmnak_cycles < 100)) begin
         @(posedge lclk);
         pmnak_cycles = pmnak_cycles + 1;
       end
-      cov_pmnak_seen = 1'b1;
+      if (pmnak_cycles >= 100) begin
+        $display("FAIL tb_loopback_top: PMNAK not observed on RDI/FDI (rdi=%0h fdi=%0h)",
+                 d0_rdi_state_sts, d0_pl_state_sts);
+        errors = errors + 1;
+      end else begin
+        cov_pmnak_seen = 1'b1;
+      end
       repeat (4) @(posedge lclk);
       @(negedge lclk);
       d0_lp_state_req = RDI_REQ_ACTIVE;
@@ -1774,6 +1861,11 @@ module tb_loopback_top;
              (pmnak_cycles < 100)) begin
         @(posedge lclk);
         pmnak_cycles = pmnak_cycles + 1;
+      end
+      if (pmnak_cycles >= 100) begin
+        $display("FAIL tb_loopback_top: did not return to ACTIVE after PMNAK (rdi=%0h fdi=%0h)",
+                 d0_rdi_state_sts, d0_pl_state_sts);
+        errors = errors + 1;
       end
       repeat (4) @(posedge lclk);
       $display("PASS tb_loopback_top: PMNAK observed on RDI for unsupported L1 request");

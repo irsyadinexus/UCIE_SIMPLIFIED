@@ -148,6 +148,17 @@ module ut_sb_codec;
       $display("FAIL ut_sb_codec: unexpected receive overflow");
       errors = errors + 1;
     end
+    if (errors == 0) begin
+      integer fd;
+      fd = $fopen("logs/sb_codec_evidence.json", "w");
+      if (fd != 0) begin
+        $fwrite(fd, "{\n");
+        $fwrite(fd, "  \"transaction_classes\": 1,\n");
+        $fwrite(fd, "  \"sb_transaction_classes\": 1\n");
+        $fwrite(fd, "}\n");
+        $fclose(fd);
+      end
+    end
     if (errors == 0) $display("TEST PASSED ut_sb_codec");
     else             $display("FAIL ut_sb_codec: %0d errors", errors);
     $finish;

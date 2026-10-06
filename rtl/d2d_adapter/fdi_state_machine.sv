@@ -166,6 +166,7 @@ module fdi_state_machine (
   input  logic        adapter_active_req,
   input  logic        adapter_state_req_vld,
   input  logic [3:0]  adapter_state_req,
+  input  logic        adapter_stage3_ready = 1'b1,
   output logic        fdi_active_req,
   output logic [3:0]  fdi_state_req_out,
   output logic        fdi_state_req_vld
@@ -306,7 +307,7 @@ module fdi_state_machine (
   always_comb begin
     pl_protocol        = PROTO_STREAMING;
     pl_protocol_flitfmt = FMT_RAW;
-    pl_stream          = lp_stream;
+    pl_stream          = STREAM_ID_S0_STREAMING;
     pl_error           = 1'b0;
     pl_cerror          = rdi_cerror;
     pl_nferror         = rdi_nferror;
@@ -329,13 +330,14 @@ module fdi_state_machine (
         fdi_state_req_out = FDI_REQ_ACTIVE;
         fdi_state_req_vld = local_active_req;
       end
+      FDI_REQ_L1, FDI_REQ_L2,
       FDI_REQ_LINKRESET, FDI_REQ_DISABLED: begin
         fdi_state_req_out = lp_state_req;
         fdi_state_req_vld = 1'b1;
       end
       default: begin
-        // FDI_REQ_L1, FDI_REQ_L2, FDI_REQ_RETRAIN, and FDI_REQ_NOP are
-        // suppressed: the RDI keeps seeing no request and no valid request.
+        // FDI_REQ_RETRAIN and FDI_REQ_NOP are suppressed:
+        // the RDI keeps seeing no request and no valid request.
         fdi_state_req_out = RDI_REQ_NOP;
         fdi_state_req_vld = 1'b0;
       end
@@ -369,7 +371,7 @@ module fdi_state_machine (
         // lp_rx_active_sts, then FDI reports Active.
         if (rdi_state_sts == RDI_STS_LINKERROR)  fdi_d = F_LINKERROR;
         else if (rdi_state_sts == RDI_STS_DISABLED) fdi_d = F_DISABLED;
-        else if (rdi_state_sts == RDI_STS_ACTIVE && lp_rx_active_sts)
+        else if (rdi_state_sts == RDI_STS_ACTIVE && lp_rx_active_sts && adapter_stage3_ready)
                                                fdi_d = F_ACTIVE;
         else                                    fdi_d = F_RESET;
       end
@@ -388,7 +390,8 @@ module fdi_state_machine (
         // PMNAK is a transient NAK: it ends when the RDI reports Active after
         // an accepted retry, or Reset when the link is torn down.
         if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
-        else if (rdi_state_sts == RDI_STS_ACTIVE)    fdi_d = F_ACTIVE;
+        else if (rdi_state_sts == RDI_STS_ACTIVE && lp_rx_active_sts && adapter_stage3_ready)
+                                                     fdi_d = F_ACTIVE;
         else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
         else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
         else if (rdi_state_sts == RDI_STS_DISABLED)  fdi_d = F_DISABLED;
@@ -396,7 +399,7 @@ module fdi_state_machine (
       end
       F_LINKRESET: begin
         if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
-        else if (rdi_state_sts == RDI_STS_ACTIVE)    fdi_d = F_ACTIVE;
+        else if (rdi_state_sts == RDI_STS_ACTIVE && lp_rx_active_sts && adapter_stage3_ready) fdi_d = F_ACTIVE;
         else if (rdi_state_sts == RDI_STS_LINKERROR) fdi_d = F_LINKERROR;
         else                                         fdi_d = fdi_q;
       end
@@ -415,6 +418,8 @@ module fdi_state_machine (
     endcase
   end
 
+  logic [7:0] unused_lp_stream;
+  assign unused_lp_stream = lp_stream;
 endmodule
 
 `endif

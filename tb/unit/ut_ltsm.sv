@@ -212,7 +212,8 @@ module ut_ltsm;
   logic        sb_tx_load, sb_tx_busy, sb_tx_accepted;
   logic [4:0]  sb_tx_opcode;
   logic [2:0]  sb_tx_srcid, sb_tx_dstid;
-  logic [7:0]  sb_tx_msginfo, sb_tx_msgcode, sb_tx_msgsubcode;
+  logic [15:0] sb_tx_msginfo;
+  logic [7:0]  sb_tx_msgcode, sb_tx_msgsubcode;
   logic [7:0]  sb_tx_be;
   logic [4:0]  sb_tx_tag;
   logic        sb_tx_ep;
@@ -226,7 +227,8 @@ module ut_ltsm;
   logic        sb_rx_pkt_vld;
   logic [4:0]  sb_rx_opcode;
   logic [2:0]  sb_rx_srcid, sb_rx_dstid;
-  logic [7:0]  sb_rx_msginfo, sb_rx_msgcode, sb_rx_msgsubcode;
+  logic [15:0] sb_rx_msginfo;
+  logic [7:0]  sb_rx_msgcode, sb_rx_msgsubcode;
   logic [63:0] sb_rx_payload;
   logic        sb_rx_cp_err, sb_rx_dp_err;
 
@@ -235,26 +237,29 @@ module ut_ltsm;
   logic        inject_rx_pkt_vld;
   logic [4:0]  inject_rx_opcode;
   logic [2:0]  inject_rx_srcid, inject_rx_dstid;
-  logic [7:0]  inject_rx_msginfo, inject_rx_msgcode;
+  logic [15:0] inject_rx_msginfo;
+  logic [7:0]  inject_rx_msgcode;
   logic [7:0]  inject_rx_msgsubcode;
   logic        inject_rx_cp_err, inject_rx_dp_err;
   logic        cdc_rx_pkt_vld;
   logic [4:0]  cdc_rx_opcode;
   logic [2:0]  cdc_rx_srcid, cdc_rx_dstid;
-  logic [7:0]  cdc_rx_msginfo, cdc_rx_msgcode, cdc_rx_msgsubcode;
+  logic [15:0] cdc_rx_msginfo;
+  logic [7:0]  cdc_rx_msgcode, cdc_rx_msgsubcode;
   logic        cdc_rx_cp_err, cdc_rx_dp_err;
 
   // Req.3 CDC signals. The LTSM remains in lclk. The local codec remains in
   // sbclk, so complete sideband packets cross through the same mailboxes used
   // by logical_phy.
-  localparam int unsigned SB_TX_W = 126;
-  localparam int unsigned SB_RX_W = 101;
+  localparam int unsigned SB_TX_W = 134;
+  localparam int unsigned SB_RX_W = 109;
   logic [SB_TX_W-1:0] tx_cdc_data;
   logic               tx_cdc_busy;
   logic               loc_tx_load;
   logic [4:0]         loc_tx_opcode;
   logic [2:0]         loc_tx_srcid, loc_tx_dstid;
-  logic [7:0]         loc_tx_msginfo, loc_tx_msgcode, loc_tx_msgsubcode;
+  logic [15:0]        loc_tx_msginfo;
+  logic [7:0]         loc_tx_msgcode, loc_tx_msgsubcode;
   logic [7:0]         loc_tx_be;
   logic [4:0]         loc_tx_tag;
   logic               loc_tx_ep;
@@ -265,7 +270,8 @@ module ut_ltsm;
   logic               loc_rx_pkt_vld;
   logic [4:0]         loc_rx_opcode;
   logic [2:0]         loc_rx_srcid, loc_rx_dstid;
-  logic [7:0]         loc_rx_msginfo, loc_rx_msgcode, loc_rx_msgsubcode;
+  logic [15:0]        loc_rx_msginfo;
+  logic [7:0]         loc_rx_msgcode, loc_rx_msgsubcode;
   logic [63:0]        loc_rx_data;
   logic               loc_rx_cp_err, loc_rx_dp_err;
   logic [SB_RX_W-1:0] rx_cdc_data;
@@ -276,7 +282,8 @@ module ut_ltsm;
   logic        par_tx_load, par_tx_busy;
   logic [4:0]  par_tx_opcode;
   logic [2:0]  par_tx_srcid, par_tx_dstid;
-  logic [7:0]  par_tx_msginfo, par_tx_msgcode, par_tx_msgsubcode;
+  logic [15:0] par_tx_msginfo;
+  logic [7:0]  par_tx_msgcode, par_tx_msgsubcode;
   logic [7:0]  par_tx_be;
   logic [4:0]  par_tx_tag;
   logic        par_tx_ep;
@@ -314,7 +321,7 @@ module ut_ltsm;
     .rdi_disabled_req(1'b0),
     .active_entry_done(),
     .clear_start_link_train(),
-    .link_trained(link_trained), .train_error(train_error),
+    .link_trained(link_trained), .phy_training_done(), .train_error(train_error),
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
     .degrade_lanes(degrade_lanes),
@@ -387,7 +394,7 @@ module ut_ltsm;
     loc_tx_packet.opcode = loc_tx_opcode;
     loc_tx_packet.src_id = loc_tx_srcid;
     loc_tx_packet.dst_id = loc_tx_dstid;
-    loc_tx_packet.msg_info = {8'h0, loc_tx_msginfo};
+    loc_tx_packet.msg_info = loc_tx_msginfo;
     loc_tx_packet.msg_code = loc_tx_msgcode;
     loc_tx_packet.msg_subcode = loc_tx_msgsubcode;
     loc_tx_packet.be = loc_tx_be;
@@ -400,7 +407,7 @@ module ut_ltsm;
   assign loc_rx_opcode = loc_rx_packet.opcode;
   assign loc_rx_srcid = loc_rx_packet.src_id;
   assign loc_rx_dstid = loc_rx_packet.dst_id;
-  assign loc_rx_msginfo = loc_rx_packet.msg_info[7:0];
+  assign loc_rx_msginfo = loc_rx_packet.msg_info;
   assign loc_rx_msgcode = loc_rx_packet.msg_code;
   assign loc_rx_msgsubcode = loc_rx_packet.msg_subcode;
   assign loc_rx_data = loc_rx_packet.data;
@@ -461,7 +468,7 @@ module ut_ltsm;
     par_tx_packet.opcode = par_tx_opcode;
     par_tx_packet.src_id = par_tx_srcid;
     par_tx_packet.dst_id = par_tx_dstid;
-    par_tx_packet.msg_info = {8'h0, par_tx_msginfo};
+    par_tx_packet.msg_info = par_tx_msginfo;
     par_tx_packet.msg_code = par_tx_msgcode;
     par_tx_packet.msg_subcode = par_tx_msgsubcode;
     par_tx_packet.be = par_tx_be;
@@ -538,7 +545,7 @@ module ut_ltsm;
       par_tx_opcode     <= 5'b0;
       par_tx_srcid      <= 3'b0;
       par_tx_dstid      <= 3'b0;
-      par_tx_msginfo    <= 8'b0;
+      par_tx_msginfo    <= 16'h0000;
       par_tx_msgcode    <= 8'b0;
       par_tx_msgsubcode <= 8'b0;
       par_tx_be         <= 8'b0;
@@ -562,16 +569,16 @@ module ut_ltsm;
         if ((par_rx_msgcode == MC_MBINIT_REQ) &&
             (par_rx_msgsubcode == MS_PARAM_CFG)) begin
           par_tx_opcode     <= SB_OP_MSG_DATA64;
-          par_tx_msginfo    <= 8'h00;
+          par_tx_msginfo    <= 16'h0000;
           par_tx_msgcode    <= MC_MBINIT_RSP;
           par_tx_msgsubcode <= MS_PARAM_CFG;
           par_tx_data_in    <= PARAM_RSP_DATA;
           par_tx_has_data   <= 1'b1;
         end else begin
           par_tx_opcode     <= par_rx_opcode;
-          par_tx_msginfo    <= 8'h00;
-          par_tx_msgcode    <= rsp_for(par_rx_msgcode);
-          par_tx_msgsubcode <= par_rx_msgsubcode;
+          par_tx_msginfo    <= 16'h0000;
+          par_tx_msgcode    <= rsp_code_for(par_rx_msgcode, par_rx_msgsubcode);
+          par_tx_msgsubcode <= rsp_subcode_for(par_rx_msgcode, par_rx_msgsubcode);
           par_tx_data_in    <= 64'b0;
           par_tx_has_data   <= 1'b0;
         end
@@ -579,15 +586,23 @@ module ut_ltsm;
     end
   end
 
-  function automatic logic [7:0] rsp_for(input logic [7:0] code);
+  function automatic logic [7:0] rsp_code_for(input logic [7:0] code, input logic [7:0] subcode);
     case (code)
-      MC_SB_DONE_REQ:  rsp_for = MC_SB_DONE_RSP;
-      MC_MBINIT_REQ:   rsp_for = MC_MBINIT_RSP;
-      MC_MBTRAIN_REQ:  rsp_for = MC_MBTRAIN_RSP;
-      MC_LM_RDI_REQ:   rsp_for = MC_LM_RDI_RSP;
-      MC_PHYR_REQ:     rsp_for = MC_PHYR_RSP;
-      default:         rsp_for = MC_TE_RSP;
+      MC_SB_DONE_REQ:  rsp_code_for = MC_SB_DONE_RSP;
+      MC_MBINIT_REQ:   rsp_code_for = MC_MBINIT_RSP;
+      MC_MBTRAIN_REQ:  rsp_code_for = (subcode == 8'h09) ? 8'hBA : MC_MBTRAIN_RSP;
+      8'hBA:           rsp_code_for = (subcode == 8'h09) ? 8'hBA : 8'hB5;
+      MC_LM_RDI_REQ:   rsp_code_for = MC_LM_RDI_RSP;
+      MC_PHYR_REQ:     rsp_code_for = MC_PHYR_RSP;
+      default:         rsp_code_for = MC_TE_RSP;
     endcase
+  endfunction
+
+  function automatic logic [7:0] rsp_subcode_for(input logic [7:0] code, input logic [7:0] subcode);
+    if ((code == 8'hBA) && (subcode == 8'h0E))
+      rsp_subcode_for = 8'h0F;
+    else
+      rsp_subcode_for = subcode;
   endfunction
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,700 @@
+// ============================================================================
+// File      : tb/waveform/tb_link_init_wave.sv
+// Project   : UCIe 1.0 Simplified Endpoint
+// Purpose   : Two-Die (Die0 <-> Die1) Link Initialization Waveform Testbench
+//
+// SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 4.5.3 - Link Training State Machine (LTSM)
+//   UCIe 1.0 Specification, Section 7.5.1 - UCIe Link DVSEC (Link Control)
+//   UCIe 1.0 Specification, Section 8.1   - Raw Die-to-Die Interface (RDI, Table 114)
+//   UCIe 1.0 Specification, Section 8.2   - Flit-Aware Die-to-Die Interface (FDI, Table 115)
+//   UCIe 1.0 Specification, Section 8.1.6 - RDI Bring-up Flow (Active Entry)
+//
+// TEST SEQUENCE:
+//   1. Both dies start from hardware reset (lreset_n=0, sbreset_n=0).
+//   2. Both dies enter synchronous reset state from hardware reset.
+//   3. Protocol Layer on both dies writes 1b to "Start UCIe Link Training"
+//      bit in UCIe Link Control register (offset 0x00) via FDI sideband CfgWr.
+//   4. Clean execution of SBINIT, MBINIT, MBTRAIN, and LINKINIT without errors.
+//   5. Active state achieved in LTSM, RDI SM, and FDI SM on both dies,
+//      broadcasted to partner die and Protocol Layer.
+//   6. Simulation finishes cleanly after link reaches stable ACTIVE.
+// ============================================================================
+`include "ucie_pkg.sv"
+import ucie_pkg::*;
+
+`timescale 1ns/1ps
+module tb_link_init_wave;
+
+  // ==========================================================================
+  // Clocks
+  // ==========================================================================
+  logic lclk;   // 500 MHz local clock (2.0 ns period)
+  logic sbclk;  // 800 MHz sideband clock (1.25 ns period)
+  logic mbclk;  // 2.0 GHz mainband forwarded clock fCK (0.5 ns period)
+
+  initial begin
+    lclk  = 1'b0;
+    sbclk = 1'b0;
+    mbclk = 1'b0;
+  end
+
+  always #1.000 lclk = ~lclk;
+  always #0.625 sbclk = ~sbclk;
+
+  logic mbclk_en;
+  always begin
+    if (mbclk_en === 1'b1) begin
+      #0.250 mbclk = ~mbclk;
+    end else begin
+      mbclk = 1'b0;
+      @(mbclk_en);
+    end
+  end
+
+  // ==========================================================================
+  // Resets
+  // ==========================================================================
+  logic d0_lreset_n;
+  logic d0_sbreset_n;
+  logic d1_lreset_n;
+  logic d1_sbreset_n;
+  time  reset_release_time;
+
+  initial begin
+    d0_lreset_n  = 1'b0;
+    d0_sbreset_n = 1'b0;
+    d1_lreset_n  = 1'b0;
+    d1_sbreset_n = 1'b0;
+    reset_release_time = 0;
+
+    // Hold hardware reset across initial cycles, then release synchronously
+    #20.000;
+    @(negedge lclk);
+    d0_lreset_n  = 1'b1;
+    d0_sbreset_n = 1'b1;
+    d1_lreset_n  = 1'b1;
+    d1_sbreset_n = 1'b1;
+    reset_release_time = $time;
+    $display("[%0t ns] Synchronous hardware reset released on Die0 and Die1", $time);
+  end
+
+  // ==========================================================================
+  // Die-to-Die Interconnect (Crossed Wires)
+  // ==========================================================================
+  // Sideband scalar wires
+  logic                 sb_d0_to_d1_clk;
+  logic                 sb_d0_to_d1_data;
+  logic                 sb_d1_to_d0_clk;
+  logic                 sb_d1_to_d0_data;
+
+  // Mainband data & framing valid
+  logic [NLANES_MAX-1:0] mb_d0_to_d1_data;
+  logic                  mb_d0_to_d1_valid;
+  logic [NLANES_MAX-1:0] mb_d1_to_d0_data;
+  logic                  mb_d1_to_d0_valid;
+
+  // ==========================================================================
+  // Die 0: FDI Interface Signals (Table 115)
+  // ==========================================================================
+  logic                  d0_start_link_train;
+  logic                  d0_lp_irdy;
+  logic                  d0_lp_valid;
+  logic [DATA_W-1:0]     d0_lp_data;
+  logic [7:0]            d0_lp_stream;
+  logic                  d0_lp_stallack;
+  logic                  d0_lp_rx_active_sts;
+  logic [3:0]            d0_lp_state_req;
+  logic                  d0_lp_linkerror;
+  logic                  d0_lp_clk_ack;
+  logic                  d0_lp_wake_req;
+  logic [NC-1:0]         d0_lp_cfg;
+  logic                  d0_lp_cfg_vld;
+  logic                  d0_lp_cfg_crd;
+
+  logic                  d0_pl_trdy;
+  logic                  d0_pl_valid;
+  logic [DATA_W-1:0]     d0_pl_data;
+  logic [7:0]            d0_pl_stream;
+  logic                  d0_pl_error;
+  logic                  d0_pl_cerror;
+  logic                  d0_pl_nferror;
+  logic                  d0_pl_trainerror;
+  logic                  d0_pl_phyinrecenter;
+  logic [2:0]            d0_pl_protocol;
+  logic [3:0]            d0_pl_protocol_flitfmt;
+  logic                  d0_pl_protocol_vld;
+  logic                  d0_pl_clk_req;
+  logic                  d0_pl_wake_ack;
+  logic [2:0]            d0_pl_speedmode;
+  logic [2:0]            d0_pl_lnk_cfg;
+  logic                  d0_pl_rx_active_req;
+  logic [3:0]            d0_pl_state_sts;
+  logic                  d0_pl_inband_pres;
+  logic                  d0_pl_stallreq;
+  logic [NC-1:0]         d0_pl_cfg;
+  logic                  d0_pl_cfg_vld;
+  logic                  d0_pl_cfg_crd;
+
+  // ==========================================================================
+  // Die 1: FDI Interface Signals (Table 115)
+  // ==========================================================================
+  logic                  d1_start_link_train;
+  logic                  d1_lp_irdy;
+  logic                  d1_lp_valid;
+  logic [DATA_W-1:0]     d1_lp_data;
+  logic [7:0]            d1_lp_stream;
+  logic                  d1_lp_stallack;
+  logic                  d1_lp_rx_active_sts;
+  logic [3:0]            d1_lp_state_req;
+  logic                  d1_lp_linkerror;
+  logic                  d1_lp_clk_ack;
+  logic                  d1_lp_wake_req;
+  logic [NC-1:0]         d1_lp_cfg;
+  logic                  d1_lp_cfg_vld;
+  logic                  d1_lp_cfg_crd;
+
+  logic                  d1_pl_trdy;
+  logic                  d1_pl_valid;
+  logic [DATA_W-1:0]     d1_pl_data;
+  logic [7:0]            d1_pl_stream;
+  logic                  d1_pl_error;
+  logic                  d1_pl_cerror;
+  logic                  d1_pl_nferror;
+  logic                  d1_pl_trainerror;
+  logic                  d1_pl_phyinrecenter;
+  logic [2:0]            d1_pl_protocol;
+  logic [3:0]            d1_pl_protocol_flitfmt;
+  logic                  d1_pl_protocol_vld;
+  logic                  d1_pl_clk_req;
+  logic                  d1_pl_wake_ack;
+  logic [2:0]            d1_pl_speedmode;
+  logic [2:0]            d1_pl_lnk_cfg;
+  logic                  d1_pl_rx_active_req;
+  logic [3:0]            d1_pl_state_sts;
+  logic                  d1_pl_inband_pres;
+  logic                  d1_pl_stallreq;
+  logic [NC-1:0]         d1_pl_cfg;
+  logic                  d1_pl_cfg_vld;
+  logic                  d1_pl_cfg_crd;
+
+  // ==========================================================================
+  // DUT Instantiations (Die 0 and Die 1)
+  // ==========================================================================
+  ucie_main #(
+    .NBYTES(NBYTES),
+    .NLANES(NLANES_MAX),
+    .NC(NC)
+  ) dut_die0 (
+    .lclk                  (lclk),
+    .lreset_n              (d0_lreset_n),
+    .mbclk                 (mbclk),
+    .sbclk                 (sbclk),
+    .sbreset_n             (d0_sbreset_n),
+    .start_link_train      (d0_start_link_train),
+    // FDI (Table 115)
+    .lp_irdy               (d0_lp_irdy),
+    .lp_valid              (d0_lp_valid),
+    .lp_data               (d0_lp_data),
+    .lp_stream             (d0_lp_stream),
+    .lp_stallack           (d0_lp_stallack),
+    .lp_rx_active_sts      (d0_lp_rx_active_sts),
+    .pl_trdy               (d0_pl_trdy),
+    .pl_valid              (d0_pl_valid),
+    .pl_data               (d0_pl_data),
+    .pl_stream             (d0_pl_stream),
+    .pl_error              (d0_pl_error),
+    .pl_cerror             (d0_pl_cerror),
+    .pl_nferror            (d0_pl_nferror),
+    .pl_trainerror         (d0_pl_trainerror),
+    .pl_phyinrecenter      (d0_pl_phyinrecenter),
+    .pl_protocol           (d0_pl_protocol),
+    .pl_protocol_flitfmt   (d0_pl_protocol_flitfmt),
+    .pl_protocol_vld       (d0_pl_protocol_vld),
+    .pl_rx_active_req      (d0_pl_rx_active_req),
+    .lp_state_req          (d0_lp_state_req),
+    .pl_state_sts          (d0_pl_state_sts),
+    .pl_inband_pres        (d0_pl_inband_pres),
+    .pl_stallreq           (d0_pl_stallreq),
+    .lp_linkerror          (d0_lp_linkerror),
+    .lp_cfg                (d0_lp_cfg),
+    .lp_cfg_vld            (d0_lp_cfg_vld),
+    .lp_cfg_crd            (d0_lp_cfg_crd),
+    .pl_cfg                (d0_pl_cfg),
+    .pl_cfg_vld            (d0_pl_cfg_vld),
+    .pl_cfg_crd            (d0_pl_cfg_crd),
+    .pl_clk_req            (d0_pl_clk_req),
+    .lp_clk_ack            (d0_lp_clk_ack),
+    .lp_wake_req           (d0_lp_wake_req),
+    .pl_wake_ack           (d0_pl_wake_ack),
+    .pl_speedmode          (d0_pl_speedmode),
+    .pl_lnk_cfg            (d0_pl_lnk_cfg),
+    // Sideband & Mainband
+    .sb_tx_clk             (sb_d0_to_d1_clk),
+    .sb_tx_data            (sb_d0_to_d1_data),
+    .sb_rx_clk             (sb_d1_to_d0_clk),
+    .sb_rx_data            (sb_d1_to_d0_data),
+    .mb_tx_data            (mb_d0_to_d1_data),
+    .mb_tx_valid           (mb_d0_to_d1_valid),
+    .mb_rx_data            (mb_d1_to_d0_data),
+    .mb_rx_valid           (mb_d1_to_d0_valid)
+  );
+
+  ucie_main #(
+    .NBYTES(NBYTES),
+    .NLANES(NLANES_MAX),
+    .NC(NC)
+  ) dut_die1 (
+    .lclk                  (lclk),
+    .lreset_n              (d1_lreset_n),
+    .mbclk                 (mbclk),
+    .sbclk                 (sbclk),
+    .sbreset_n             (d1_sbreset_n),
+    .start_link_train      (d1_start_link_train),
+    // FDI (Table 115)
+    .lp_irdy               (d1_lp_irdy),
+    .lp_valid              (d1_lp_valid),
+    .lp_data               (d1_lp_data),
+    .lp_stream             (d1_lp_stream),
+    .lp_stallack           (d1_lp_stallack),
+    .lp_rx_active_sts      (d1_lp_rx_active_sts),
+    .pl_trdy               (d1_pl_trdy),
+    .pl_valid              (d1_pl_valid),
+    .pl_data               (d1_pl_data),
+    .pl_stream             (d1_pl_stream),
+    .pl_error              (d1_pl_error),
+    .pl_cerror             (d1_pl_cerror),
+    .pl_nferror            (d1_pl_nferror),
+    .pl_trainerror         (d1_pl_trainerror),
+    .pl_phyinrecenter      (d1_pl_phyinrecenter),
+    .pl_protocol           (d1_pl_protocol),
+    .pl_protocol_flitfmt   (d1_pl_protocol_flitfmt),
+    .pl_protocol_vld       (d1_pl_protocol_vld),
+    .pl_rx_active_req      (d1_pl_rx_active_req),
+    .lp_state_req          (d1_lp_state_req),
+    .pl_state_sts          (d1_pl_state_sts),
+    .pl_inband_pres        (d1_pl_inband_pres),
+    .pl_stallreq           (d1_pl_stallreq),
+    .lp_linkerror          (d1_lp_linkerror),
+    .lp_cfg                (d1_lp_cfg),
+    .lp_cfg_vld            (d1_lp_cfg_vld),
+    .lp_cfg_crd            (d1_lp_cfg_crd),
+    .pl_cfg                (d1_pl_cfg),
+    .pl_cfg_vld            (d1_pl_cfg_vld),
+    .pl_cfg_crd            (d1_pl_cfg_crd),
+    .pl_clk_req            (d1_pl_clk_req),
+    .lp_clk_ack            (d1_lp_clk_ack),
+    .lp_wake_req           (d1_lp_wake_req),
+    .pl_wake_ack           (d1_pl_wake_ack),
+    .pl_speedmode          (d1_pl_speedmode),
+    .pl_lnk_cfg            (d1_pl_lnk_cfg),
+    // Sideband & Mainband
+    .sb_tx_clk             (sb_d1_to_d0_clk),
+    .sb_tx_data            (sb_d1_to_d0_data),
+    .sb_rx_clk             (sb_d0_to_d1_clk),
+    .sb_rx_data            (sb_d0_to_d1_data),
+    .mb_tx_data            (mb_d1_to_d0_data),
+    .mb_tx_valid           (mb_d1_to_d0_valid),
+    .mb_rx_data            (mb_d0_to_d1_data),
+    .mb_rx_valid           (mb_d0_to_d1_valid)
+  );
+
+  // ==========================================================================
+  // RDI Interface Signals (Table 114) Exposed from DUT Internal Nets
+  // ==========================================================================
+  // Die 0 RDI (Table 114)
+  wire [3:0]          d0_rdi_lp_state_req   = dut_die0.rdi_lp_state_req;
+  wire                d0_rdi_lp_stallack    = dut_die0.rdi_lp_stallack;
+  wire                d0_rdi_lp_linkerror   = dut_die0.rdi_lp_linkerror;
+  wire                d0_rdi_lp_irdy        = dut_die0.rdi_lp_irdy;
+  wire                d0_rdi_lp_valid       = dut_die0.rdi_lp_valid;
+  wire [DATA_W-1:0]   d0_rdi_lp_data        = dut_die0.rdi_lp_data;
+  wire [3:0]          d0_rdi_pl_state_sts   = dut_die0.rdi_pl_state_sts;
+  wire                d0_rdi_pl_inband_pres = dut_die0.rdi_pl_inband_pres;
+  wire                d0_rdi_pl_linkerror   = dut_die0.rdi_pl_linkerror;
+  wire                d0_rdi_pl_error       = dut_die0.rdi_pl_error;
+  wire                d0_rdi_pl_phyinrecenter = dut_die0.rdi_pl_phyinrecenter;
+  wire                d0_rdi_pl_cerror      = dut_die0.rdi_pl_cerror;
+  wire                d0_rdi_pl_nferror     = dut_die0.rdi_pl_nferror;
+  wire                d0_rdi_pl_trainerror  = dut_die0.rdi_pl_trainerror;
+  wire                d0_rdi_pl_trdy        = dut_die0.rdi_pl_trdy;
+  wire                d0_rdi_pl_valid       = dut_die0.rdi_pl_valid;
+  wire [DATA_W-1:0]   d0_rdi_pl_data        = dut_die0.rdi_pl_data;
+  wire [2:0]          d0_rdi_pl_lnk_cfg     = dut_die0.rdi_pl_lnk_cfg;
+  wire [2:0]          d0_rdi_pl_speedmode   = dut_die0.rdi_pl_speedmode;
+  wire                d0_rdi_pl_stallreq    = dut_die0.rdi_pl_stallreq;
+
+  // Die 1 RDI (Table 114)
+  wire [3:0]          d1_rdi_lp_state_req   = dut_die1.rdi_lp_state_req;
+  wire                d1_rdi_lp_stallack    = dut_die1.rdi_lp_stallack;
+  wire                d1_rdi_lp_linkerror   = dut_die1.rdi_lp_linkerror;
+  wire                d1_rdi_lp_irdy        = dut_die1.rdi_lp_irdy;
+  wire                d1_rdi_lp_valid       = dut_die1.rdi_lp_valid;
+  wire [DATA_W-1:0]   d1_rdi_lp_data        = dut_die1.rdi_lp_data;
+  wire [3:0]          d1_rdi_pl_state_sts   = dut_die1.rdi_pl_state_sts;
+  wire                d1_rdi_pl_inband_pres = dut_die1.rdi_pl_inband_pres;
+  wire                d1_rdi_pl_linkerror   = dut_die1.rdi_pl_linkerror;
+  wire                d1_rdi_pl_error       = dut_die1.rdi_pl_error;
+  wire                d1_rdi_pl_phyinrecenter = dut_die1.rdi_pl_phyinrecenter;
+  wire                d1_rdi_pl_cerror      = dut_die1.rdi_pl_cerror;
+  wire                d1_rdi_pl_nferror     = dut_die1.rdi_pl_nferror;
+  wire                d1_rdi_pl_trainerror  = dut_die1.rdi_pl_trainerror;
+  wire                d1_rdi_pl_trdy        = dut_die1.rdi_pl_trdy;
+  wire                d1_rdi_pl_valid       = dut_die1.rdi_pl_valid;
+  wire [DATA_W-1:0]   d1_rdi_pl_data        = dut_die1.rdi_pl_data;
+  wire [2:0]          d1_rdi_pl_lnk_cfg     = dut_die1.rdi_pl_lnk_cfg;
+  wire [2:0]          d1_rdi_pl_speedmode   = dut_die1.rdi_pl_speedmode;
+  wire                d1_rdi_pl_stallreq    = dut_die1.rdi_pl_stallreq;
+
+  // ==========================================================================
+  // State Machine Registers
+  // ==========================================================================
+  wire [7:0] d0_ltsm_state         = dut_die0.u_lphy.u_ltsm.state_q;
+  wire [1:0] d0_sbinit_phase       = dut_die0.u_lphy.u_ltsm.sbinit_phase_q;
+  wire [3:0] d0_rdi_state          = dut_die0.u_lphy.u_rdi_sm.state_q;
+  wire [3:0] d0_fdi_state          = dut_die0.u_adapter.u_fdi_sm.fdi_q;
+  wire       d0_link_control_start = dut_die0.u_adapter.u_regfile.reg_link_ctrl[0];
+
+  wire [7:0] d1_ltsm_state         = dut_die1.u_lphy.u_ltsm.state_q;
+  wire [1:0] d1_sbinit_phase       = dut_die1.u_lphy.u_ltsm.sbinit_phase_q;
+  wire [3:0] d1_rdi_state          = dut_die1.u_lphy.u_rdi_sm.state_q;
+  wire [3:0] d1_fdi_state          = dut_die1.u_adapter.u_fdi_sm.fdi_q;
+  wire       d1_link_control_start = dut_die1.u_adapter.u_regfile.reg_link_ctrl[0];
+
+  // Sideband observability
+  wire       d0_sb_rx_pkt_vld      = dut_die0.u_lphy.sb_rx_pkt_vld;
+  wire [4:0] d0_sb_rx_opcode       = dut_die0.u_lphy.sb_rx_opcode;
+  wire [7:0] d0_sb_rx_msgcode      = dut_die0.u_lphy.sb_rx_msgcode;
+  wire [7:0] d0_sb_rx_msgsubcode   = dut_die0.u_lphy.sb_rx_msgsubcode;
+
+  wire       d1_sb_rx_pkt_vld      = dut_die1.u_lphy.sb_rx_pkt_vld;
+  wire [4:0] d1_sb_rx_opcode       = dut_die1.u_lphy.sb_rx_opcode;
+  wire [7:0] d1_sb_rx_msgcode      = dut_die1.u_lphy.sb_rx_msgcode;
+  wire [7:0] d1_sb_rx_msgsubcode   = dut_die1.u_lphy.sb_rx_msgsubcode;
+
+  // Mainband clock gating enable
+  assign mbclk_en = (d0_ltsm_state == LT_MB_LINKSPEED) ||
+                    (d1_ltsm_state == LT_MB_LINKSPEED) ||
+                    (d0_ltsm_state == LT_LINKINIT)     ||
+                    (d1_ltsm_state == LT_LINKINIT)     ||
+                    (d0_ltsm_state == LT_ACTIVE)       ||
+                    (d1_ltsm_state == LT_ACTIVE);
+
+  // ==========================================================================
+  // Protocol Layer BFM Stimulus & Automated Handshakes
+  // ==========================================================================
+  // Automatic stallack response
+  always @(posedge lclk or negedge d0_lreset_n) begin
+    if (!d0_lreset_n) d0_lp_stallack <= 1'b0;
+    else              d0_lp_stallack <= d0_pl_stallreq;
+  end
+
+  always @(posedge lclk or negedge d1_lreset_n) begin
+    if (!d1_lreset_n) d1_lp_stallack <= 1'b0;
+    else              d1_lp_stallack <= d1_pl_stallreq;
+  end
+
+  // Automatic rx_active_sts response
+  always @(posedge lclk or negedge d0_lreset_n) begin
+    if (!d0_lreset_n)
+      d0_lp_rx_active_sts <= 1'b0;
+    else if (d0_pl_rx_active_req)
+      d0_lp_rx_active_sts <= 1'b1;
+    else if (d0_pl_state_sts == FDI_STS_RESET || d0_pl_state_sts == FDI_STS_LINKRESET)
+      d0_lp_rx_active_sts <= 1'b0;
+  end
+
+  always @(posedge lclk or negedge d1_lreset_n) begin
+    if (!d1_lreset_n)
+      d1_lp_rx_active_sts <= 1'b0;
+    else if (d1_pl_rx_active_req)
+      d1_lp_rx_active_sts <= 1'b1;
+    else if (d1_pl_state_sts == FDI_STS_RESET || d1_pl_state_sts == FDI_STS_LINKRESET)
+      d1_lp_rx_active_sts <= 1'b0;
+  end
+
+  // Task: Protocol Layer Configuration Write to UCIe Link Control (Offset 0x00)
+  // Sends a standard 64-bit sideband configuration header followed by 64-bit payload
+  // over the FDI lp_cfg bus.
+  task automatic fdi_cfg_write_link_control(input int die_sel);
+    sb_packet_t req;
+    logic [63:0] hdr;
+    logic [63:0] pld;
+    begin
+      req = '0;
+      req.opcode = SB_OP_CFG_WRITE32;
+      req.src_id = FDI_SRCID_STACK0;
+      req.dst_id = FDI_DSTID_ADAPTER;
+      req.addr   = 27'h0000000;              // UCIe Link Control register (Table 65)
+      req.data   = 64'h0000_0000_0000_0001;  // Bit 0 = 1b: Start UCIe Link Training
+      req.be     = 8'h0F;
+      req.tag    = (die_sel == 0) ? 5'h01 : 5'h02;
+      hdr = ucie_pkg::sb_encode_header(req);
+      pld = 64'h0000_0000_0000_0001;
+
+      // 8 cycles header
+      for (int b = 0; b < 8; b++) begin
+        @(negedge lclk);
+        if (die_sel == 0) begin
+          d0_lp_cfg     = hdr[b*8 +: 8];
+          d0_lp_cfg_vld = 1'b1;
+        end else begin
+          d1_lp_cfg     = hdr[b*8 +: 8];
+          d1_lp_cfg_vld = 1'b1;
+        end
+      end
+      // 8 cycles payload
+      for (int b = 0; b < 8; b++) begin
+        @(negedge lclk);
+        if (die_sel == 0) begin
+          d0_lp_cfg     = pld[b*8 +: 8];
+          d0_lp_cfg_vld = 1'b1;
+        end else begin
+          d1_lp_cfg     = pld[b*8 +: 8];
+          d1_lp_cfg_vld = 1'b1;
+        end
+      end
+      @(negedge lclk);
+      if (die_sel == 0) begin
+        d0_lp_cfg     = '0;
+        d0_lp_cfg_vld = 1'b0;
+      end else begin
+        d1_lp_cfg     = '0;
+        d1_lp_cfg_vld = 1'b0;
+      end
+    end
+  endtask
+
+  // Protocol Layer Master Flow
+  initial begin
+    // Default initial inputs
+    d0_start_link_train = 1'b0;
+    d0_lp_irdy          = 1'b0;
+    d0_lp_valid         = 1'b0;
+    d0_lp_data          = '0;
+    d0_lp_stream        = STREAM_ID_S0_STREAMING;
+    d0_lp_state_req     = FDI_REQ_NOP;
+    d0_lp_linkerror     = 1'b0;
+    d0_lp_clk_ack       = 1'b1;
+    d0_lp_wake_req      = 1'b0;
+    d0_lp_cfg           = '0;
+    d0_lp_cfg_vld       = 1'b0;
+    d0_lp_cfg_crd       = 1'b0;
+
+    d1_start_link_train = 1'b0;
+    d1_lp_irdy          = 1'b0;
+    d1_lp_valid         = 1'b0;
+    d1_lp_data          = '0;
+    d1_lp_stream        = STREAM_ID_S0_STREAMING;
+    d1_lp_state_req     = FDI_REQ_NOP;
+    d1_lp_linkerror     = 1'b0;
+    d1_lp_clk_ack       = 1'b1;
+    d1_lp_wake_req      = 1'b0;
+    d1_lp_cfg           = '0;
+    d1_lp_cfg_vld       = 1'b0;
+    d1_lp_cfg_crd       = 1'b0;
+
+    // Wait until synchronous hardware reset deassertion
+    wait (d0_lreset_n === 1'b1 && d1_lreset_n === 1'b1);
+
+    // Advance to 3999 us (remove 0ms to 3999us wait window from active training trace)
+    #3_999_080;
+    @(posedge lclk);
+    $display("[%0t ns] Protocol Layer on Die0 and Die1 writing 1b to Start UCIe Link Training in UCIe Link Control...", $time);
+
+    // Protocol layer on both dies writes 1b to Start UCIe Link Training bit in UCIe Link Control
+    fork
+      fdi_cfg_write_link_control(0);
+      fdi_cfg_write_link_control(1);
+    join
+
+    // Also assert the top-level trigger pin
+    @(negedge lclk);
+    d0_start_link_train = 1'b1;
+    d1_start_link_train = 1'b1;
+
+    // Protocol layer sets Active state request on FDI
+    repeat (2) @(posedge lclk);
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_ACTIVE;
+    d1_lp_state_req = FDI_REQ_ACTIVE;
+    $display("[%0t ns] Protocol Layer requested FDI ACTIVE (lp_state_req=ACTIVE)", $time);
+  end
+
+  // ==========================================================================
+  // LTSM State Transition Logging & Verification
+  // ==========================================================================
+  logic [7:0] d0_prev_state, d1_prev_state;
+  initial begin
+    d0_prev_state = LT_RESET;
+    d1_prev_state = LT_RESET;
+  end
+
+  always @(posedge lclk) begin
+    if (d0_ltsm_state !== d0_prev_state) begin
+      $display("[%0t ns] DIE0 LTSM Transition: %s (%02h) -> %s (%02h) | RDI=%01h FDI=%01h",
+               $time, ltsm_state_name(d0_prev_state), d0_prev_state,
+               ltsm_state_name(d0_ltsm_state), d0_ltsm_state, d0_rdi_state, d0_fdi_state);
+      d0_prev_state = d0_ltsm_state;
+    end
+    if (d1_ltsm_state !== d1_prev_state) begin
+      $display("[%0t ns] DIE1 LTSM Transition: %s (%02h) -> %s (%02h) | RDI=%01h FDI=%01h",
+               $time, ltsm_state_name(d1_prev_state), d1_prev_state,
+               ltsm_state_name(d1_ltsm_state), d1_ltsm_state, d1_rdi_state, d1_fdi_state);
+      d1_prev_state = d1_ltsm_state;
+    end
+  end
+
+  // Helper function to decode state names
+  function automatic string ltsm_state_name(input logic [7:0] st);
+    case (st)
+      LT_RESET:        return "RESET";
+      LT_SBINIT:       return "SBINIT";
+      LT_MBINIT_PARAM: return "MBINIT.PARAM";
+      LT_MBINIT_CAL:   return "MBINIT.CAL";
+      LT_MBINIT_RPCLK: return "MBINIT.RPCLK";
+      LT_MBINIT_RPVAL: return "MBINIT.RPVAL";
+      LT_MBINIT_REVMB: return "MBINIT.REVMB";
+      LT_MBINIT_RPMB:  return "MBINIT.RPMB";
+      LT_MB_VALVREF:   return "MBTRAIN.VALVREF";
+      LT_MB_DATAVREF:  return "MBTRAIN.DATAVREF";
+      LT_MB_SPEEDIDLE: return "MBTRAIN.SPEEDIDLE";
+      LT_MB_TXSELFCAL: return "MBTRAIN.TXSELFCAL";
+      LT_MB_RXCLKCAL:  return "MBTRAIN.RXCLKCAL";
+      LT_MB_VTCENTER:  return "MBTRAIN.VTCENTER";
+      LT_MB_DTVREF1:   return "MBTRAIN.DTVREF1";
+      LT_MB_RXDESKEW:  return "MBTRAIN.RXDESKEW";
+      LT_MB_DTCENTER2: return "MBTRAIN.DTCENTER2";
+      LT_MB_LINKSPEED: return "MBTRAIN.LINKSPEED";
+      LT_LINKINIT:     return "LINKINIT";
+      LT_ACTIVE:       return "ACTIVE";
+      LT_TRAINERROR:   return "TRAINERROR";
+      default:         return "UNKNOWN";
+    endcase
+  endfunction
+
+  // ==========================================================================
+  // Termination and Success Checker
+  // ==========================================================================
+  initial begin
+    // Bounded wait for link initialization to reach ACTIVE state
+    wait (d0_ltsm_state == LT_ACTIVE && d1_ltsm_state == LT_ACTIVE);
+    wait (d0_rdi_state  == RDI_STS_ACTIVE && d1_rdi_state  == RDI_STS_ACTIVE);
+    wait (d0_fdi_state  == FDI_STS_ACTIVE && d1_fdi_state  == FDI_STS_ACTIVE);
+    wait (d0_pl_state_sts == FDI_STS_ACTIVE && d1_pl_state_sts == FDI_STS_ACTIVE);
+
+    // Let link run in stable ACTIVE for 32 cycles to show steady state on waveform
+    repeat (32) @(posedge lclk);
+
+    $display("\n==========================================================================");
+    $display("LINK INITIALIZATION SUCCESSFUL AT TIME %0t ns", $time);
+    $display("  Die0 LTSM: %s (%02h) | RDI: ACTIVE (%01h) | FDI: ACTIVE (%01h)",
+             ltsm_state_name(d0_ltsm_state), d0_ltsm_state, d0_rdi_state, d0_pl_state_sts);
+    $display("  Die1 LTSM: %s (%02h) | RDI: ACTIVE (%01h) | FDI: ACTIVE (%01h)",
+             ltsm_state_name(d1_ltsm_state), d1_ltsm_state, d1_rdi_state, d1_pl_state_sts);
+    $display("  Active state successfully broadcasted to partner die and Protocol layer.");
+    $display("TEST PASSED tb_link_init_wave");
+    $display("==========================================================================\n");
+    $finish;
+  end
+
+  // Watchdog timeout
+  initial begin
+    #20_000_000; // 20 ms watchdog
+    $fatal(1, "TEST FAILED tb_link_init_wave: Watchdog timeout at %0t ns", $time);
+  end
+
+  // ==========================================================================
+  // VCD Waveform Dump
+  // ==========================================================================
+  string wave_path;
+  initial begin
+    // Remove waveform from 0ms to 3999us (waiting for reset dwell)
+    #3_999_000;
+    wave_path = "logs/link_init.vcd";
+    void'($value$plusargs("wave=%s", wave_path));
+    $dumpfile(wave_path);
+
+    // Group 1: Timing (Clocks and Resets)
+    $dumpvars(0, lclk, sbclk, mbclk,
+                 d0_lreset_n, d0_sbreset_n,
+                 d1_lreset_n, d1_sbreset_n);
+
+    // Group 2: FDI Interface (Table 115) - Die0 and Die1
+    $dumpvars(0, d0_lp_irdy, d0_pl_trdy,
+                 d0_lp_valid, d0_pl_valid,
+                 d0_lp_data, d0_pl_data,
+                 d0_lp_stream, d0_pl_stream,
+                 d0_lp_stallack, d0_pl_stallreq,
+                 d0_lp_rx_active_sts, d0_pl_rx_active_req,
+                 d0_lp_state_req, d0_pl_state_sts,
+                 d0_lp_linkerror,
+                 d0_pl_inband_pres,
+                 d0_pl_error, d0_pl_cerror, d0_pl_nferror,
+                 d0_pl_trainerror, d0_pl_phyinrecenter,
+                 d0_pl_protocol, d0_pl_protocol_flitfmt, d0_pl_protocol_vld,
+                 d0_pl_clk_req, d0_lp_clk_ack,
+                 d0_lp_wake_req, d0_pl_wake_ack,
+                 d0_pl_speedmode, d0_pl_lnk_cfg,
+                 d0_lp_cfg, d0_lp_cfg_vld, d0_lp_cfg_crd,
+                 d0_pl_cfg, d0_pl_cfg_vld, d0_pl_cfg_crd);
+
+    $dumpvars(0, d1_lp_irdy, d1_pl_trdy,
+                 d1_lp_valid, d1_pl_valid,
+                 d1_lp_data, d1_pl_data,
+                 d1_lp_stream, d1_pl_stream,
+                 d1_lp_stallack, d1_pl_stallreq,
+                 d1_lp_rx_active_sts, d1_pl_rx_active_req,
+                 d1_lp_state_req, d1_pl_state_sts,
+                 d1_lp_linkerror,
+                 d1_pl_inband_pres,
+                 d1_pl_error, d1_pl_cerror, d1_pl_nferror,
+                 d1_pl_trainerror, d1_pl_phyinrecenter,
+                 d1_pl_protocol, d1_pl_protocol_flitfmt, d1_pl_protocol_vld,
+                 d1_pl_clk_req, d1_lp_clk_ack,
+                 d1_lp_wake_req, d1_pl_wake_ack,
+                 d1_pl_speedmode, d1_pl_lnk_cfg,
+                 d1_lp_cfg, d1_lp_cfg_vld, d1_lp_cfg_crd,
+                 d1_pl_cfg, d1_pl_cfg_vld, d1_pl_cfg_crd);
+
+    // Group 3: RDI Interface (Table 114) - Die0 and Die1
+    $dumpvars(0, d0_rdi_lp_irdy, d0_rdi_pl_trdy,
+                 d0_rdi_lp_valid, d0_rdi_pl_valid,
+                 d0_rdi_lp_data, d0_rdi_pl_data,
+                 d0_rdi_lp_state_req, d0_rdi_pl_state_sts,
+                 d0_rdi_lp_stallack, d0_rdi_pl_stallreq,
+                 d0_rdi_lp_linkerror, d0_rdi_pl_linkerror,
+                 d0_rdi_pl_inband_pres,
+                 d0_rdi_pl_error, d0_rdi_pl_cerror, d0_rdi_pl_nferror,
+                 d0_rdi_pl_trainerror, d0_rdi_pl_phyinrecenter,
+                 d0_rdi_pl_speedmode, d0_rdi_pl_lnk_cfg);
+
+    $dumpvars(0, d1_rdi_lp_irdy, d1_rdi_pl_trdy,
+                 d1_rdi_lp_valid, d1_rdi_pl_valid,
+                 d1_rdi_lp_data, d1_rdi_pl_data,
+                 d1_rdi_lp_state_req, d1_rdi_pl_state_sts,
+                 d1_rdi_lp_stallack, d1_rdi_pl_stallreq,
+                 d1_rdi_lp_linkerror, d1_rdi_pl_linkerror,
+                 d1_rdi_pl_inband_pres,
+                 d1_rdi_pl_error, d1_rdi_pl_cerror, d1_rdi_pl_nferror,
+                 d1_rdi_pl_trainerror, d1_rdi_pl_phyinrecenter,
+                 d1_rdi_pl_speedmode, d1_rdi_pl_lnk_cfg);
+
+    // Group 4: State Machines
+    $dumpvars(0, d0_ltsm_state, d0_sbinit_phase,
+                 d0_rdi_state, d0_fdi_state, d0_link_control_start,
+                 d1_ltsm_state, d1_sbinit_phase,
+                 d1_rdi_state, d1_fdi_state, d1_link_control_start);
+
+    // Group 5: Sideband
+    $dumpvars(0, sb_d0_to_d1_clk, sb_d0_to_d1_data,
+                 sb_d1_to_d0_clk, sb_d1_to_d0_data,
+                 d0_sb_rx_pkt_vld, d0_sb_rx_opcode, d0_sb_rx_msgcode, d0_sb_rx_msgsubcode,
+                 d1_sb_rx_pkt_vld, d1_sb_rx_opcode, d1_sb_rx_msgcode, d1_sb_rx_msgsubcode);
+
+    // Group 6: Mainband
+    $dumpvars(0, mb_d0_to_d1_data, mb_d0_to_d1_valid,
+                 mb_d1_to_d0_data, mb_d1_to_d0_valid);
+  end
+
+endmodule

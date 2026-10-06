@@ -378,6 +378,28 @@ sbinit-wave: compile
 	@gzip -c $(LOGS)/sbinit.vcd > $(LOGS)/sbinit.vcd.gz
 	@echo "SBINIT WAVEFORM OK: $(LOGS)/sbinit.vcd"
 
+# -------------------------------------------------------- link-init-wave
+# Full RESET-to-ACTIVE link initialization waveform between Die 0 and Die 1.
+link-init-wave: compile
+	@mkdir -p $(OUT) $(LOGS)
+	@echo "== Two-Die Link Initialization waveform"
+	@$(IVERILOG) -g2012 -Wall $(INCLUDES) -o $(OUT)/link_init.vvp \
+	    $(TB)/waveform/tb_link_init_wave.sv $(RTL_TOP) $(RTL_PHY) \
+	    $(RTL_COMMON) $(RTL_ADAPT) > $(LOGS)/link_init_comp.txt 2>&1; \
+	  status=$$?; \
+	  if [ $$status -ne 0 ] || [ -s $(LOGS)/link_init_comp.txt ]; then \
+	    cat $(LOGS)/link_init_comp.txt; \
+	    echo "LINK INIT WAVEFORM FAILED (compile/warnings)"; exit 1; \
+	  fi
+	@timeout $(SIM_TIMEOUT)s $(VVP) $(OUT)/link_init.vvp \
+	    +wave=$(LOGS)/link_init.vcd 2>&1 | tee $(LOGS)/link_init_run.txt
+	@grep -q "^TEST PASSED tb_link_init_wave" $(LOGS)/link_init_run.txt || \
+	  { echo "LINK INIT WAVEFORM FAILED"; exit 1; }
+	@test -s $(LOGS)/link_init.vcd || \
+	  { echo "LINK INIT WAVEFORM FAILED: VCD is empty"; exit 1; }
+	@which vcd2fst > /dev/null 2>&1 && vcd2fst $(LOGS)/link_init.vcd $(LOGS)/link_init.fst || true
+	@cp -f $(TB)/waveform/link_init.gtkw $(LOGS)/link_init.gtkw
+	@echo "LINK INIT WAVEFORM OK: $(LOGS)/link_init.vcd and $(LOGS)/link_init.gtkw"
 # ------------------------------------------------------------- coverage
 # Aggregates multi-source Phase F coverage via cov_report.py.
 #

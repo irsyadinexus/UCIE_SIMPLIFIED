@@ -1991,38 +1991,27 @@ module ltsm #(
   //            PLAN.md Sections 15.4 and 15.9 Phase C.
   // =========================================================================
 
-  // The diagnostic pattern remains enabled throughout LINKINIT.
-  // It is disabled for every MBINIT and MBTRAIN immediate-success state.
-  // UCIe 1.0 Section 4.5.3.5 requires the LINKINIT LFSR reset.
-  // UCIe 1.0 Section 8.1.6 defines Active Entry independently of pat_done.
-  // PLAN.md Section 15.9 Phase C forbids diagnostic-pattern delay.
-  assign pat_enable = (state_q == LT_LINKINIT);
+  // Mainband pattern generation:
+  // Per UCIe 1.0 Section 4.5.3.4.12, continuous mode LFSR pattern is sent
+  // on mainband during MBTRAIN.LINKSPEED.
+  // Transmitters are idle during LINKINIT per Section 4.5.3.4.12 Step 7 and Section 4.5.3.5.
+  assign pat_enable = (state_q == LT_MB_LINKSPEED);
 
-  // The existing selection mux remains unchanged for Phase A compatibility.
-  // Only PAT_LFSR is effective because pat_enable is high only in LINKINIT.
-  // UCIe 1.0 Section 4.4.1 defines the diagnostic LFSR pattern.
-  // UCIe 1.0 Section 4.5.3.5 defines the LINKINIT reseed action.
-  // PLAN.md Sections 15.4 and 15.9 retain this diagnostic path.
-  assign pat_select = (state_q == LT_MB_VALVREF)  ? PAT_VALTRAIN  :
-                      (state_q == LT_MB_DATAVREF) ? PAT_VALTRAIN  :
-                      (state_q == LT_LINKINIT)    ? PAT_LFSR      :
-                      (state_q == LT_MB_RXDESKEW) ? PAT_CLKREPAIR :
-                                                    PAT_PERLANEID;
+  // The selection mux maps PAT_LFSR to MBTRAIN.LINKSPEED per Section 4.5.3.4.12.
+  assign pat_select = (state_q == LT_MB_VALVREF)   ? PAT_VALTRAIN  :
+                      (state_q == LT_MB_DATAVREF)  ? PAT_VALTRAIN  :
+                      (state_q == LT_MB_LINKSPEED) ? PAT_LFSR      :
+                      (state_q == LT_MB_RXDESKEW)  ? PAT_CLKREPAIR :
+                                                     PAT_PERLANEID;
 
-  // LINKINIT entry emits exactly one LFSR reseed pulse.
-  // The pulse is independent from local and remote Active request timing.
-  // UCIe 1.0 Section 4.5.3.5 requires reset on LINKINIT entry.
-  // UCIe 1.0 Section 8.1.6 defines the later Active Entry exchange.
-  // PLAN.md Section 15.9 Phase C preserves this entry action.
-  assign pat_lfsr_reset = (state_q == LT_LINKINIT) && state_entry;
+  // LFSR reset:
+  // 1. Emits reset strobe on entry to MBTRAIN.LINKSPEED (to start 4K UI LFSR from seed).
+  // 2. Emits reset strobe on entry to LINKINIT per UCIe 1.0 Section 4.5.3.5:
+  //    "The LFSR must be RESET upon entering this state."
+  assign pat_lfsr_reset = ((state_q == LT_MB_LINKSPEED) || (state_q == LT_LINKINIT)) && state_entry;
 
-  // The diagnostic LFSR can advance while LINKINIT waits for Active Entry.
-  // Its completion cannot change the LTSM state or the exchange obligations.
-  // UCIe 1.0 Section 4.4.1 defines LFSR operation.
-  // UCIe 1.0 Sections 4.5.3.5 and 8.1.6 define LINKINIT completion.
-  // PLAN.md Section 15.9 Phase C removes the pat_done exit gate.
-  assign pat_lfsr_enable = (state_q == LT_LINKINIT);
-
+  // The LFSR advances during MBTRAIN.LINKSPEED, and is idle during LINKINIT.
+  assign pat_lfsr_enable = (state_q == LT_MB_LINKSPEED);
   // =========================================================================
   // LTSM status and private Phase C outputs
   // =========================================================================

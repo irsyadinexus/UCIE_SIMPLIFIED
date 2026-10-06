@@ -294,9 +294,11 @@ module tb_loopback_top;
   // Spec ref: UCIe 1.0 Sections 4.1.3 and 5.2; PLAN.md Section 15.6.
   // -------------------------------------------------------------------------
   logic mbclk_en;
-  assign mbclk_en = (d0_ltsm_state == LT_LINKINIT) ||
-                    (d1_ltsm_state == LT_LINKINIT) ||
-                    (d0_ltsm_state == LT_ACTIVE) ||
+  assign mbclk_en = (d0_ltsm_state == LT_MB_LINKSPEED) ||
+                    (d1_ltsm_state == LT_MB_LINKSPEED) ||
+                    (d0_ltsm_state == LT_LINKINIT)     ||
+                    (d1_ltsm_state == LT_LINKINIT)     ||
+                    (d0_ltsm_state == LT_ACTIVE)       ||
                     (d1_ltsm_state == LT_ACTIVE);
   // -------------------------------------------------------------------------
   // -------------------------------------------------------------------------

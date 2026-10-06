@@ -574,6 +574,18 @@ module tb_link_init_wave;
   endfunction
 
   // ==========================================================================
+  // 512-Byte Bidirectional Random Data Streaming in ACTIVE State
+  // ==========================================================================
+  localparam int STREAM_BYTES = 512;
+  localparam int BEATS_TOTAL  = STREAM_BYTES / (DATA_W / 8); // 512 / 16 = 32 beats
+
+  logic [DATA_W-1:0] d0_tx_words [0:BEATS_TOTAL-1];
+  logic [DATA_W-1:0] d1_tx_words [0:BEATS_TOTAL-1];
+  integer d0_rx_count;
+  integer d1_rx_count;
+  integer stream_errors;
+
+  // ==========================================================================
   // Termination and Success Checker
   // ==========================================================================
   initial begin
@@ -583,8 +595,8 @@ module tb_link_init_wave;
     wait (d0_fdi_state  == FDI_STS_ACTIVE && d1_fdi_state  == FDI_STS_ACTIVE);
     wait (d0_pl_state_sts == FDI_STS_ACTIVE && d1_pl_state_sts == FDI_STS_ACTIVE);
 
-    // Let link run in stable ACTIVE for 32 cycles to show steady state on waveform
-    repeat (32) @(posedge lclk);
+    // Let link run in stable ACTIVE for 16 cycles before data transfer
+    repeat (16) @(posedge lclk);
 
     $display("\n==========================================================================");
     $display("LINK INITIALIZATION SUCCESSFUL AT TIME %0t ns", $time);
@@ -593,7 +605,106 @@ module tb_link_init_wave;
     $display("  Die1 LTSM: %s (%02h) | RDI: ACTIVE (%01h) | FDI: ACTIVE (%01h)",
              ltsm_state_name(d1_ltsm_state), d1_ltsm_state, d1_rdi_state, d1_pl_state_sts);
     $display("  Active state successfully broadcasted to partner die and Protocol layer.");
-    $display("TEST PASSED tb_link_init_wave");
+    $display("  Starting %0d-Byte Bidirectional Random Streaming Transfer (Raw Mode)...", STREAM_BYTES);
+    $display("==========================================================================");
+
+    // Generate random test data (32 beats = 512 Bytes per direction)
+    for (int b = 0; b < BEATS_TOTAL; b = b + 1) begin
+      d0_tx_words[b] = {$urandom(), $urandom(), $urandom(), $urandom()};
+      d1_tx_words[b] = {$urandom(), $urandom(), $urandom(), $urandom()};
+    end
+
+    d0_rx_count   = 0;
+    d1_rx_count   = 0;
+    stream_errors = 0;
+
+    // Both dies stream in Raw mode using STREAM_ID_S0_STREAMING
+    d0_lp_stream = STREAM_ID_S0_STREAMING;
+    d1_lp_stream = STREAM_ID_S0_STREAMING;
+
+    // Fork concurrent bidirectional transmission and reception
+    fork
+      // Die 0 TX: Stream 32 beats (512 Bytes) to Die 1
+      begin : d0_tx_proc
+        for (int i = 0; i < BEATS_TOTAL; i = i + 1) begin
+          @(negedge lclk);
+          while (!d0_pl_trdy) @(negedge lclk);
+          d0_lp_data  = d0_tx_words[i];
+          d0_lp_valid = 1'b1;
+          d0_lp_irdy  = 1'b1;
+        end
+        @(negedge lclk);
+        d0_lp_valid = 1'b0;
+        d0_lp_irdy  = 1'b0;
+        d0_lp_data  = '0;
+      end
+
+      // Die 1 TX: Stream 32 beats (512 Bytes) to Die 0
+      begin : d1_tx_proc
+        for (int j = 0; j < BEATS_TOTAL; j = j + 1) begin
+          @(negedge lclk);
+          while (!d1_pl_trdy) @(negedge lclk);
+          d1_lp_data  = d1_tx_words[j];
+          d1_lp_valid = 1'b1;
+          d1_lp_irdy  = 1'b1;
+        end
+        @(negedge lclk);
+        d1_lp_valid = 1'b0;
+        d1_lp_irdy  = 1'b0;
+        d1_lp_data  = '0;
+      end
+
+      // Die 0 RX: Receive and verify 32 beats (512 Bytes) from Die 1
+      begin : d0_rx_proc
+        while (d0_rx_count < BEATS_TOTAL) begin
+          @(posedge lclk);
+          #0.1;
+          if (d0_pl_valid) begin
+            if (d0_pl_data !== d1_tx_words[d0_rx_count]) begin
+              $display("FAIL [Die0 RX Beat %02d]: got %032h, expected %032h",
+                       d0_rx_count, d0_pl_data, d1_tx_words[d0_rx_count]);
+              stream_errors = stream_errors + 1;
+            end else begin
+              $display("PASS [Die0 RX Beat %02d]: %032h (descrambled RDI data matches Die1 TX)",
+                       d0_rx_count, d0_pl_data);
+            end
+            d0_rx_count = d0_rx_count + 1;
+          end
+        end
+      end
+
+      // Die 1 RX: Receive and verify 32 beats (512 Bytes) from Die 0
+      begin : d1_rx_proc
+        while (d1_rx_count < BEATS_TOTAL) begin
+          @(posedge lclk);
+          #0.1;
+          if (d1_pl_valid) begin
+            if (d1_pl_data !== d0_tx_words[d1_rx_count]) begin
+              $display("FAIL [Die1 RX Beat %02d]: got %032h, expected %032h",
+                       d1_rx_count, d1_pl_data, d0_tx_words[d1_rx_count]);
+              stream_errors = stream_errors + 1;
+            end else begin
+              $display("PASS [Die1 RX Beat %02d]: %032h (descrambled RDI data matches Die0 TX)",
+                       d1_rx_count, d1_pl_data);
+            end
+            d1_rx_count = d1_rx_count + 1;
+          end
+        end
+      end
+    join
+
+    // Let link run for 16 idle cycles after transfer completion to show idle on waveform
+    repeat (16) @(posedge lclk);
+
+    $display("\n==========================================================================");
+    if (stream_errors == 0) begin
+      $display("SUCCESS: %0d Bytes transferred bidirectionally (32 beats each way) without error!", STREAM_BYTES);
+      $display("  Die0 -> Die1: %0d bytes verified", STREAM_BYTES);
+      $display("  Die1 -> Die0: %0d bytes verified", STREAM_BYTES);
+      $display("TEST PASSED tb_link_init_wave");
+    end else begin
+      $fatal(1, "TEST FAILED tb_link_init_wave: %0d streaming errors detected", stream_errors);
+    end
     $display("==========================================================================\n");
     $finish;
   end

@@ -418,12 +418,12 @@ module tb_link_init_wave;
     logic [63:0] pld;
     begin
       req = '0;
-      req.opcode = SB_OP_CFG_WRITE32;
+      req.opcode = SB_OP_CFG_WRITE64;
       req.src_id = FDI_SRCID_STACK0;
       req.dst_id = FDI_DSTID_ADAPTER;
       req.addr   = 27'h0000000;              // UCIe Link Control register (Table 65)
       req.data   = 64'h0000_0000_0000_0001;  // Bit 0 = 1b: Start UCIe Link Training
-      req.be     = 8'h0F;
+      req.be     = 8'hFF;
       req.tag    = (die_sel == 0) ? 5'h01 : 5'h02;
       hdr = ucie_pkg::sb_encode_header(req);
       pld = 64'h0000_0000_0000_0001;

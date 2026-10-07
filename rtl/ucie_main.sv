@@ -165,11 +165,9 @@
 //  (c) The LTSM owns the PHY-side LinkMgmt.RDI Active exchange. The Adapter
 //      and PHY CSR Start copies cross only as private edge-triggered events.
 //      The completed Active Entry result clears both sticky copies.
-//
-//  (d) start_link_train remains a top-level trigger. Adapter CSR Start and
-//      PHY CSR Start use private wiring, so public ports and topology remain
-//      unchanged (PLAN.md Section 15.5).
-//
+//  (d) Adapter CSR Start and PHY CSR Start use private internal wiring,
+//      allowing link training initiation via software CSR writes without
+//      a dedicated top-level pin.
 // ============================================================================
 //
 //                       RDI / FDI SIGNAL NAMING
@@ -278,7 +276,6 @@ module ucie_main #(
   input  logic        mbclk,        // 2 GHz forwarded clock fCK (Req.2)
   input  logic        sbclk,
   input  logic        sbreset_n,
-  input  logic        start_link_train,
   // ---------------------------------------------------------- FDI (Table 115)
   input  logic        lp_irdy,
   input  logic        lp_valid,
@@ -521,7 +518,6 @@ module ucie_main #(
     .phy_csr_rdata         (phy_csr_rdata),
     .phy_csr_rdata_vld     (phy_csr_rdata_vld),
     // Training Start
-    .start_link_train      (start_link_train),
     .clear_start_link_train(clear_start_link_train),
     .adapter_start_link_train(adapter_start_link_train),
     .ltsm_state_obs        (),
@@ -551,7 +547,6 @@ module ucie_main #(
     .mbclk           (mbclk),
     .sbclk           (sbclk),
     .sbreset_n       (sbreset_n),
-    .start_link_train(start_link_train),
     .adapter_start_link_train(adapter_start_link_train),
     .rdi_lp_state_req(rdi_lp_state_req),
     .rdi_lp_stallack       (rdi_lp_stallack),

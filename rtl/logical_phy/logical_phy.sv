@@ -219,7 +219,6 @@ module logical_phy #(
   input  logic        mbclk,        // 2 GHz forwarded clock fCK (Req.2)
   input  logic        sbclk,
   input  logic        sbreset_n,
-  input logic        start_link_train,
   input logic        adapter_start_link_train,
   input  rdi_req_t   rdi_lp_state_req,
   input  logic        rdi_lp_stallack,
@@ -962,7 +961,7 @@ module logical_phy #(
       rdi_active_req_q      <= 1'b0;
     end else begin
       ltsm_software_start_q <=
-        start_link_train | adapter_start_link_train | csr_start_link_train;
+        adapter_start_link_train | csr_start_link_train;
       rdi_active_req_q      <=
         (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE);
     end
@@ -979,7 +978,7 @@ module logical_phy #(
   //           PLAN.md Sections 15.4, 15.5, and 15.9.
   // ---------------------------------------------------------------------------
   assign ltsm_software_start_event =
-    (start_link_train | adapter_start_link_train | csr_start_link_train) &&
+    (adapter_start_link_train | csr_start_link_train) &&
     !ltsm_software_start_q;
   assign ltsm_rdi_active_event =
     (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE) && !rdi_active_req_q;
@@ -1226,8 +1225,7 @@ module logical_phy #(
   // phy_csr_* channel with byte enables.
   //
   // start_link_train output: writing a 1 to CSR_TRAIN_CTL (offset 0x0)
-  // initiates the LTSM RESET exit, complementing the top-level
-  // start_link_train pin.
+  // initiates the LTSM RESET exit.
   //
   // NOTE: These are electrical *parameter* registers only. There is no
   // analog/AFE implementation per the project scope constraint.

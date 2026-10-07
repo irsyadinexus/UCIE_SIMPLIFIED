@@ -84,8 +84,8 @@
 //       1. LinkReset from Active: the protocol layer requests LinkReset on
 //          both dies. Both must publish LinkReset, enter RESET, hold the full
 //          4 ms minimum without restarting, and then recover to ACTIVE. Die 0
-//          recovers on a fresh software Start edge while its Start pin is
-//          held high across the dwell (a held level is not a trigger). Die 1
+//          recovers on a fresh FDI Link Control CSR write to Start UCIe
+//          Link Training. Die 1
 //          recovers on a fresh FDI NOP-to-Active request event (forwarded to RDI).
 //       2. Disabled from Active: the protocol layer requests Disabled on both
 //          dies, both enter RESET, dwell the full minimum, and recover on
@@ -209,7 +209,7 @@
 //                        status, add the pre-Active user-data block check,
 //                        the active-data scrambler proof, LinkReset and
 //                        Disabled recovery with the full RESET dwell,
-//                        held-Start rejection, software Start recovery, RDI
+//                        FDI Link Control CSR recovery, RDI
 //                        NOP-to-Active recovery, and the private framing
 //                        fault scenario. Raise the watchdog for the added
 //                        recovery dwells. Public ucie_main ports unchanged.
@@ -419,7 +419,12 @@ module tb_loopback_top;
     mb_b2a_val_inject    = 1'b0;
   end
   // ------------------------------------------------------- die 0
-  logic        d0_start_link_train;
+  logic [NC-1:0] d0_lp_cfg, d1_lp_cfg;
+  logic        d0_lp_cfg_vld, d1_lp_cfg_vld;
+  logic        d0_lp_cfg_crd, d1_lp_cfg_crd;
+  logic [NC-1:0] d0_pl_cfg, d1_pl_cfg;
+  logic        d0_pl_cfg_vld, d1_pl_cfg_vld;
+  logic        d0_pl_cfg_crd, d1_pl_cfg_crd;
   logic        d0_lp_irdy, d0_lp_valid;
   logic [DATA_W-1:0] d0_lp_data;
   logic [7:0]  d0_lp_stream;
@@ -440,7 +445,6 @@ module tb_loopback_top;
   logic        d0_sb_rx_pkt_vld;
 
   // ------------------------------------------------------- die 1
-  logic        d1_start_link_train;
   logic        d1_lp_irdy, d1_lp_valid;
   logic [DATA_W-1:0] d1_lp_data;
   logic [7:0]  d1_lp_stream;
@@ -550,7 +554,12 @@ module tb_loopback_top;
     .mbclk           (mbclk),
     .sbclk           (sbclk),
     .sbreset_n       (d0_sbreset_n),
-    .start_link_train(d0_start_link_train),
+    .lp_cfg          (d0_lp_cfg),
+    .lp_cfg_vld      (d0_lp_cfg_vld),
+    .lp_cfg_crd      (d0_lp_cfg_crd),
+    .pl_cfg          (d0_pl_cfg),
+    .pl_cfg_vld      (d0_pl_cfg_vld),
+    .pl_cfg_crd      (d0_pl_cfg_crd),
     .lp_irdy         (d0_lp_irdy),
     .lp_valid        (d0_lp_valid),
     .lp_data         (d0_lp_data),
@@ -605,13 +614,18 @@ module tb_loopback_top;
     .mbclk           (mbclk),
     .sbclk           (sbclk),
     .sbreset_n       (d1_sbreset_n),
-    .start_link_train(d1_start_link_train),
     .lp_irdy         (d1_lp_irdy),
     .lp_valid        (d1_lp_valid),
     .lp_data         (d1_lp_data),
     .lp_stream       (d1_lp_stream),
     .lp_stallack     (d1_lp_stallack),
     .lp_rx_active_sts(d1_lp_rx_active_sts),
+    .lp_cfg          (d1_lp_cfg),
+    .lp_cfg_vld      (d1_lp_cfg_vld),
+    .lp_cfg_crd      (d1_lp_cfg_crd),
+    .pl_cfg          (d1_pl_cfg),
+    .pl_cfg_vld      (d1_pl_cfg_vld),
+    .pl_cfg_crd      (d1_pl_cfg_crd),
     .pl_trdy         (d1_pl_trdy),
     .pl_valid        (d1_pl_valid),
     .pl_data         (d1_pl_data),
@@ -645,11 +659,10 @@ module tb_loopback_top;
   // are held for the whole run: the link management messages are not
   // transported in this reduced PoC, so the testbench supplies them.
   //
-  // Die 0 asserts its Start pin once after local reset and then HOLDS it high
-  // for the rest of the run. The logical PHY only accepts a fresh low-to-high
-  // edge, so this held level is deliberately used by the recovery scenarios:
-  // it must not restart the link after a RESET dwell, and only a fresh pulse
-  // may do so.
+  // Die 0 initiates training via a software CSR write to UCIe Link Control
+  // after local reset. The LTSM clears the Start copy upon Active Entry,
+  // requiring a fresh CSR write or NOP-to-Active request to restart training
+  // after a RESET dwell.
   always @(posedge lclk or negedge d0_lreset_n) begin
     if (!d0_lreset_n)
       d0_lp_stallack <= 1'b0;
@@ -682,25 +695,74 @@ module tb_loopback_top;
       d1_lp_rx_active_sts <= 1'b0;
   end
 
+  task automatic fdi_cfg_write_link_control(input int die_sel);
+    ucie_pkg::sb_packet_t req;
+    logic [63:0] hdr;
+    logic [63:0] pld;
+    begin
+      req = '0;
+      req.opcode = ucie_pkg::SB_OP_CFG_WRITE32;
+      req.src_id = ucie_pkg::FDI_SRCID_STACK0;
+      req.dst_id = ucie_pkg::FDI_DSTID_ADAPTER;
+      req.addr   = 27'h0000000;  // 0x00: UCIe Link Control Register
+      req.data   = 64'h0000_0000_0000_0001;  // Bit 0 = 1b: Start UCIe Link Training
+      req.be     = 8'h0F;
+      req.tag    = (die_sel == 0) ? 5'h01 : 5'h02;
+      hdr = ucie_pkg::sb_encode_header(req);
+      pld = 64'h0000_0000_0000_0001;
+
+      for (int b = 0; b < 8; b++) begin
+        @(negedge lclk);
+        if (die_sel == 0) begin
+          d0_lp_cfg     = hdr[b*8 +: 8];
+          d0_lp_cfg_vld = 1'b1;
+        end else begin
+          d1_lp_cfg     = hdr[b*8 +: 8];
+          d1_lp_cfg_vld = 1'b1;
+        end
+      end
+      for (int b = 0; b < 8; b++) begin
+        @(negedge lclk);
+        if (die_sel == 0) begin
+          d0_lp_cfg     = pld[b*8 +: 8];
+          d0_lp_cfg_vld = 1'b1;
+        end else begin
+          d1_lp_cfg     = pld[b*8 +: 8];
+          d1_lp_cfg_vld = 1'b1;
+        end
+      end
+      @(negedge lclk);
+      if (die_sel == 0) begin
+        d0_lp_cfg     = '0;
+        d0_lp_cfg_vld = 1'b0;
+      end else begin
+        d1_lp_cfg     = '0;
+        d1_lp_cfg_vld = 1'b0;
+      end
+    end
+  endtask
+
   initial begin
-    d0_start_link_train = 1'b0;
     d0_lp_state_req     = FDI_REQ_NOP;
     d0_lp_irdy          = 1'b0;
     d0_lp_valid         = 1'b0;
     d0_lp_data          = '0;
     d0_lp_stream        = STREAM_ID_S0_STREAMING;
+    d0_lp_cfg           = '0;
+    d0_lp_cfg_vld       = 1'b0;
+    d0_lp_cfg_crd       = 1'b0;
 
-    d1_start_link_train = 1'b0;
     d1_lp_state_req     = FDI_REQ_NOP;
     d1_lp_irdy          = 1'b0;
     d1_lp_valid         = 1'b0;
     d1_lp_data          = '0;
     d1_lp_stream        = STREAM_ID_S0_STREAMING;
+    d1_lp_cfg           = '0;
+    d1_lp_cfg_vld       = 1'b0;
+    d1_lp_cfg_crd       = 1'b0;
 
     wait (d0_lreset_n === 1'b1);
-    @(negedge lclk);
-    d0_start_link_train = 1'b1;
-    d1_start_link_train = 1'b0;
+    fdi_cfg_write_link_control(0);
     repeat (2) @(posedge lclk);
     @(negedge lclk);
     d0_lp_state_req     = FDI_REQ_ACTIVE;
@@ -1120,11 +1182,6 @@ module tb_loopback_top;
       $display("FAIL tb_loopback_top: a local reset pair was not aligned");
       errors = errors + 1;
       reset_pair_error_seen = 1'b1;
-    end
-    if (d1_start_link_train !== 1'b0) begin
-      $display("FAIL tb_loopback_top: Die 1 local training trigger asserted");
-      errors = errors + 1;
-      d1_start_link_train = 1'b0;
     end
 
     if (d1_lreset_n && (d1_ltsm_state == LT_RESET) &&
@@ -1549,8 +1606,7 @@ module tb_loopback_top;
   //
   // Waits the complete 4 ms RESET minimum with both dies in RESET and proves
   // that neither die restarts on its own:
-  //   - Die 0 holds its Start pin high across the whole interval. A held
-  //     level is not a fresh event, so the LTSM must stay in RESET.
+  //   - Die 0 has not issued a fresh FDI Link Control CSR write.
   //   - Die 1 holds RDI NOP, so it has no fresh request either.
   // The elapsed-time check and the final state check are the "full RESET
   // dwell plus no automatic restart" proof for every recovery epoch.
@@ -1563,11 +1619,21 @@ module tb_loopback_top;
         $display("FAIL tb_loopback_top: dwell check did not start in RESET");
         errors = errors + 1;
       end
-      if (d0_start_link_train !== 1'b1) begin
-        $display("FAIL tb_loopback_top: held-Start check needs Die 0 Start held high");
-        errors = errors + 1;
-      end
-      #4_100_000;
+      fork : f_dwell_cfg_mon
+        begin
+          #4_100_000;
+        end
+        begin
+          while (1) begin
+            @(posedge lclk);
+            if (d0_lp_cfg_vld || d1_lp_cfg_vld) begin
+              $display("FAIL tb_loopback_top: unexpected FDI configuration activity during RESET dwell at %0t", $time);
+              errors = errors + 1;
+            end
+          end
+        end
+      join_any
+      disable f_dwell_cfg_mon;
       if (($time - dwell_start) < 4_000_000) begin
         $display("FAIL tb_loopback_top: RESET dwell shorter than 4 ms");
         errors = errors + 1;
@@ -1585,31 +1651,25 @@ module tb_loopback_top;
   endtask
 
   // -------------------------------------------------------------------------
-  // task: recover_d0_start_d1_rdi
+  // task: recover_d0_csr_d1_rdi
   //
   // Applies the two approved fresh triggers after the RESET dwell:
-  //   Die 0: a low-then-high Start pulse. Because the pin was held high
-  //          through the dwell without restarting the link, this edge is the
-  //          only software trigger the LTSM sees.
-//   Die 1: the FDI request was withdrawn to NOP before this point, so
-//          driving Active creates exactly one fresh NOP-to-Active event
-//          forwarded through the adapter to RDI.
-// Both dies must leave RESET. Die 0's FDI request level then returns to
-// Active so the adapter can follow the LTSM into ACTIVE.
+  //   Die 0: a fresh FDI Link Control CSR write to Start UCIe Link Training.
+  //   Die 1: the FDI request was withdrawn to NOP before this point, so
+  //          driving Active creates exactly one fresh NOP-to-Active event
+  //          forwarded through the adapter to RDI.
+  // Both dies must leave RESET. Die 0's FDI request level then returns to
+  // Active so the adapter can follow the LTSM into ACTIVE.
   // -------------------------------------------------------------------------
-  task recover_d0_start_d1_rdi;
+  task recover_d0_csr_d1_rdi;
     int cycles;
     begin
       if (d0_lp_state_req != RDI_REQ_NOP) begin
-        $display("FAIL tb_loopback_top: Die 0 RDI request not released before Start recovery");
+        $display("FAIL tb_loopback_top: Die 0 RDI request not released before CSR recovery");
         errors = errors + 1;
       end
-      // Die 0: fresh software Start edge.
-      @(negedge lclk);
-      d0_start_link_train = 1'b0;
-      repeat (8) @(posedge lclk);
-      @(negedge lclk);
-      d0_start_link_train = 1'b1;
+      // Die 0: fresh FDI Link Control CSR write.
+      fdi_cfg_write_link_control(0);
 
       // Die 1: fresh RDI NOP-to-Active event.
       @(negedge lclk);
@@ -1621,10 +1681,10 @@ module tb_loopback_top;
         cycles = cycles + 1;
       end
       if (d0_ltsm_state == LT_RESET) begin
-        $display("FAIL tb_loopback_top: software Start did not leave RESET");
+        $display("FAIL tb_loopback_top: FDI Link Control CSR Start did not leave RESET");
         errors = errors + 1;
       end else begin
-        $display("PASS tb_loopback_top: software Start recovery (Die 0)");
+        $display("PASS tb_loopback_top: FDI Link Control CSR Start recovery (Die 0)");
       end
 
       cycles = 0;
@@ -1914,19 +1974,18 @@ module tb_loopback_top;
       $display("PASS tb_loopback_top: LinkReset request and response crossed both dies");
     end
 
-    // Release the local requests. Die 0 returns to NOP so the held Start pin
-    // is the only software path under test; Die 1 stays at NOP for its
+    // Release the local requests. Die 0 returns to NOP; Die 1 stays at NOP for its
     // NOP-to-Active recovery later.
     @(negedge lclk);
     d0_lp_state_req = RDI_REQ_NOP;
     d1_lp_state_req = RDI_REQ_NOP;
     wait_rdi_reset_pair();
 
-    // Full RESET dwell, no automatic restart, held-Start rejection.
+    // Full RESET dwell, no automatic restart.
     check_reset_dwell_pair();
 
-    // Fresh software Start (Die 0) and fresh RDI NOP-to-Active (Die 1).
-    recover_d0_start_d1_rdi();
+    // Fresh FDI Link Control CSR Start (Die 0) and fresh RDI NOP-to-Active (Die 1).
+    recover_d0_csr_d1_rdi();
     wait_active_pair();
     wait_rdi_active_pair();
 
@@ -1973,7 +2032,7 @@ module tb_loopback_top;
     end
 
     // Release the requests and re-check the full RESET dwell with no
-    // automatic restart. Die 0's Start pin is still held high.
+    // automatic restart.
     @(negedge lclk);
     d0_lp_state_req = RDI_REQ_NOP;
     d1_lp_state_req = RDI_REQ_NOP;
@@ -2046,7 +2105,7 @@ module tb_loopback_top;
 
     // The fault event is one lclk pulse, so the approved fresh triggers must
     // bring both dies back to Active where scrambled data flows again.
-    recover_d0_start_d1_rdi();
+    recover_d0_csr_d1_rdi();
     wait_active_pair();
     wait_rdi_active_pair();
 

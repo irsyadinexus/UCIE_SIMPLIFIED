@@ -181,7 +181,7 @@ module ut_stall;
   logic [3:0]  ad_rdi_pl_state_sts;
   logic        ad_rdi_pl_inband_pres, ad_rdi_pl_trdy;
   logic [2:0]  ad_rdi_pl_lnk_cfg, ad_rdi_pl_speedmode;
-  logic        ad_start_link_train, ad_clear_start_link_train;
+  logic        ad_clear_start_link_train;
   logic        ad_adapter_start_link_train;
   logic [7:0]  ad_ltsm_state_obs;
   logic        ad_link_active_obs;
@@ -256,7 +256,6 @@ module ut_stall;
     .rdi_lp_stallack(ad_rdi_lp_stallack),
     .rdi_pl_lnk_cfg(ad_rdi_pl_lnk_cfg),
     .rdi_pl_speedmode(ad_rdi_pl_speedmode),
-    .start_link_train(ad_start_link_train),
     .clear_start_link_train(ad_clear_start_link_train),
     .adapter_start_link_train(ad_adapter_start_link_train),
     .adapter_sb_tx_ready(1'b1),
@@ -320,7 +319,6 @@ module ut_stall;
     ad_rdi_pl_stallreq = 1'b0;
     ad_rdi_pl_lnk_cfg = LNKCFG_X16;
     ad_rdi_pl_speedmode = SPEED_4GT;
-    ad_start_link_train = 1'b0;
     ad_clear_start_link_train = 1'b0;
     #5 lreset_n = 1'b1;
     @(negedge lclk);

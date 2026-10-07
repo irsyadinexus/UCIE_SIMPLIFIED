@@ -21,13 +21,11 @@
 //   Offset  Register           Access  Description
 //   ------  -----------------  ------  ----------------------------------------
 //   0x00    UCIe Link Control  RW      Bit 0: start link training. Set by SW
-//                                       write or by the start_link_train_wr
-//                                       hardware trigger. Cleared by the
+//                                       write via sideband CfgWr. Cleared by the
 //                                       private clear_start_link_train input
 //                                       after a successful Active Entry; the
-//                                       clear wins over the SW write and the
-//                                       hardware trigger (PLAN.md 15.9
-//                                       Phase C).
+//                                       clear wins over a concurrent SW write
+//                                       (PLAN.md 15.9 Phase C).
 //   0x08    UCIe Link Status   RO/HW   [0]   in-band presence (from RDI).
 //                                       [4:1] RDI state status.
 //                                       [6:5] link width (hardcoded 10b = x16).
@@ -48,16 +46,15 @@
 //     csr_wr / csr_addr / csr_wdata -> write path
 //     csr_rd / csr_addr -> read path -> csr_rdata / csr_rdata_vld
 //
-//   Hardware-write inputs (start_link_train_wr, in_band_pres, rdi_state_sts,
-//   ltsm_state, trainerror, phyinrecenter) come from the adapter and PHY
+//   Hardware-write inputs (in_band_pres, rdi_state_sts, ltsm_state,
+//   trainerror, phyinrecenter) come from the adapter and PHY
 //   status signals. Software-read outputs (start_link_train, link_status_active)
 //   are decoded from the register contents.
 //
 //   Private input: clear_start_link_train. Driven by d2d_adapter.sv from the
 //   private training event path, not a public top-level port. It clears
 //   bit 0 of the Link Control register after the LTSM completes Active Entry,
-//   and has priority over a concurrent CfgWr to 0x00 and over
-//   start_link_train_wr (PLAN.md section 15.9 Phase C).
+//   and has priority over a concurrent CfgWr to 0x00 (PLAN.md section 15.9 Phase C).
 //
 //   Per spec 7.1: configuration register access via sideband is supported,
 //   but no analog/AFE circuits are implemented in this simplified endpoint.
@@ -90,8 +87,7 @@
 //                        clear_start_link_train. It clears bit 0 of
 //                        reg_link_ctrl (UCIe Link Control, offset 0x00) after
 //                        a successful Active Entry. The clear has priority
-//                        over a concurrent sideband CfgWr to 0x00 and over
-//                        the start_link_train_wr hardware set event, and it
+//                        over a concurrent sideband CfgWr to 0x00, and it
 //                        leaves bits [63:1] unchanged. All other registers
 //                        keep their existing behaviour. Comments for the
 //                        header, interface, Link Control storage and the
@@ -99,7 +95,7 @@
 //                        section 15.9 Phase C and UCIe 1.0 section 7.5.
 //   v0.0.7  2026-09-28  Sideband protocol remediation:
 //                        - Add csr_be[7:0] port and merge enabled bytes on writes (Section 7.5).
-//                        - Preserve hardware-set and private-clear priority (Section 7.5).
+//                        - Preserve private-clear priority over CSR write (Section 7.5).
 //                        - Add Table 70-73 Sideband Mailbox Index (0x30), Data (0x38),
 //                          Control (0x40), and Status (0x48) registers (Section 7.5).
 //                        - Add rem_req_vld/rdy/pkt and rem_cpl_vld/pkt internal mailbox
@@ -127,7 +123,6 @@ module adapter_regfile (
   output logic [63:0] csr_rdata,
   output logic        csr_rdata_vld,
   // Hardware write side.
-  input  logic        start_link_train_wr,   // UCIe Link Control bit 0
   input  logic        in_band_pres,          // sticky copy from RDI
   input  logic [3:0]  rdi_state_sts,
   input  logic [7:0]  ltsm_state,            // Error Log 0 State N
@@ -148,8 +143,7 @@ module adapter_regfile (
   // software Start event requirement).
   //
   // The clear forces bit 0 of reg_link_ctrl to 0 and leaves bits [63:1]
-  // unchanged. It has priority over a concurrent sideband CfgWr to offset
-  // 0x00 and over the start_link_train_wr hardware set event.
+  //   unchanged. It has priority over a concurrent sideband CfgWr to offset 0x00.
   // ------------------------------------------------------------------------
   input  logic        clear_start_link_train,
 
@@ -197,10 +191,9 @@ module adapter_regfile (
   // bits are reserved for local error indications.
   //
   // reg_link_ctrl (offset 0x00) is the Adapter Start copy. Bit 0 is sticky:
-  // it is set by a sideband CfgWr or by start_link_train_wr, and it is
-  // cleared by the private input clear_start_link_train after a successful
-  // Active Entry. That clear owns bit 0 with the highest priority
-  // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5).
+  // it is set by a sideband CfgWr, and it is cleared by the private input
+  // clear_start_link_train after a successful Active Entry. That clear owns
+  // bit 0 with the highest priority (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5).
   // --------------------------------------------------------------------------
   logic [63:0] reg_link_ctrl;
   logic [63:0] reg_link_stat;
@@ -297,23 +290,18 @@ module adapter_regfile (
   // always_ff: UCIe Link Control Register (0x00)
   // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5 - UCIe Registers)
   //
-  // Bit 0: Start UCIe link training. This bit can be set by:
-  //   (a) A sideband CfgWr to offset 0x00 (software-initiated training).
-  //   (b) The start_link_train_wr hardware trigger from d2d_adapter.sv
-  //       (external controller or testbench-initiated training).
+  // Bit 0: Start UCIe link training. This bit is set by a sideband CfgWr to
+  // offset 0x00 (software-initiated training).
   //
-  // The entire 64-bit register is writable via sideband CfgWr. The hardware
-  // trigger only sets bit 0 without disturbing other bits.
+  // The entire 64-bit register is writable via sideband CfgWr.
   //
   // -------------------------------------------------------------------------
   // Private Active Entry clear and its priority
   // -------------------------------------------------------------------------
   // clear_start_link_train is tested FIRST in the if/else chain, so the clear
-  // wins over a concurrent sideband write and over the start_link_train_wr
-  // hardware set event. Bit 0 of the register falls on the lclk edge that
-  // follows the clear assertion, which is the edge on which the LTSM reports
-  // a successful Active Entry.
-  //
+  // wins over a concurrent sideband write. Bit 0 of the register falls on the
+  // lclk edge that follows the clear assertion, which is the edge on which the
+  // LTSM reports a successful Active Entry.
   // The clear writes bit 0 only. Bits [63:1] hold their previous value, so
   // any other Link Control field programmed by software is preserved.
   // A sideband CfgWr to offset 0x00 during the clear is dropped, including
@@ -334,10 +322,6 @@ module adapter_regfile (
         for (int b = 0; b < 8; b++) begin
           if (csr_be[b]) reg_link_ctrl[b*8 +: 8] <= csr_wdata[b*8 +: 8];
         end
-      end
-      // Hardware-set priority over software write for bit 0
-      if (start_link_train_wr) begin
-        reg_link_ctrl[0] <= 1'b1;
       end
     end
   end

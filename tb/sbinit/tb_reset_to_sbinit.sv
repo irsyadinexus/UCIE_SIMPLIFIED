@@ -95,7 +95,6 @@ module tb_reset_to_sbinit;
   // --------------------------------------------------------------------------
   // Die 0 FDI inputs and outputs
   // --------------------------------------------------------------------------
-  logic                  d0_start_link_train;
   logic                  d0_lp_irdy;
   logic                  d0_lp_valid;
   logic [DATA_W-1:0]     d0_lp_data;
@@ -136,7 +135,6 @@ module tb_reset_to_sbinit;
   // --------------------------------------------------------------------------
   // Die 1 FDI inputs and outputs
   // --------------------------------------------------------------------------
-  logic                  d1_start_link_train;
   logic                  d1_lp_irdy;
   logic                  d1_lp_valid;
   logic [DATA_W-1:0]     d1_lp_data;
@@ -275,7 +273,7 @@ module tb_reset_to_sbinit;
   // --------------------------------------------------------------------------
   ucie_main dut_die0 (
     .lclk(lclk), .lreset_n(d0_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
-    .sbreset_n(d0_sbreset_n), .start_link_train(d0_start_link_train),
+    .sbreset_n(d0_sbreset_n),
     .lp_irdy(d0_lp_irdy), .lp_valid(d0_lp_valid), .lp_data(d0_lp_data),
     .lp_stream(d0_lp_stream), .lp_stallack(d0_lp_stallack),
     .lp_rx_active_sts(d0_lp_rx_active_sts), .pl_trdy(d0_pl_trdy),
@@ -300,7 +298,7 @@ module tb_reset_to_sbinit;
 
   ucie_main dut_die1 (
     .lclk(lclk), .lreset_n(d1_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
-    .sbreset_n(d1_sbreset_n), .start_link_train(d1_start_link_train),
+    .sbreset_n(d1_sbreset_n),
     .lp_irdy(d1_lp_irdy), .lp_valid(d1_lp_valid), .lp_data(d1_lp_data),
     .lp_stream(d1_lp_stream), .lp_stallack(d1_lp_stallack),
     .lp_rx_active_sts(d1_lp_rx_active_sts), .pl_trdy(d1_pl_trdy),
@@ -326,10 +324,54 @@ module tb_reset_to_sbinit;
   // --------------------------------------------------------------------------
   // Protocol-layer stimulus
   // --------------------------------------------------------------------------
-  initial begin
-    d0_start_link_train = 1'b0;
-    d1_start_link_train = 1'b0;
+  task automatic fdi_cfg_write_link_control(input int die_sel);
+    ucie_pkg::sb_packet_t req;
+    logic [63:0] hdr;
+    logic [63:0] pld;
+    begin
+      req = '0;
+      req.opcode = ucie_pkg::SB_OP_CFG_WRITE32;
+      req.src_id = ucie_pkg::FDI_SRCID_STACK0;
+      req.dst_id = ucie_pkg::FDI_DSTID_ADAPTER;
+      req.addr   = 27'h0000000;  // 0x00: UCIe Link Control Register
+      req.data   = 64'h0000_0000_0000_0001;  // Bit 0 = 1b: Start UCIe Link Training
+      req.be     = 8'h0F;
+      req.tag    = (die_sel == 0) ? 5'h01 : 5'h02;
+      hdr = ucie_pkg::sb_encode_header(req);
+      pld = 64'h0000_0000_0000_0001;
 
+      for (int b = 0; b < 8; b++) begin
+        @(negedge lclk);
+        if (die_sel == 0) begin
+          d0_lp_cfg     = hdr[b*8 +: 8];
+          d0_lp_cfg_vld = 1'b1;
+        end else begin
+          d1_lp_cfg     = hdr[b*8 +: 8];
+          d1_lp_cfg_vld = 1'b1;
+        end
+      end
+      for (int b = 0; b < 8; b++) begin
+        @(negedge lclk);
+        if (die_sel == 0) begin
+          d0_lp_cfg     = pld[b*8 +: 8];
+          d0_lp_cfg_vld = 1'b1;
+        end else begin
+          d1_lp_cfg     = pld[b*8 +: 8];
+          d1_lp_cfg_vld = 1'b1;
+        end
+      end
+      @(negedge lclk);
+      if (die_sel == 0) begin
+        d0_lp_cfg     = '0;
+        d0_lp_cfg_vld = 1'b0;
+      end else begin
+        d1_lp_cfg     = '0;
+        d1_lp_cfg_vld = 1'b0;
+      end
+    end
+  endtask
+
+  initial begin
     d0_lp_irdy = 1'b0;
     d0_lp_valid = 1'b0;
     d0_lp_data = '0;
@@ -358,11 +400,8 @@ module tb_reset_to_sbinit;
 
     @(posedge d0_lreset_n);
     #0.700;
-    d0_start_link_train = 1'b1;
-    #2.000;
-    d0_start_link_train = 1'b0;
+    fdi_cfg_write_link_control(0);
   end
-
   // --------------------------------------------------------------------------
   // Waveform dump
   // --------------------------------------------------------------------------
@@ -511,10 +550,6 @@ module tb_reset_to_sbinit;
       errors = errors + 1;
     end
 
-    if (d1_start_link_train !== 1'b0) begin
-      $display("FAIL tb_reset_to_sbinit: Die1 local Start asserted");
-      errors = errors + 1;
-    end
   end
 
   initial begin

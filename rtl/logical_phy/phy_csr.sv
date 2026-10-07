@@ -60,8 +60,7 @@
 //
 //   A private input, clear_start_link_train, clears the sticky TRAIN_CTL bit
 //   0 value after a successful Active Entry. The clear has priority over a
-//   concurrent csr_wr and over any hardware Start set event
-//   (PLAN.md section 15.9 Phase C).
+//   concurrent csr_wr (PLAN.md section 15.9 Phase C).
 //
 // --------------------------------------------------------------------------
 // Read path
@@ -113,15 +112,15 @@
 //                        clear_start_link_train. It clears start_train_q, the
 //                        sticky TRAIN_CTL bit 0 Start copy, after a successful
 //                        Active Entry. The clear has priority over a
-//                        concurrent csr_wr and over any hardware Start set
-//                        event for bit 0 only; elec_param_q and all status
-//                        registers keep their existing behaviour. Comments for
+//                        concurrent csr_wr for bit 0 only; elec_param_q and
+//                        all status registers keep their existing behaviour.
+//                        Comments for
 //                        the interface, storage, write path and output now
 //                        cite PLAN.md section 15.9 Phase C and UCIe 1.0
 //                        section 7.5.
 //   v0.0.5  2026-09-28  Sideband protocol remediation:
 //                        - Add csr_be[7:0] port and merge enabled bytes on writes (Section 7.5).
-//                        - Preserve hardware-set and private-clear priority (Section 7.5).
+//                        - Preserve private-clear priority over CSR write (Section 7.5).
 //                        - Preserve one-cycle read latency.
 `ifndef PhyCsr_SV
 `define PhyCsr_SV
@@ -215,9 +214,9 @@ module phy_csr (
   // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5 - UCIe Registers)
   // -------------------------------------------------------------------------
   // clear_start_link_train is tested FIRST in the if/else chain, so the
-  // clear wins over a concurrent software write and over any hardware Start
-  // set event. Start Link Training is therefore deasserted in the same lclk
-  // cycle in which the LTSM reports a successful Active Entry.
+  // clear wins over a concurrent software write. Start Link Training is
+  // therefore deasserted in the same lclk cycle in which the LTSM reports a
+  // successful Active Entry.
   //
   // The clear only forces start_train_q to 0. A concurrent sideband write to
   // ELEC_PARAM still lands, because elec_param_q keeps its own assignment
@@ -260,15 +259,13 @@ module phy_csr (
   // start_link_train output  (spec 4.5.3.1 – RESET exit trigger)
   // =========================================================================
   // Directly reflects TRAIN_CTL bit 0. When asserted, the LTSM exits RESET
-  // and begins the link training sequence. This output is OR'd with the
-  // top-level start_link_train pin in logical_phy.sv.
+  // and begins the link training sequence.
   //
   // The value is the sticky storage start_train_q, so the output falls on
   // reset, on a TRAIN_CTL write of 0, or on the private Active Entry clear
-  // clear_start_link_train (PLAN.md section 15.9 Phase C). The clear path
+  // input clear_start_link_train (PLAN.md section 15.9 Phase C). The clear path
   // means the LTSM consumes the Start level once, then sees a low level
   // after Active Entry instead of a held request.
-  //
   // Because the clear is registered in the write-path always_ff above, the
   // output drops on the lclk edge that follows the clear assertion.
   // =========================================================================

@@ -97,7 +97,6 @@ module tb_link_init_wave;
   // ==========================================================================
   // Die 0: FDI Interface Signals (Table 115)
   // ==========================================================================
-  logic                  d0_start_link_train;
   logic                  d0_lp_irdy;
   logic                  d0_lp_valid;
   logic [DATA_W-1:0]     d0_lp_data;
@@ -139,7 +138,6 @@ module tb_link_init_wave;
   // ==========================================================================
   // Die 1: FDI Interface Signals (Table 115)
   // ==========================================================================
-  logic                  d1_start_link_train;
   logic                  d1_lp_irdy;
   logic                  d1_lp_valid;
   logic [DATA_W-1:0]     d1_lp_data;
@@ -191,7 +189,6 @@ module tb_link_init_wave;
     .mbclk                 (mbclk),
     .sbclk                 (sbclk),
     .sbreset_n             (d0_sbreset_n),
-    .start_link_train      (d0_start_link_train),
     // FDI (Table 115)
     .lp_irdy               (d0_lp_irdy),
     .lp_valid              (d0_lp_valid),
@@ -250,7 +247,6 @@ module tb_link_init_wave;
     .mbclk                 (mbclk),
     .sbclk                 (sbclk),
     .sbreset_n             (d1_sbreset_n),
-    .start_link_train      (d1_start_link_train),
     // FDI (Table 115)
     .lp_irdy               (d1_lp_irdy),
     .lp_valid              (d1_lp_valid),
@@ -468,7 +464,6 @@ module tb_link_init_wave;
   // Protocol Layer Master Flow
   initial begin
     // Default initial inputs
-    d0_start_link_train = 1'b0;
     d0_lp_irdy          = 1'b0;
     d0_lp_valid         = 1'b0;
     d0_lp_data          = '0;
@@ -481,7 +476,6 @@ module tb_link_init_wave;
     d0_lp_cfg_vld       = 1'b0;
     d0_lp_cfg_crd       = 1'b0;
 
-    d1_start_link_train = 1'b0;
     d1_lp_irdy          = 1'b0;
     d1_lp_valid         = 1'b0;
     d1_lp_data          = '0;
@@ -508,10 +502,6 @@ module tb_link_init_wave;
       fdi_cfg_write_link_control(1);
     join
 
-    // Also assert the top-level trigger pin
-    @(negedge lclk);
-    d0_start_link_train = 1'b1;
-    d1_start_link_train = 1'b1;
 
     // Protocol layer sets Active state request on FDI
     repeat (2) @(posedge lclk);

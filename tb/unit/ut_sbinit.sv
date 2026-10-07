@@ -47,7 +47,6 @@ module ut_sbinit;
     .mbclk(mbclk),
     .sbclk(sbclk),
     .sbreset_n(sbreset_n),
-    .start_link_train(1'b0),
     .adapter_start_link_train(1'b0),
     .rdi_lp_state_req('0),
     .rdi_lp_stallack(1'b0),

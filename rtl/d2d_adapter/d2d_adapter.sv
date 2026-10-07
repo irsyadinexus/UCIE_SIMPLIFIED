@@ -257,7 +257,6 @@ module d2d_adapter #(
   output logic [7:0]            phy_csr_be,
   input  logic [63:0]           phy_csr_rdata,
   input  logic                  phy_csr_rdata_vld,
-  input  logic                  start_link_train,
   input  logic                  clear_start_link_train,
   output logic                  adapter_start_link_train,
   output logic [7:0]            ltsm_state_obs,
@@ -297,8 +296,6 @@ module d2d_adapter #(
   logic [7:0]  csr_be;
   logic        csr_rdata_vld;
   logic        sb_credit_returned, sb_stall_sent, sb_msg_timeout;
-  logic        start_link_train_wr;
-  logic        start_link_train_q;
   logic        link_status_active;
   logic        adapter_fatal, adapter_linkerror;
   logic        stage3_done;
@@ -583,8 +580,8 @@ module d2d_adapter #(
   //
   // CSR reads and writes arrive from u_sb_if via csr_wr/csr_rd/csr_addr/
   // csr_wdata and return on csr_rdata/csr_rdata_vld. Hardware writes
-  // (start_link_train_wr, in_band_pres, rdi_state_sts, ltsm_state,
-  // trainerror, phyinrecenter) come from the adapter and PHY status.
+  // (in_band_pres, rdi_state_sts, ltsm_state, trainerror, phyinrecenter)
+  // come from the adapter and PHY status.
   //
   // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (CSR definition).
   // -------------------------------------------------------------------------
@@ -598,7 +595,6 @@ module d2d_adapter #(
     .csr_rd                (csr_rd),
     .csr_rdata             (csr_rdata),
     .csr_rdata_vld         (csr_rdata_vld),
-    .start_link_train_wr   (start_link_train_wr),
     .in_band_pres          (rdi_pl_inband_pres),
     .rdi_state_sts         (rdi_pl_state_sts),
     .ltsm_state            (ltsm_state_obs),
@@ -650,26 +646,6 @@ module d2d_adapter #(
   always_comb begin
     rdi_lp_linkerror = lp_linkerror | adapter_fatal;
     link_active_obs  = link_status_active;
-  end
-
-  // -------------------------------------------------------------------------
-  // always_ff: Adapter Start event latch
-  //
-  // Converts the external Start level into one registered write event for the
-  // Adapter Link Control copy. The previous level blocks a held Start from
-  // re-arming the copy after the Phase C Active-entry clear.
-  //
-  // Spec ref: UCIe 1.0, Section 7.5, Table 65; PLAN.md Sections 15.5 and
-  //           15.9 Phase D Start cutover.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      start_link_train_q  <= 1'b0;
-      start_link_train_wr <= 1'b0;
-    end else begin
-      start_link_train_q  <= start_link_train;
-      start_link_train_wr <= start_link_train && !start_link_train_q;
-    end
   end
 
   // -------------------------------------------------------------------------

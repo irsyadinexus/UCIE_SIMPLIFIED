@@ -9,7 +9,7 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 
 ## Implementation Scope
 - **Raw Mode**: Supported.
-- **Streaming Protocol**: Supported (64-byte flit format, 512B streaming data verification).
+- **Streaming Protocol**: Supported (Raw Mode Format 1 direct pass-through without flit headers or sequencing, verified with 512B bidirectional streaming data transfer).
 - **Standard Package**: Supported (x16 single-module).
 - **Advanced Package**: Not supported.
 - **Module**: Only 1 module supported.
@@ -29,8 +29,7 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - **Sideband Packet**: Standard 64-bit header (UCIe 1.0 Figures 100–103), 32-UI inter-packet gap, optional 64-bit payload (DATA64 / 32-bit zero-padded) followed by 32-UI gap, serialized over scalar physical pins (`sb_tx_clk`, `sb_tx_data`, `sb_rx_clk`, `sb_rx_data`) with 800 MHz SDR forwarded strobe clocking and falling-edge sampling.
 - **Physical Layer RESET**: Physical Layer stays in RESET for a spec-mandated minimum of 4 ms upon every entry to RESET (UCIe 1.0 Section 4.5.3.1).
 - **LinkError Remediation (UCIe 1.0 Section 8.3.2.7)**:
-  - Strictly unscaled 8 ms minimum residency dwell timer (`u_linkerror_timer`, `C_RESIDENCY` = 4,000,000 `lclk` cycles).
-  - Sideband LinkError handshake bypass: once the 8 ms residency dwell expires, the peer sideband handshake (`TE_REQ` / `TE_RSP`) is bypassed.
+  - Minimum residency dwell satisfaction: Dwell is satisfied immediately if a validated sideband LinkError handshake completes; otherwise, an unscaled 8 ms residency timer (`u_linkerror_timer`, `C_RESIDENCY` = 4,000,000 `lclk` cycles) serves as a fallback to satisfy dwell and allow recovery without peer sideband acknowledgment.
   - Direct transition to RESET: LinkError exits directly to RESET without passing through LinkReset (UCIe 1.0 Figures 111, 119, 126).
   - Response draining prior to reset.
 - **Timer Constants**: 4 ms RESET minimum, 8 ms residency/message timeouts, and 4 ms stall keep-alive are implemented at true spec physical values in `rtl/rtl_common/timer.sv` calibrated to `lclk` = 500 MHz; no RTL timer constant is divided for simulation speed.

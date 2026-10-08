@@ -20,16 +20,33 @@
 // prevents a one-clock-domain valid pulse from being lost in the other clock
 // domain and keeps each payload stable during synchronization.
 //
+// CDC ARCHITECTURE & TOGGLE SYNCHRONIZATION DIAGRAM
+//
+//    Source Domain (src_clk)                     Destination Domain (dst_clk)
+//   +-----------------------+                   +--------------------------+
+//   | src_data -> [src_data_q] (held stable)--> | dst_data (sampled)       |
+//   |                       |                   |                          |
+//   | src_send -> src_req_q | --(2-stage sync)->| src_req_sync -> dst_valid|
+//   |                       |                   |                 |        |
+//   | src_busy <- dst_ack   | <--(2-stage sync)-| dst_ack_q <-----+        |
+//   +-----------------------+                   +--------------------------+
+//
 // RESET CONTRACT
 //   Both domain resets must assert together before traffic begins. Reset
 //   aborts an in-flight mailbox entry. Sources must not send until both resets
 //   have deasserted, which prevents a reset epoch from being mistaken for a
 //   request toggle.
 //
+// SPECIFICATION REFERENCES
+//   - UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission.
+//   - UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+//
 // REVISION HISTORY
 //   v0.0.1  2026-09-23  Req.3: add the toggle-handshake CDC boundary for
 //                        complete sideband packet payloads.
 //   v0.0.2  2026-09-23  Req.3: document the common-reset contract.
+//   v0.0.3  2026-10-08  Documentation compliance pass: expand header with ASCII
+//                        CDC architecture diagram and per-construct comment blocks.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -86,6 +103,15 @@ module sb_cdc_mailbox #(
     end
   end
 
+  // -------------------------------------------------------------------------
+  // assign: src_busy - source domain busy indication
+  //
+  // Asserted while a request toggle is outstanding and has not yet been
+  // acknowledged by the destination domain through the 2-stage synchronizer.
+  // Backpressures the source to guarantee payload stability during CDC crossing.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+  // -------------------------------------------------------------------------
   assign src_busy = (src_req_q != dst_ack_sync_q);
 
   // -------------------------------------------------------------------------

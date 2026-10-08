@@ -13,6 +13,7 @@
 //                                and sideband configuration width (8 b).
 //   3. Timer intervals         – Spec-compliant residency timeout (8 ms
 //                                per sub-state), RESET minimum (4 ms),
+//                                LinkError residency dwell (8 ms, spec 8.3.2.7),
 //                                sideband message timeout (8 ms), stall
 //                                interval (4 ms), and SBINIT active/idle
 //                                windows (1 ms each).
@@ -114,6 +115,8 @@
 //                                 packed struct, Figure 100-103 encode/decode
 //                                 helpers, CP/DP rules, and structural decode
 //                                 error checking.
+//   0.0.7 2026-10-08  -           Add Section 8.3.2.7 LinkError minimum residency
+//                                 dwell constants (8 ms, C_RESIDENCY) and documentation.
 // ============================================================================
 `ifndef UciePkg_SV
 `define UciePkg_SV

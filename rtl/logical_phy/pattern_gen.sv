@@ -122,6 +122,8 @@
 //                                  16-high-then-8-low period.
 //   0.0.6  2026-09-24  -           Clarify the Phase A LINKINIT diagnostic
 //                                  ownership boundary with Phase C.
+//   0.0.7  2026-10-08  -           Documentation compliance pass: add detailed
+//                                  spec-referenced comment above generate bit multiplexer.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -249,6 +251,18 @@ module pattern_gen #(
         wire valtrain_bit  = (current_ui[2] == 1'b0);
         wire clkrepair_bit = (clk_pos < 5'd16);
 
+        // ---------------------------------------------------------------------
+        // assign: data[8*lane + u] - Training Pattern Bit Multiplexer
+        //
+        // Drives the UI slice for this lane based on selected pattern type:
+        //   - PAT_PERLANEID: lane ID vector or 1010 preamble (Section 4.4.2).
+        //   - PAT_VALTRAIN: 11110000 8-UI square wave (Section 4.4.3).
+        //   - PAT_CLKREPAIR: 16 UI high, 8 UI low clock repair waveform.
+        //   - PAT_LFSR: 4096-UI pseudo-random LFSR scrambler sequence.
+        // Gated low when enable == 0.
+        //
+        // Spec ref: UCIe 1.0 Specification, Section 4.4 - Training Patterns.
+        // ---------------------------------------------------------------------
         assign data[8*lane + u] = !enable ? 1'b0 :
                                   (pattern == PAT_PERLANEID) ? perlaneid_bit :
                                   (pattern == PAT_VALTRAIN)  ? valtrain_bit  :

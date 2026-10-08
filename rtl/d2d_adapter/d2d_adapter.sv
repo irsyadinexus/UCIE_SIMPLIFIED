@@ -164,6 +164,9 @@
 //                          private rdi_lp_linkerror output (Sections 8.1, 8.2).
 //                        - Add public FDI Stage 3 clock/wake/protocol ports and configuration
 //                          sideband (lp_cfg / pl_cfg) (Sections 6.1, 8.2).
+//   v0.0.9    2026-10-08  Documentation compliance pass: expand construct comment
+//                          blocks for Stage 3 status assigns, protocol registers,
+//                          and lint suppression blocks with spec subsection references.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -301,6 +304,15 @@ module d2d_adapter #(
   logic        stage3_done;
   logic        adapter_capability_done;
   logic        adapter_stage3_ready;
+  // -------------------------------------------------------------------------
+  // assign: adapter_stage3_ready - Stage 3 bringup completion flag
+  //
+  // Qualifies that both adapter capability parameter exchange and Stage 3
+  // power/clock bringup have completed successfully before FDI Active state
+  // is enabled.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.7 - FDI Bring up flow.
+  // -------------------------------------------------------------------------
   assign adapter_stage3_ready = adapter_capability_done && stage3_done;
   logic        protocol_error, fdi_format_error;
   logic        rem_req_vld, rem_req_rdy;
@@ -610,12 +622,46 @@ module d2d_adapter #(
     .rem_cpl_pkt           (rem_cpl_pkt)
   );
   // -------------------------------------------------------------------------
-  // Stage 3 Clock, Wake, and Protocol Status Generation (Sections 7.5, 8.2)
+  // assign: pl_clk_req - Protocol Layer Clock Request Driver
+  //
+  // Drives continuous active clock request (pl_clk_req = 1) toward the
+  // Protocol Layer during operation per Section 8.2 FDI specification.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 (Table 115 - FDI Signal List).
   // -------------------------------------------------------------------------
   assign pl_clk_req   = 1'b1;
+
+  // -------------------------------------------------------------------------
+  // assign: pl_speedmode - Active Speed Mode Status Forwarding
+  //
+  // Forwards physical layer speed mode (4 GT/s only in fixed profile) from the
+  // RDI status port directly to the FDI protocol interface.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 (Table 115 - FDI Signal List).
+  // -------------------------------------------------------------------------
   assign pl_speedmode = rdi_pl_speedmode;
+
+  // -------------------------------------------------------------------------
+  // assign: pl_lnk_cfg - Link Width Configuration Forwarding
+  //
+  // Forwards physical layer active link configuration (x16 Standard Package)
+  // from the RDI status port directly to the FDI protocol interface.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 (Table 115 - FDI Signal List).
+  // -------------------------------------------------------------------------
   assign pl_lnk_cfg   = rdi_pl_lnk_cfg;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Stage 3 Clock Ack, Wake Ack, and Protocol Valid Synchronizer
+  //
+  // Registers protocol layer clock acknowledgement (lp_clk_ack) and wake
+  // acknowledgement (pl_wake_ack), and controls pl_protocol_vld assertion
+  // when the physical link is in ACTIVE state and adapter capability exchange
+  // has completed. Clears on reset or when RDI leaves ACTIVE.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.7 - FDI Bring up flow;
+  //           Table 115 - FDI Signal List.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       lp_clk_ack_q   <= 1'b0;
@@ -632,7 +678,24 @@ module d2d_adapter #(
     end
   end
 
+  // -------------------------------------------------------------------------
+  // assign: pl_protocol_vld - Protocol Valid Status Driver
+  //
+  // Asserts when the link is in ACTIVE state and adapter capability exchange
+  // has successfully completed with the partner die per Section 8.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 (Table 115 - FDI Signal List).
+  // -------------------------------------------------------------------------
   assign pl_protocol_vld = protocol_vld_q;
+
+  // -------------------------------------------------------------------------
+  // assign: pl_inband_pres - In-band Presence Output Status Driver
+  //
+  // Combines FDI in-band presence detection from link training with protocol
+  // valid status and protocol layer clock acknowledgement per Table 115.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 (Table 115 - FDI Signal List).
+  // -------------------------------------------------------------------------
   assign pl_inband_pres  = fdi_pl_inband_pres && protocol_vld_q && lp_clk_ack_q;
 
   // -------------------------------------------------------------------------
@@ -667,6 +730,15 @@ module d2d_adapter #(
   // Spec ref: N/A (lint suppression, no functional impact).
   // -------------------------------------------------------------------------
   logic unused_inputs;
+  // -------------------------------------------------------------------------
+  // always_comb: Unused-Input Lint Suppression
+  //
+  // Several RDI and internal sideband signals are present on the port list for
+  // specification compliance but are not consumed in this streaming endpoint.
+  // The reduction ensures lint tools recognize all signals as read.
+  //
+  // Spec ref: UCIe 1.0 Table 114 (RDI), Table 115 (FDI).
+  // -------------------------------------------------------------------------
   always_comb begin
     unused_inputs = rdi_pl_error |
                     fdi_active_req |

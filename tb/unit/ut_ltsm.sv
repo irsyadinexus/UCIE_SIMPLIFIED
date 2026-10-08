@@ -15,7 +15,7 @@
 // (C_RESIDENCY) expires cycle-exactly, and the LTSM escalates to
 // TRAINERROR within one clock cycle.
 //
-// The test covers two independent scenarios:
+// The test covers three independent scenarios / verification phases:
 //
 //   1.  Pattern-Triggered Training Walk
 //       After the true 4 ms RESET minimum, atomic match/mismatch results drive
@@ -41,7 +41,14 @@
 //       The partner responder is disabled, the LTSM is reset and
 //       re-started. It enters SBINIT and waits for a sideband response.
 //       When no remote response arrives, the C_RESIDENCY countdown timer
-//       expires and the LTSM transitions to TRAINERROR on the very next posedge.
+//       expires cycle-exactly at 4,000,000 cycles (8 ms) and the LTSM
+//       transitions to TRAINERROR on the very next posedge.
+//
+//   3.  LinkError Minimum Residency Dwell Gate (UCIe 1.0 Section 8.3.2.7)
+//       Following the unacknowledged SBINIT timeout into LT_TRAINERROR,
+//       linkerror_dwell_satisfied begins at 0. Recovery attempts are blocked
+//       before le_tmr expiry, unsolicited TE_RSP is rejected, and expiry of
+//       le_tmr satisfies the dwell to allow direct exit to RESET (§8.3.2.7).
 //
 // STIMULUS
 // --------
@@ -185,6 +192,10 @@
 //                        input low. The nominal walk never injects the
 //                        mainband framing fault; the fatal-cause check for
 //                        that event lives in ut_ltsm_policy.sv.
+//   v0.0.11 2026-10-08  Verify UCIe 1.0 Section 8.3.2.7 LinkError minimum residency
+//                        dwell gating after 8 ms SBINIT timeout (recovery blocked
+//                        before le_tmr expiry, unsolicited TE_RSP rejection, and
+//                        direct transition to RESET on le_tmr expiry).
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -373,11 +384,25 @@ module ut_ltsm;
     .dst_data(tx_cdc_data), .dst_valid(loc_tx_load)
   );
 
+  // -------------------------------------------------------------------------
+  // assign: loc_tx_* - Unpack TX Mailbox Destination Bus
+  //
+  // Unpacks flat transmit fields from the CDC mailbox in the sbclk domain.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
+  // -------------------------------------------------------------------------
   assign {loc_tx_opcode, loc_tx_srcid, loc_tx_dstid, loc_tx_msginfo,
           loc_tx_msgcode, loc_tx_msgsubcode, loc_tx_be, loc_tx_tag,
           loc_tx_ep, loc_tx_addr, loc_tx_data_in, loc_tx_has_data} =
          tx_cdc_data;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Codec Busy Synchronizer Flops
+  //
+  // Synchronizes local codec busy from sbclk to lclk using 2-stage flops.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband CDC.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       loc_tx_busy_meta_q <= 1'b0;
@@ -387,9 +412,32 @@ module ut_ltsm;
       loc_tx_busy_sync_q <= loc_tx_busy_meta_q;
     end
   end
+
+  // -------------------------------------------------------------------------
+  // assign: sb_tx_busy - Composite Sideband Transmit Busy Level
+  //
+  // ORs mailbox busy with synchronized codec busy to stall LTSM transmissions.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
+  // -------------------------------------------------------------------------
   assign sb_tx_busy = tx_cdc_busy | loc_tx_busy_sync_q;
+
+  // -------------------------------------------------------------------------
+  // assign: sb_tx_accepted - LTSM Transmit Handshake Acceptance Flag
+  //
+  // Asserts when LTSM requests transmission and the TX CDC mailbox is free.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // -------------------------------------------------------------------------
   assign sb_tx_accepted = sb_tx_load && !tx_cdc_busy;
 
+  // -------------------------------------------------------------------------
+  // always_comb: Local Transmit Packet Structure Assembler
+  //
+  // Packs individual fields into a typed sb_packet_t record for codec input.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // -------------------------------------------------------------------------
   always_comb begin
     loc_tx_packet = '0;
     loc_tx_packet.opcode = loc_tx_opcode;
@@ -404,13 +452,77 @@ module ut_ltsm;
     loc_tx_packet.addr = {{15{1'b0}}, loc_tx_addr};
     loc_tx_packet.data = loc_tx_data_in;
   end
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_pkt_vld - Local Codec Receive Valid Forwarding
+  //
+  // Forwards valid pulse from local sideband codec.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
+  // -------------------------------------------------------------------------
   assign loc_rx_pkt_vld = loc_rx_valid;
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_opcode - Local Codec Receive Opcode Unpack
+  //
+  // Unpacks opcode field from local codec packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 47).
+  // -------------------------------------------------------------------------
   assign loc_rx_opcode = loc_rx_packet.opcode;
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_srcid - Local Codec Receive Source ID Unpack
+  //
+  // Unpacks source ID field from local codec packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 48).
+  // -------------------------------------------------------------------------
   assign loc_rx_srcid = loc_rx_packet.src_id;
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_dstid - Local Codec Receive Destination ID Unpack
+  //
+  // Unpacks destination ID field from local codec packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 48).
+  // -------------------------------------------------------------------------
   assign loc_rx_dstid = loc_rx_packet.dst_id;
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_msginfo - Local Codec Receive MsgInfo Unpack
+  //
+  // Unpacks message info field from local codec packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign loc_rx_msginfo = loc_rx_packet.msg_info;
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_msgcode - Local Codec Receive MsgCode Unpack
+  //
+  // Unpacks message code field from local codec packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign loc_rx_msgcode = loc_rx_packet.msg_code;
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_msgsubcode - Local Codec Receive MsgSubcode Unpack
+  //
+  // Unpacks message subcode field from local codec packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign loc_rx_msgsubcode = loc_rx_packet.msg_subcode;
+
+  // -------------------------------------------------------------------------
+  // assign: loc_rx_data - Local Codec Receive Payload Data Unpack
+  //
+  // Unpacks 64-bit payload data from local codec packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Layouts.
+  // -------------------------------------------------------------------------
   assign loc_rx_data = loc_rx_packet.data;
 
   sb_codec u_loc (
@@ -433,13 +545,24 @@ module ut_ltsm;
     .dst_clk(lclk), .dst_reset_n(lreset_n),
     .dst_data(rx_cdc_data), .dst_valid(cdc_rx_pkt_vld)
   );
+  // -------------------------------------------------------------------------
+  // assign: cdc_rx_* - Unpack RX Mailbox Output Bus
+  //
+  // Unpacks delivered receive packet fields from the CDC mailbox in lclk.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband CDC.
+  // -------------------------------------------------------------------------
   assign {cdc_rx_opcode, cdc_rx_srcid, cdc_rx_dstid, cdc_rx_msginfo,
           cdc_rx_msgcode, cdc_rx_msgsubcode, cdc_rx_cp_err,
           cdc_rx_dp_err, cdc_rx_data} = rx_cdc_data;
 
-  // Select a direct lclk packet only while its one-cycle valid pulse is high.
-  // This isolates SBINIT request/response ordering from codec serialization.
-  // Injected SBINIT packets carry no data payload.
+  // -------------------------------------------------------------------------
+  // always_comb: Injected vs Mailbox Sideband Receive Multiplexer
+  //
+  // Selects direct injected packets or mailbox CDC packets to feed LTSM inputs.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // -------------------------------------------------------------------------
   always_comb begin
     sb_rx_pkt_vld    = inject_rx_pkt_vld || cdc_rx_pkt_vld;
     sb_rx_opcode     = inject_rx_pkt_vld ? inject_rx_opcode : cdc_rx_opcode;
@@ -454,16 +577,13 @@ module ut_ltsm;
     sb_rx_dp_err     = inject_rx_pkt_vld ? inject_rx_dp_err : cdc_rx_dp_err;
   end
 
-// ---------------------------------------------------------------------------
-// Partner Sideband Codec: sb_codec u_par
-// ---------------------------------------------------------------------------
-// Represents the remote die's sideband channel.  It deserialises the
-// loc_sb_data stream into par_rx_* fields consumed by the responder
-// always block, and serialises the responder's par_tx_* reply back
-// into the par_sb_data stream that the local codec receives.  This
-// closed loop allows the LTSM to complete every sideband handshake
-// without a second LTSM instance.
-//
+  // -------------------------------------------------------------------------
+  // always_comb: Partner Transmit Packet Record Assembler
+  //
+  // Assembles responder packet fields into typed sb_packet_t for partner codec.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // -------------------------------------------------------------------------
   always_comb begin
     par_tx_packet = '0;
     par_tx_packet.opcode = par_tx_opcode;
@@ -478,12 +598,68 @@ module ut_ltsm;
     par_tx_packet.addr = {{15{1'b0}}, par_tx_addr};
     par_tx_packet.data = par_tx_data_in;
   end
+
+  // -------------------------------------------------------------------------
+  // assign: par_rx_pkt_vld - Partner Codec Receive Valid Qualifier
+  //
+  // Forwards receive packet valid flag from partner codec.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
+  // -------------------------------------------------------------------------
   assign par_rx_pkt_vld = par_rx_valid;
+
+  // -------------------------------------------------------------------------
+  // assign: par_rx_opcode - Partner Codec Receive Opcode Unpack
+  //
+  // Unpacks opcode field from partner received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 47).
+  // -------------------------------------------------------------------------
   assign par_rx_opcode = par_rx_packet.opcode;
+
+  // -------------------------------------------------------------------------
+  // assign: par_rx_srcid - Partner Codec Receive Source ID Unpack
+  //
+  // Unpacks source ID field from partner received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 48).
+  // -------------------------------------------------------------------------
   assign par_rx_srcid = par_rx_packet.src_id;
+
+  // -------------------------------------------------------------------------
+  // assign: par_rx_dstid - Partner Codec Receive Destination ID Unpack
+  //
+  // Unpacks destination ID field from partner received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 48).
+  // -------------------------------------------------------------------------
   assign par_rx_dstid = par_rx_packet.dst_id;
+
+  // -------------------------------------------------------------------------
+  // assign: par_rx_msginfo - Partner Codec Receive MsgInfo Unpack
+  //
+  // Unpacks lower 8 bits of message info from partner received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign par_rx_msginfo = par_rx_packet.msg_info[7:0];
+
+  // -------------------------------------------------------------------------
+  // assign: par_rx_msgcode - Partner Codec Receive MsgCode Unpack
+  //
+  // Unpacks message code from partner received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign par_rx_msgcode = par_rx_packet.msg_code;
+
+  // -------------------------------------------------------------------------
+  // assign: par_rx_msgsubcode - Partner Codec Receive MsgSubcode Unpack
+  //
+  // Unpacks message subcode from partner received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign par_rx_msgsubcode = par_rx_packet.msg_subcode;
 
   sb_codec u_par (
@@ -502,9 +678,14 @@ module ut_ltsm;
   integer local_done_count;
   logic [7:0] local_done_code [0:3];
 
-  // Record only the local SBINIT packets received by the partner codec. The
-  // directed sequence later checks that a queued peer request causes a Done
-  // response before the local Done request.
+  // -------------------------------------------------------------------------
+  // always: Local SBINIT Packet Recorder in Partner Domain
+  //
+  // Records Out-Of-Reset and Done message arrivals in the partner domain to
+  // verify handshake sequencing and response-before-request precedence.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
   always @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       local_oor_count  <= 0;
@@ -619,6 +800,15 @@ module ut_ltsm;
 // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT.
 // ---------------------------------------------------------------------------
   logic [13:0] pat_ui;
+
+  // -------------------------------------------------------------------------
+  // always: Training Pattern UI Counter Register
+  //
+  // Advances pattern UI count on posedge lclk when pat_enable is active,
+  // simulating the 4K-UI LFSR training burst for LINKINIT.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.5 - LINKINIT.
+  // -------------------------------------------------------------------------
   always @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n || !pat_enable) pat_ui <= '0;
     else                           pat_ui <= pat_ui + 1'b1;
@@ -713,6 +903,14 @@ module ut_ltsm;
   integer      expected_state_index;
   integer      observed_state_index;
 
+  // -------------------------------------------------------------------------
+  // always: LTSM State Walk Sequence Recorder
+  //
+  // Appends new LTSM state to seen[] buffer whenever state changes to verify
+  // exact traversal of all 20 link training states.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training State Machine.
+  // -------------------------------------------------------------------------
   always @(posedge lclk) begin
     if (lreset_n) begin
       if (seen_n == 0 || ltsm_state !== seen[seen_n-1]) begin

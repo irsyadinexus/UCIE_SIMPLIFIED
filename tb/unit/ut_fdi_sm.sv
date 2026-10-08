@@ -168,6 +168,9 @@
 //                        description after the evidence export update.
 //   v0.0.8  2026-09-25  Restore the closing initial-block delimiter after the
 //                        Phase F evidence writer.
+//   v0.0.9  2026-10-08  Update state walk sequence to test direct exit from
+//                        LINKERROR to RESET per UCIe 1.0 Section 8.2.5 (Figure 119)
+//                        and Section 8.3.2.7.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0

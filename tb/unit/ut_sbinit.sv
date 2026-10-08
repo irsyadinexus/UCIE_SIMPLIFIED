@@ -8,11 +8,46 @@
 //               remote match/mismatch events. LTSM policy remains covered by
 //               ut_ltsm and is not duplicated here.
 //
-// Revision history
-// ----------------
-//   v0.0.1  2026-09-24  Add direct SBINIT waveform and event-mailbox checks.
-//   v0.0.2  2026-09-25  Connect the Phase D private Adapter Start input with
-//                       a zero tie-off. Preserve this direct SBINIT proof.
+// WAVEFORM STRUCTURE AND ATOMIC EVENT PASSING
+//
+//   Transmitter emits alternating SDR pulses: 64 UI active (1010...) followed
+//   by 32 UI parked low. Receiver samples on negedge sb_rx_clk and requires
+//   alternating data throughout all 64 UIs. CDC mailboxes transfer single-cycle
+//   atomic completion and match strobes to the link clock domain.
+//
+// TESTBENCH VERIFICATION STRATEGY
+//   1. Direct Primitive Testing: Drives logical_phy SBINIT primitive directly
+//      without top-level wrapper overhead.
+//   2. Strobe Sampling Eyeline: Validates that falling edge sampling of sb_rx_clk
+//      reliably latches incoming SDR data bits.
+//   3. 64-UI Active Window Check: Verifies that exactly 64 alternating bits are
+//      transmitted and received during active bursts.
+//   4. 32-UI Low Gap Validation: Confirms that strobe and data park low for
+//      exactly 32 UIs between consecutive iterations.
+//   5. CDC Pulse Delivery: Verifies that iteration completion and match flags
+//      cross cleanly into lclk without losing pulses.
+//
+// REVISION HISTORY
+// ----------------------------------------------------------------------------
+//   Rev     Date        Author      Description
+//   ------  ----------  ----------  ------------------------------------------
+//   v0.0.1  2026-09-24  -           Add direct SBINIT waveform and event-mailbox checks.
+//   v0.0.2  2026-09-25  -           Connect the Phase D private Adapter Start input with
+//                                    a zero tie-off. Preserve this direct SBINIT proof.
+//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
+//                                    and add per-construct comments.
+// TESTBENCH EXECUTION FLOW
+//   1. Assert lreset_n and sbreset_n, then release both.
+//   2. Enable pattern_run_enable and sbinit_raw_mode to start raw transmission.
+//   3. Sample the emitted sb_tx_clk and sb_tx_data across 64 active UIs and
+//      confirm the alternating bit sequence.
+//   4. Confirm sb_tx_clk and sb_tx_data park low for exactly 32 UIs.
+//   5. Count the local-completion events crossing into lclk and confirm exactly
+//      one per iteration.
+//   6. Drive remote match and mismatch events and confirm ordered delivery.
+//   7. Report pass or fail and finish.
+//
+// ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
@@ -105,15 +140,36 @@ module ut_sbinit;
     mbclk = 1'b0;
     sbclk = 1'b0;
   end
+  // -------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz reference clock for SBINIT LTSM testing.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Link Clock Frequency.
+  // -------------------------------------------------------------------------
   always #1.000 lclk  = ~lclk;
+
+  // -------------------------------------------------------------------------
+  // always: Mainband Forwarded Clock Generator (2 GHz mbclk)
+  //
+  // Generates 2 GHz forwarded clock fCK for 4 GT/s DDR transmission.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Mainband Clocking.
+  // -------------------------------------------------------------------------
   always #0.250 mbclk = ~mbclk;
   initial begin
     #0.1875;
     forever #0.625 sbclk = ~sbclk;
   end
 
-  // Capture each mailbox destination pulse and its 1-bit atomic event flag in the
-  // same lclk sample. A duplicate pulse or a dropped flag changes the event counts.
+  // -------------------------------------------------------------------------
+  // always: Atomic SBINIT Event Monitor
+  //
+  // Captures mailbox destination pulses and iteration match flags in lclk.
+  // Verifies that exactly 4 raw iterations complete prior to Done exchange.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
   always @(posedge lclk) begin
     #0.01;
     if (!lreset_n) begin

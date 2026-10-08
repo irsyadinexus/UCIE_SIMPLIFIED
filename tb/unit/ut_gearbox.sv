@@ -210,6 +210,10 @@
 //                                 reference and evidence export history.
 //   0.0.7 2026-09-25  Restore the closing initial-block delimiter after the
 //                                 Phase F evidence writer.
+//   0.0.8 2026-10-08  Documentation compliance pass: add 5-20 line
+//                                 spec-referenced comment blocks above the
+//                                 framing-injection mux assigns and the
+//                                 mbclk sampling/monitor always blocks.
 // ============================================================================
 `include "ucie_pkg.sv"
 `timescale 1ns/1ps
@@ -248,6 +252,15 @@ module ut_gearbox;
   // the mbclk edge, so the wire never changes in the same time step in which
   // the receiver samples it.
   assign mb_rx_wire     = mb_tx_wire;
+
+  // -------------------------------------------------------------------------
+  // assign: mb_rx_val_wire - Receive Framing Valid Wire Multiplexer
+  //
+  // Selects between error injector pattern bits (inj_pat) or direct transmit
+  // framing wire (mb_tx_val_wire) to test receiver framing fault detection.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   assign mb_rx_val_wire = inj_en ? inj_pat[3 - int'(u_rx.cyc_q)] : mb_tx_val_wire;
 
   tx_gearbox u_tx (
@@ -324,9 +337,15 @@ module ut_gearbox;
   // times this rate is what makes the 8-UI DDR transfer fit in one lclk
   // period.
   //
-  // Spec ref: UCIe 1.0, Section 5.1.1 - Data rates.
-  // -------------------------------------------------------------------------
   initial begin lclk = 1'b0; mbclk = 1'b0; end
+
+  // -------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz parallel clock for 128-bit gearbox word transfers.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Data Rates.
+  // -------------------------------------------------------------------------
   always #1.00 lclk  = ~lclk;
 
   // -------------------------------------------------------------------------
@@ -473,6 +492,15 @@ module ut_gearbox;
   // -------------------------------------------------------------------------
   int wire_ui_cnt;
   logic [W-1:0] active_tx_word;
+
+  // -------------------------------------------------------------------------
+  // always: Double Data Rate (DDR) Pin Sampler & Bit Transpose Checker
+  //
+  // Samples pin wires on posedge and negedge mbclk (both DDR edges) with
+  // small delta delay to verify byte-to-lane mapping per Section 4.1.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   always @(posedge mbclk or negedge mbclk) begin
     #0.01;
     if (lreset_n && u_tx.ser_val_q) begin
@@ -516,11 +544,18 @@ module ut_gearbox;
   //
   // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
   //           PLAN.md Section 6.2 - Valid framing.
-  // -------------------------------------------------------------------------
   logic [3:0] tx_pat_q;          // window: [3] = cycle 0 ... [0] = cycle 3
   int         tx_pat_cnt;        // samples collected in the current window
   int         tx_valid_windows;  // windows that carried the PAT_VALID pattern
 
+  // -------------------------------------------------------------------------
+  // always: Transmit Framing Pattern Window Monitor
+  //
+  // Reconstructs the 4-phase framing pattern across mbclk cycles and verifies
+  // that PAT_VALID (4'b1000) or PAT_IDLE (4'b0000) is transmitted per spec.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   always @(posedge mbclk) begin
     #0.01;                       // let the mbclk-cycle registers settle
     if (!lreset_n) begin

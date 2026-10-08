@@ -86,6 +86,9 @@
 //                        during both acknowledged and release stall phases.
 //   v0.0.7  2026-09-25  Clarify that data registers continue to capture while
 //                        output valid and ready gates block stalled transfers.
+//   v0.0.8  2026-10-08  Documentation compliance pass: expand construct comment
+//                        blocks for elastic registers, multiplexing, and lint
+//                        suppression assigns with spec subsection references.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -147,6 +150,15 @@ module adapter_datapath #(
 
   // -------------------------------------------------------------------------
   // always_ff: One-entry Elastic Stage & RX Pipeline Register
+  //
+  // Captures inbound Protocol Layer transmit data into a 1-entry elastic
+  // buffer stage (tx_data_q, tx_valid_q) when an FDI transfer occurs, and
+  // registers inbound RDI physical receive data (rx_data_q, rx_valid_q).
+  // On asynchronous reset (lreset_n == 0), both pipeline registers are
+  // cleared to prevent transmitting invalid data.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.2.1 - Raw Mode Operation;
+  //           Section 8.2 - Flit-Aware Die-to-Die Interface (FDI).
   // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -168,7 +180,18 @@ module adapter_datapath #(
   end
 
   // -------------------------------------------------------------------------
-  // always_comb: Output Multiplexing and Gating
+  // always_comb: Output Multiplexing, Degrade Masking, and Stall Gating
+  //
+  // Drives the RDI transmit data path and FDI receive data path.
+  // In the transmit direction, valid and irdy are gated by !stall_active
+  // to enforce data quiescing during physical stall handshakes (Section 8.3.1).
+  // In x8 width degrade mode, the upper half of the transmit word is masked
+  // to zero per Section 4.3.7. In the receive direction, ready is derived
+  // from elastic buffer vacancy.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.3.7 - Width Degrade;
+  //           Section 8.1 - Raw Die-to-Die Interface (RDI);
+  //           Section 8.3.1 - Stall Handshake.
   // -------------------------------------------------------------------------
   always_comb begin
     // FDI -> RDI
@@ -188,6 +211,10 @@ module adapter_datapath #(
     pl_stream    = STREAM_ID_S0_STREAMING;
   end
 
+  logic unused_stallack;
+  logic [7:0] unused_lp_stream;
+  logic unused_rx_active_sts;
+
   // -------------------------------------------------------------------------
   // assign: Unused lp_stallack Lint Suppression
   //
@@ -198,11 +225,28 @@ module adapter_datapath #(
   //
   // Spec ref: UCIe 1.0, Table 115 - FDI Signal List (lp_stallack definition).
   // -------------------------------------------------------------------------
-  logic unused_stallack;
   assign unused_stallack = lp_stallack;
-  logic [7:0] unused_lp_stream;
+
+  // -------------------------------------------------------------------------
+  // assign: Unused lp_stream Lint Suppression
+  //
+  // Stream routing is fixed to STREAM_ID_S0_STREAMING for the single-stack
+  // streaming endpoint. This assign consumes the FDI lp_stream input
+  // to prevent synthesis and lint tool unused-port warnings.
+  //
+  // Spec ref: UCIe 1.0, Table 115 - FDI Signal List (lp_stream definition).
+  // -------------------------------------------------------------------------
   assign unused_lp_stream = lp_stream;
-  logic unused_rx_active_sts;
+
+  // -------------------------------------------------------------------------
+  // assign: Unused lp_rx_active_sts Lint Suppression
+  //
+  // lp_rx_active_sts is consumed by the FDI state machine (fdi_state_machine.sv)
+  // for the 4-way Active handshake. This assign consumes the signal in the
+  // datapath module to prevent unused-port warnings while maintaining interface parity.
+  //
+  // Spec ref: UCIe 1.0, Table 115 - FDI Signal List (lp_rx_active_sts definition).
+  // -------------------------------------------------------------------------
   assign unused_rx_active_sts = lp_rx_active_sts;
 
 endmodule

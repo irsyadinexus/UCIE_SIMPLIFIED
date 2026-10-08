@@ -19,8 +19,28 @@
 //     with strobe, negedge strobe sampling, parked clock/data low).
 //   - UCIe 1.0, Section 6.1: Sideband protocol specification and timing.
 //
-// Revision History
+// SBINIT RAW WAVEFORM GENERATION & DETECTION (UCIe 1.0 Section 4.5.3.2)
+//
+//     +----------------- 64 UI Active Pattern -----------------+--- 32 UI Low ---+
+//     | 1 | 0 | 1 | 0 | 1 | ...                              | | 0 | 0 | ... | 0 |
+//     +--------------------------------------------------------+-----------------+
+//     ^                                                        ^                 ^
+//     Start of Iteration                                       Low Gap Start     End of Iteration
+//
+// THEORY OF OPERATION
+//   During the initial physical sideband bring-up phase (SBINIT), the physical
+//   pins operate in raw SDR mode prior to enabling packet-based communication.
+//   The transmitter emits repeated bursts consisting of 64 alternating data
+//   bits (1010...) accompanied by a forwarded clock strobe, followed by a
+//   mandatory 32-UI low separation period where clock and data remain parked low.
+//   The receiver samples serial data on the falling edge of the incoming strobe
+//   to maximize setup and hold margin, and verifies exact alternating bit sequences
+//   across all 64 active UIs before reporting valid pattern detection.
+//
+// REVISION HISTORY
 // --------------------------------------------------------------------------
+//   Rev     Date        Author      Description
+//   ------  ----------  ----------  ----------------------------------------
 //   v0.0.1  2026-09-24  -           Extract raw waveform primitive from
 //                                    logical_phy. Preserve LTSM policy and
 //                                    logical_phy CDC ownership.
@@ -32,6 +52,11 @@
 //                                    drift tolerance (>16 sbclk cycles) in sbclk,
 //                                    and 32-UI low gap validation with parked
 //                                    clock/data check.
+//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
+//                                    waveform diagram and add comprehensive
+//                                    spec-referenced construct comments.
+//   v0.0.4  2026-10-08  -           Header expansion: add detailed theory of
+//                                    operation and formal revision history table.
 // ============================================================================
 `ifndef SbInitRaw_SV
 `define SbInitRaw_SV
@@ -86,8 +111,16 @@ module sb_init_raw (
   // Strobe loss threshold in sbclk cycles (>16 cycles to tolerate CDC phase drift)
   localparam logic [5:0] STROBE_LOSS_THRESHOLD = 6'd20;
 
-  // Synchronize stable LTSM controls into sbclk. Raw mode resets asserted so
-  // the packet codec stays quiescent until the LTSM selects packet mode.
+  // -------------------------------------------------------------------------
+  // always_ff: Synchronizer for LTSM Control Signals
+  //
+  // Synchronizes pattern_run_enable and sbinit_raw_mode levels from the 500 MHz
+  // lclk domain into the 800 MHz sbclk domain using two-stage synchronizers.
+  // Raw mode resets asserted so that the codec remains quiescent until raw
+  // pattern phase completes.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       pattern_run_meta_q <= 1'b0;
@@ -149,6 +182,15 @@ module sb_init_raw (
   logic raw_tx_clk_en_neg_q;
   logic raw_tx_bit_q;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Forwarded Clock Gating and SDR Data Strobe Alignment
+  //
+  // Latches clock enable on the falling edge of sbclk to produce clean,
+  // glitch-free forwarded strobe pulses (sb_tx_clk) edge-aligned with the
+  // alternating pattern data bit (raw_tx_bit_q).
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 and Figure 99.
+  // -------------------------------------------------------------------------
   always_ff @(negedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       raw_tx_clk_en_neg_q <= 1'b0;
@@ -162,9 +204,44 @@ module sb_init_raw (
     end
   end
 
+  // -------------------------------------------------------------------------
+  // assign: sb_tx_clk - Raw Forwarded Strobe Pin Driver
+  //
+  // Produces 800 MT/s SDR forwarded strobe pulses during 64-UI active pattern
+  // windows and parks low during the 32-UI low gap per Section 5.13.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 and Section 5.13.
+  // -------------------------------------------------------------------------
   assign sb_tx_clk         = raw_tx_clk_en_neg_q & sbclk;
+
+  // -------------------------------------------------------------------------
+  // assign: sb_tx_data - Raw Transmit Data Pin Driver
+  //
+  // Drives the alternating bit sequence (raw_tx_bit_q) during 64-UI active
+  // pattern windows and parks low during the 32-UI low gap per Section 5.13.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 and Section 5.13.
+  // -------------------------------------------------------------------------
   assign sb_tx_data        = raw_tx_clk_en_neg_q ? raw_tx_bit_q : 1'b0;
+
+  // -------------------------------------------------------------------------
+  // assign: raw_tx_idle - Raw Transmit State Idle Flag
+  //
+  // Asserted while the raw transmit state machine is in RAW_TX_IDLE, indicating
+  // no active pattern generation is in progress.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
   assign raw_tx_idle       = (raw_tx_state_q == RAW_TX_IDLE);
+
+  // -------------------------------------------------------------------------
+  // assign: raw_mode_active - Synchronized Raw Mode Status
+  //
+  // Drives raw mode status into the physical sideband pin multiplexer to
+  // gate raw waveform vs packet codec pin ownership.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
   assign raw_mode_active   = raw_mode_sync_q;
 
   // =========================================================================
@@ -185,8 +262,25 @@ module sb_init_raw (
   logic        rx_fe_done_tog_q      = 1'b0;
   logic        rx_fe_strobe_tog_q    = 1'b0;
 
+  // -------------------------------------------------------------------------
+  // assign: rx_fe_rst_n - Front-End Asynchronous Reset
+  //
+  // Controls the front-end strobe sampling flip-flops, combining the hardware
+  // sideband reset with abort reset to re-arm the alternating bit counter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 and Section 5.13.
+  // -------------------------------------------------------------------------
   assign rx_fe_rst_n = sbreset_n && !rx_fe_abort_rst_q;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Physical Strobe Negedge Sampling Front-End
+  //
+  // Samples serial data on the falling edge of the incoming strobe (sb_rx_clk)
+  // per UCIe 1.0 Figure 99, providing 50% UI eye setup and hold margin.
+  // Validates the 64-UI alternating sequence and asserts a match toggle on success.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 and Figure 99.
+  // -------------------------------------------------------------------------
   always_ff @(negedge sb_rx_clk or negedge rx_fe_rst_n) begin
     if (!rx_fe_rst_n) begin
       rx_fe_bit_cnt_q       <= 6'd0;
@@ -229,6 +323,14 @@ module sb_init_raw (
   logic [1:0] rx_clk_sync_q;
   logic [1:0] rx_data_sync_q;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Strobe Toggle and Raw Level Synchronizers
+  //
+  // Bridges front-end sampling events and physical wire levels into the local
+  // sbclk domain via two-stage synchronizers to detect strobes and gaps.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2.
+  // -------------------------------------------------------------------------
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       strobe_sync_q  <= 2'b00;
@@ -248,7 +350,14 @@ module sb_init_raw (
   wire rx_clk_level  = rx_clk_sync_q[1];
   wire rx_data_level = rx_data_sync_q[1];
 
-  // Observed low boundary: clock parked low, data low, and no active strobe
+  // -------------------------------------------------------------------------
+  // assign: raw_rx_low_sample - Low Gap Boundary Detection
+  //
+  // Validates that the clock and data lines are parked low and no strobe toggles
+  // are occurring, confirming the legal 32-UI inter-pattern gap.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 and Section 5.13.
+  // -------------------------------------------------------------------------
   assign raw_rx_low_sample = !rx_clk_level && !rx_data_level && !strobe_event;
 
   // =========================================================================

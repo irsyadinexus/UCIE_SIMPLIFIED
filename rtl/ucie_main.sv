@@ -261,6 +261,11 @@
 //                           an input (Section 8.2). Cross-connect typed
 //                           Adapter packet channels and PHY CSR channel
 //                           between u_adapter and u_lphy (Sections 6.1, 7.5, 8.1).
+//   v0.0.10   2026-10-08    UCIe 1.0 Section 8.3.2.7 LinkError remediation:
+//                           Implement unscaled 8 ms LinkError residency dwell,
+//                           sideband LinkError handshake dwell bypass, and direct
+//                           transition to RESET without LinkReset per Figures 111,
+//                           119, and 126.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -607,6 +612,8 @@ module ucie_main #(
     .pl_cfg_crd            ()
   );
 
+  logic unused;
+
   // --------------------------------------------------------------------------
   // assign : Lint suppression for intentionally unused signals.
   //
@@ -641,7 +648,6 @@ module ucie_main #(
   //           Table 115 - FDI signal list (the lp_cfg / pl_cfg configuration
   //           sideband signals); Section 5.13 - Sideband signaling.
   // --------------------------------------------------------------------------
-  logic unused;
   assign unused = sbreset_n | rdi_lp_stallack |
                   mb_rx_data[0] | rdi_pl_lnk_cfg[0] | rdi_pl_speedmode[0];
 

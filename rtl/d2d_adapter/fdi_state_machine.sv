@@ -66,7 +66,28 @@
 //   it lives in logical_phy. This module observes LTSM results only
 //   through the RDI status signals.
 //
-// STATE TRANSITION TABLE (spec 8.2, simplified)
+// FDI STATE TRANSITIONS (spec 8.2.5, Figure 119)
+//
+//                 +-------------------------------------------------------+
+//                 |                                                       |
+//                 v                                                       |
+//             +-------+  rdi_state_sts == ACTIVE   +--------+             |
+//             | RESET | -------------------------> | ACTIVE |             |
+//             +-------+  && lp_rx_active_sts       +--------+             |
+//              ^  ^   \                             /   |   \             |
+//              |  |    \                           /    |    \            |
+//              |  |     v                         v     |     v           |
+//              |  |   +----------+          +-------+   |   +----------+  |
+//              |  +-- | DISABLED | <------- | PMNAK |   |   |LINKRESET |  |
+//              |      +----------+          +-------+   |   +----------+  |
+//              |                                        |                 |
+//              |                                        v                 |
+//              |                                  +-----------+           |
+//              +--------------------------------- | LINKERROR |           |
+//                     rdi_state_sts == RESET      +-----------+           |
+//                     (spec Fig 119 & 8.3.2.7)                            |
+//
+// STATE TRANSITION TABLE (spec 8.2.5 / Figure 119, fixed profile)
 //   Current State  | Condition on rdi_state_sts       | Next State
 //   ---------------+----------------------------------+------------
 //   F_RESET        | LINKERROR                        | F_LINKERROR
@@ -84,7 +105,7 @@
 //   F_PMNAK        | anything else                    | F_PMNAK (hold)
 //   F_LINKRESET    | RESET / ACTIVE / LINKERROR       | respective
 //   F_LINKRESET    | anything else                    | hold
-//   F_LINKERROR    | RESET / LINKRESET                | respective
+//   F_LINKERROR    | RESET (direct per Fig 119)       | F_RESET
 //   F_LINKERROR    | anything else                    | hold
 //   F_DISABLED     | RESET / LINKRESET                | respective
 //   F_DISABLED     | anything else                    | hold
@@ -124,6 +145,10 @@
 //   v0.0.6  2026-09-25  Keep the public adapter_active_req port unchanged
 //                        while documenting and enforcing its policy-inert
 //                        Phase D behavior.
+//   v0.0.7  2026-10-08  Update LinkError transitions per UCIe 1.0 Section 8.2.5
+//                        (Figure 119) and Section 8.3.2.7: LinkError exits
+//                        directly to Reset (never LinkReset). Add comprehensive
+//                        per-construct block comments.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -359,7 +384,8 @@ module fdi_state_machine (
   //   F_PMNAK    -> Active when the RDI accepts a retry, Reset when the link
   //                 is torn down; LinkReset/LinkError/Disabled mirror through.
   //   F_LINKRESET-> Reset / Active / LinkError.
-  //   F_LINKERROR-> only Reset (Exit-Link-Error) or LinkReset.
+  //   F_LINKERROR-> only Reset per Figure 119 and Section 8.3.2.7
+//                 (LinkError exits directly to Reset; LinkReset is excluded).
   //   F_DISABLED -> only Reset or LinkReset.
   //   default    -> F_RESET (defensive).
   // Spec ref: 8.2 (FDI LSM transitions), 8.1.5 (Exit-Link-Error).
@@ -420,6 +446,18 @@ module fdi_state_machine (
   end
 
   logic [7:0] unused_lp_stream;
+
+  // -------------------------------------------------------------------------
+  // assign: unused_lp_stream - clean lint consumption of lp_stream
+  //
+  // In the fixed-profile streaming implementation (Format 1 Raw Mode),
+  // stream routing is static (STREAM_ID_S0_STREAMING) and lp_stream is
+  // terminated cleanly to prevent unused port warnings from synthesis and
+  // lint tools without modifying protocol layer streaming behavior.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 - Flit-Aware Die-to-Die
+  //           Interface (FDI), Table 115 (lp_stream definition).
+  // -------------------------------------------------------------------------
   assign unused_lp_stream = lp_stream;
 endmodule
 

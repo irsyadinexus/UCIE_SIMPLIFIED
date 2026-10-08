@@ -60,6 +60,9 @@
 //                                 detection of early strobe loss, unexpected gap
 //                                 strobes, reserved opcodes/fields, CP/DP parity,
 //                                 upper 32-bit payload validation, and sticky overflow.
+//   0.0.6 2026-10-08  -           Documentation compliance pass: add detailed
+//                                 construct comments (5-30 lines) with UCIe 1.0
+//                                 spec citations across all always/assign blocks.
 // ============================================================================
 `ifndef SbCodec_SV
 `define SbCodec_SV
@@ -132,9 +135,15 @@ module sb_codec (
   logic        tx_clk_en_q;
   logic        tx_clk_en_neg_q;
 
-  // Glitch-free clock gating cell for forwarded TX strobe (sb_tx_clk).
-  // Clock enable is latched on negedge sbclk so that sb_tx_clk transitions
-  // occur cleanly edge-aligned with posedge sbclk, and park low when disabled.
+  // -------------------------------------------------------------------------
+  // always_ff: TX Strobe Gating Cell (Negedge Retiming)
+  //
+  // Latches tx_clk_en_q on the falling edge of sbclk so that sb_tx_clk
+  // transitions occur cleanly edge-aligned with rising sbclk edges and park
+  // stably low during inter-packet gaps, preventing runt pulses.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 and Section 4.1.5.
+  // -------------------------------------------------------------------------
   always_ff @(negedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       tx_clk_en_neg_q <= 1'b0;
@@ -143,8 +152,25 @@ module sb_codec (
     end
   end
 
+  // -------------------------------------------------------------------------
+  // assign: sb_tx_clk - Physical Transmit Strobe Pin Driver
+  //
+  // Gates the 800 MHz SDR forwarded strobe to the physical link pin.
+  // Toggles only during 64-UI active packet windows and remains parked low
+  // during 32-UI inter-packet gaps per Section 5.13.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 5.13.
+  // -------------------------------------------------------------------------
   assign sb_tx_clk = tx_clk_en_neg_q & sbclk;
 
+  // -------------------------------------------------------------------------
+  // assign: sb_tx_data - Physical Transmit Serial Data Pin Driver
+  //
+  // Drives the serial LSB bit of header or payload shift register onto the
+  // physical data pin. Parks low during inter-packet gaps per Section 5.13.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Figure 46.
+  // -------------------------------------------------------------------------
   assign sb_tx_data = (tx_state_q == TX_HDR) ||
                       ((tx_state_q == TX_HDR_GAP) && (tx_gap_cnt_q == 5'd0)) ?
                       tx_hdr_shift_q[0] :
@@ -153,11 +179,35 @@ module sb_codec (
                       tx_pld_shift_q[0] :
                       1'b0;
 
-  // Handshake and flow control
+  // -------------------------------------------------------------------------
+  // assign: tx_ready - Transmit Interface Ready Status
+  //
+  // Asserted while the transmit serializer FSM is in TX_IDLE, indicating the
+  // codec is ready to accept a new sideband packet transmission request.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.
+  // -------------------------------------------------------------------------
   assign tx_ready = (tx_state_q == TX_IDLE);
+
+  // -------------------------------------------------------------------------
+  // assign: tx_busy - Transmit Interface Busy Indication
+  //
+  // Asserted whenever the transmitter is actively serializing a packet or
+  // executing the mandatory 32-UI trailing inter-packet gap.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.3.
+  // -------------------------------------------------------------------------
   assign tx_busy  = (tx_state_q != TX_IDLE);
 
-  // TX FSM
+  // -------------------------------------------------------------------------
+  // always_ff: Transmit Serializer Protocol FSM
+  //
+  // Sequences packet serialization through TX_IDLE, TX_HDR (64 UIs),
+  // TX_HDR_GAP (32 UIs), optional TX_PAYLOAD (64 UIs), and TX_PLD_GAP (32 UIs).
+  // LSB-first transmission per Section 6.1.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.2.
+  // -------------------------------------------------------------------------
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       tx_state_q      <= TX_IDLE;
@@ -265,6 +315,14 @@ module sb_codec (
   logic rx_fe_rst_n;
   logic rx_abort_rst_q;
 
+  // -------------------------------------------------------------------------
+  // assign: rx_fe_rst_n - Receive Front-End Asynchronous Reset
+  //
+  // Generates reset for the negedge sb_rx_clk front-end sampler from global
+  // sbreset_n qualified with synchronous abort resets triggered on protocol errors.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband Signaling.
+  // -------------------------------------------------------------------------
   assign rx_fe_rst_n = sbreset_n && !rx_abort_rst_q;
 
   logic [63:0] rx_shift_reg_q;
@@ -276,6 +334,15 @@ module sb_codec (
   logic        rx_strobe_tog_q;
   logic        rx_expect_pld_q;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Receive Physical Front-End Strobe Sampler
+  //
+  // Samples serial data on negedge sb_rx_clk (strobe center per Section 5.13),
+  // shifts incoming bits LSB-first into rx_shift_reg_q, and transfers completed
+  // 64-bit words to header/payload holding buffers with completion toggle flags.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 and Figure 99.
+  // -------------------------------------------------------------------------
   always_ff @(negedge sb_rx_clk or negedge rx_fe_rst_n) begin
     if (!rx_fe_rst_n) begin
       rx_shift_reg_q    <= 64'h0;
@@ -312,6 +379,15 @@ module sb_codec (
   logic [1:0] pld_done_sync_q;
   logic [1:0] rx_clk_level_sync_q;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Strobe Toggle and Front-End Event Synchronizers
+  //
+  // 2-stage synchronizers bringing front-end toggle pulses and strobe level
+  // into the local sbclk domain to monitor reception progress and detect
+  // early strobe loss or unexpected gap activity.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 and Section 6.1.3.
+  // -------------------------------------------------------------------------
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       strobe_tog_sync_q   <= 2'b00;
@@ -378,7 +454,15 @@ module sb_codec (
   // Maximum timeout waiting for payload strobe to commence after header gap
   localparam logic [5:0] PLD_START_TIMEOUT   = 6'd63;
 
-  // RX Protocol FSM
+  // -------------------------------------------------------------------------
+  // always_ff: Receive Protocol State Machine and Gap Monitor
+  //
+  // Tracks receive packet phases: RX_IDLE, RX_HDR, RX_HDR_GAP (32 UI validation),
+  // RX_PAYLOAD, RX_PLD_GAP, and RX_DISPATCH. Validates 32-UI inter-packet gaps
+  // and detects early strobe termination or illegal gap strobes per Section 6.1.3.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5, Section 5.13, and Section 6.1.3.
+  // -------------------------------------------------------------------------
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       rx_state_q              <= RX_IDLE;
@@ -539,6 +623,15 @@ module sb_codec (
   logic           upper32_err;
   logic           format_err_comb;
 
+  // -------------------------------------------------------------------------
+  // always_comb: Combinational Packet Decoder and Error Check Matrix
+  //
+  // Unpacks received 64-bit header into typed sb_packet_t, decodes payload,
+  // validates opcode against Table 47, checks Control Parity (CP, bit 31),
+  // checks Data Parity (DP, bit 30), and verifies upper 32-bit zero-padding.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 47) and Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   always @* begin
     // Unpack 64-bit header into typed sb_packet_t
     dec_pkt = sb_decode_header(rx_hdr_latched_q);
@@ -587,10 +680,41 @@ module sb_codec (
                     | dec_hdr_err.illegal_payload;
   end
 
-  // Prepared entry for queue insertion
+  // -------------------------------------------------------------------------
+  // assign: new_rx_entry.packet - Decoded Queue Entry Packet Field
+  //
+  // Drives unpacked packet structure into candidate queue insertion entry.
+  // Cleared to zero if an unrecoverable early strobe loss occurred.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Layouts.
+  // -------------------------------------------------------------------------
   assign new_rx_entry.packet       = rx_strobe_loss_err_q ? '0 : dec_pkt;
+
+  // -------------------------------------------------------------------------
+  // assign: new_rx_entry.format_error - Candidate Entry Format Error Flag
+  //
+  // Rolls up all structural formatting and gap timing violations.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data Integrity.
+  // -------------------------------------------------------------------------
   assign new_rx_entry.format_error = format_err_comb;
+
+  // -------------------------------------------------------------------------
+  // assign: new_rx_entry.cp_error - Candidate Entry Control Parity Error Flag
+  //
+  // Driven from even-parity check across header bits [63:31, 29:0].
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign new_rx_entry.cp_error     = rx_strobe_loss_err_q ? 1'b0 : cp_mismatch_err;
+
+  // -------------------------------------------------------------------------
+  // assign: new_rx_entry.dp_error - Candidate Entry Data Parity Error Flag
+  //
+  // Driven from even-parity check across payload data bits.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign new_rx_entry.dp_error     = rx_strobe_loss_err_q ? 1'b0 : dp_mismatch_err;
 
   // =========================================================================
@@ -613,6 +737,14 @@ module sb_codec (
   wire rx_pop  = rx_valid && rx_ready;
   wire rx_push = rx_push_req;
 
+  // -------------------------------------------------------------------------
+  // always_ff: 2-Entry Packet Event Queue Register File
+  //
+  // Implements FIFO storage for up to 2 received packet events and associated
+  // error flags. Sets sticky rx_overflow_q if a push occurs when count is 2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // -------------------------------------------------------------------------
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       rx_q_count_q  <= 2'd0;
@@ -673,11 +805,59 @@ module sb_codec (
     end
   end
 
+  // -------------------------------------------------------------------------
+  // assign: rx_valid - Receive Event Available Flag
+  //
+  // Asserts while the 2-entry queue holds at least one packet event.
+  // Held steady until acknowledged and popped by rx_ready.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.
+  // -------------------------------------------------------------------------
   assign rx_valid = (rx_q_count_q != 2'd0);
+
+  // -------------------------------------------------------------------------
+  // assign: rx_packet - Read Head Packet Output Multiplexer
+  //
+  // Drives the decoded packet at the read pointer head of the 2-entry queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Layouts.
+  // -------------------------------------------------------------------------
   assign rx_packet = rx_q_rd_ptr_q ? rx_packet1_q : rx_packet0_q;
+
+  // -------------------------------------------------------------------------
+  // assign: rx_format_error - Read Head Format Error Flag Multiplexer
+  //
+  // Drives format error status for the packet at the read head of the queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data Integrity.
+  // -------------------------------------------------------------------------
   assign rx_format_error = rx_valid ? (rx_q_rd_ptr_q ? rx_format1_q : rx_format0_q) : 1'b0;
+
+  // -------------------------------------------------------------------------
+  // assign: rx_cp_error - Read Head Control Parity Error Flag Multiplexer
+  //
+  // Drives CP mismatch error status for the packet at the read head of the queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign rx_cp_error = rx_valid ? (rx_q_rd_ptr_q ? rx_cp1_q : rx_cp0_q) : 1'b0;
+
+  // -------------------------------------------------------------------------
+  // assign: rx_dp_error - Read Head Data Parity Error Flag Multiplexer
+  //
+  // Drives DP mismatch error status for the packet at the read head of the queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
   assign rx_dp_error = rx_valid ? (rx_q_rd_ptr_q ? rx_dp1_q : rx_dp0_q) : 1'b0;
+
+  // -------------------------------------------------------------------------
+  // assign: rx_overflow - Sticky Receive Queue Overflow Flag Driver
+  //
+  // Asserted sticky when incoming packets arrive faster than consumed.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // -------------------------------------------------------------------------
   assign rx_overflow = rx_overflow_q;
 
 endmodule

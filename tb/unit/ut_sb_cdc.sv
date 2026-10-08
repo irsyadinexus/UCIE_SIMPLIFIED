@@ -17,12 +17,45 @@
 //
 // Spec ref: UCIe 1.0 Section 6.1 packet transport; PLAN.md §15.2 Phase A.
 //
+// ASYNCHRONOUS CDC CROSSING ARCHITECTURE
+//
+//   Link Domain (500 MHz lclk)             Sideband Domain (800 MHz sbclk)
+//   +----------------------+               +----------------------+
+//   | src_data, src_send   |-- toggle ---->| dst_data, dst_valid  |
+//   | src_busy             |<-- ack -------|                      |
+//   +----------------------+               +----------------------+
+//
+// TESTBENCH CHECKS & VERIFICATION STRATEGY
+//   1. Transmit Mailbox Crossing: Sends 16-bit word from 500 MHz lclk into
+//      800 MHz sbclk domain; verifies single-cycle dst_valid pulse.
+//   2. Receive Mailbox Crossing: Sends 101-bit flat packet bundle from 800 MHz
+//      sbclk into 500 MHz lclk domain; verifies zero data corruption.
+//   3. Data Coherency: Confirms that data bus remains completely stable
+//      while src_busy is asserted until acknowledge clears.
+//   4. Atomic Strobe Protection: Verifies that rapid asynchronous clock domain
+//      crossings never duplicate or drop delivery pulses.
+//
 // REVISION HISTORY
-//   v0.0.1  2026-09-23  Req.3: add asynchronous 500 MHz/800 MHz CDC test.
-//   v0.0.2  2026-09-24  Phase A: test the standalone 101-bit flat RX bundle,
-//                        source busy retention, and one coherent event.
+// ----------------------------------------------------------------------------
+//   Rev     Date        Author      Description
+//   ------  ----------  ----------  ------------------------------------------
+//   v0.0.1  2026-09-23  -           Req.3: add asynchronous 500 MHz/800 MHz CDC test.
+//   v0.0.2  2026-09-24  -           Phase A: test the standalone 101-bit flat RX bundle,
+//                                    source busy retention, and one coherent event.
+//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
+//                                    and add per-construct comments.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
+// TESTBENCH EXECUTION FLOW
+//   1. Assert lreset_n and sbreset_n, then release both.
+//   2. Drive l2s_data and pulse l2s_send; wait for l2s_valid in sbclk.
+//   3. Confirm l2s_recv matches l2s_data and l2s_valid is exactly one cycle.
+//   4. Drive the 101-bit s2l_data bundle and pulse s2l_send; wait for s2l_valid.
+//   5. Confirm s2l_recv equals the expected flat bundle and that exactly one
+//      destination valid pulse is produced.
+//   6. Confirm source payload stays stable while the mailbox reports busy.
+//   7. Report pass or fail and finish.
+//
 // ============================================================================
 `timescale 1ns/1ps
 module ut_sb_cdc;
@@ -49,6 +82,14 @@ module ut_sb_cdc;
     .dst_valid(s2l_valid)
   );
 
+  // -------------------------------------------------------------------------
+  // always: Destination Valid Event Monitor
+  //
+  // Counts valid pulses received on dst_valid to verify exact atomic packet
+  // delivery through the CDC mailbox without duplicated transfer strobes.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband CDC.
+  // -------------------------------------------------------------------------
   always @(posedge s2l_valid) s2l_valid_count = s2l_valid_count + 1;
 
   initial begin
@@ -130,6 +171,13 @@ module ut_sb_cdc;
     $finish;
   end
 
+  // -------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz reference link clock for CDC mailbox testing.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Link Clock Frequency.
+  // -------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
   initial begin
     #0.1875;

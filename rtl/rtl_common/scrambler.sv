@@ -91,6 +91,8 @@
 //                                  opcode table. Re-cite to Section 4.4.1
 //                                  (Scrambling and training pattern
 //                                  generation).
+//   0.0.5  2026-10-08  -           Documentation compliance pass: add detailed
+//                                  per-step feedback and XOR scramble comments.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -156,7 +158,25 @@ module scrambler #(
   generate
     for (u = 0; u < 8; u = u + 1) begin : g_step
       wire fb = ^(lfsr_step[u] & LFSR_TAPS);
+
+      // ---------------------------------------------------------------------
+      // assign: lfsr_step[u+1] - Fibonacci LFSR Next State Step
+      //
+      // Shifts the 23-bit LFSR right by 1 bit and inserts the feedback bit
+      // fb = ^(lfsr_step[u] & LFSR_TAPS) into the MSB per Section 4.4.1.
+      //
+      // Spec ref: UCIe 1.0 Specification, Section 4.4.1 - Scrambling Polynomial.
+      // ---------------------------------------------------------------------
       assign lfsr_step[u+1] = {fb, lfsr_step[u][LFSR_W-1:1]};
+
+      // ---------------------------------------------------------------------
+      // assign: out_comb[u] - XOR Scramble/Descramble Bit
+      //
+      // XORs the input data bit with the current LFSR output bit (bit 0).
+      // Self-inverting topology serves symmetrically as scrambler and descrambler.
+      //
+      // Spec ref: UCIe 1.0 Specification, Section 4.4.1 - Scrambler Operation.
+      // ---------------------------------------------------------------------
       assign out_comb[u]    = data_in[u] ^ lfsr_step[u][0];
     end
   endgenerate

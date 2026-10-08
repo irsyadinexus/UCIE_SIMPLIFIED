@@ -101,6 +101,9 @@
 //                        - Add rem_req_vld/rdy/pkt and rem_cpl_vld/pkt internal mailbox
 //                          channel to adapter_sb_if (Sections 6.1, 7.5).
 //                        - Preserve one-cycle read latency.
+//   v0.0.8  2026-10-08  Documentation compliance pass: expand comments on
+//                        link status decoding, active status assignment,
+//                        and remote request packet assembly with spec references.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -374,6 +377,17 @@ module adapter_regfile (
   //           Control, Table 66 - Link Status).
   // -------------------------------------------------------------------------
   assign start_link_train    = reg_link_ctrl[0];
+
+  // -------------------------------------------------------------------------
+  // assign: link_status_active - active link status decode
+  //
+  // Decodes whether the RDI interface is currently in ACTIVE status (RDI_STS_ACTIVE).
+  // Driven as an observable link status flag to the top-level d2d_adapter
+  // wrapper and reflected in UCIe Link Status register bit 0 (Table 66).
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 (Table 66 - Link Status);
+  //           Section 8.1.5 - RDI State Transitions (Figure 111).
+  // -------------------------------------------------------------------------
   assign link_status_active  = (rdi_state_sts == RDI_STS_ACTIVE);
 
 
@@ -451,7 +465,18 @@ module adapter_regfile (
     end
   end
 
-  // Drive typed remote request packet to adapter_sb_if (Sections 6.1, 7.5)
+  // -------------------------------------------------------------------------
+  // always_comb / always @*: Remote Mailbox Request Packet Assembly
+  //
+  // Assembles the typed sideband request packet (rem_req_pkt) from the
+  // Sideband Mailbox Index (offset 0x30) and Mailbox Data (offset 0x38)
+  // register contents when a mailbox transaction is triggered (mb_pending_q == 1).
+  // Configured as an Adapter-originated request targeting the remote Adapter
+  // over the private sideband client interface.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol;
+  //           Section 7.5 - UCIe Registers (Tables 70-73).
+  // -------------------------------------------------------------------------
   always @* begin
     rem_req_pkt              = '0;
     rem_req_pkt.opcode       = reg_mb_index[4:0];

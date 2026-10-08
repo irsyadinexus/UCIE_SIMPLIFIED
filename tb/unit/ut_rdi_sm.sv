@@ -30,7 +30,7 @@
 //
 //     RESET --> ACTIVE --> PMNAK(L1) --> ACTIVE --> PMNAK(L2) --> ACTIVE
 //           --> hold ACTIVE for RETRAIN --> LINKRESET --> RESET --> ACTIVE
-//           --> LINKERROR --> LINKRESET --> RESET --> ACTIVE
+//           --> LINKERROR --> RESET --> ACTIVE (direct per Fig 111 & 8.3.2.7)
 //           --> DISABLED --> RESET --> ACTIVE --> four-phase stall
 //
 //   and, in addition to the state sequence itself, checks the Phase D policy:
@@ -128,6 +128,9 @@
 //                       description after the evidence export update.
 //   v0.0.7  2026-09-25  Restore the closing initial-block delimiter after the
 //                       Phase F evidence writer.
+//   v0.0.8  2026-10-08  Update LinkError recovery verification: test direct
+//                       transition from LINKERROR to RESET without LinkReset
+//                       per UCIe 1.0 Section 8.1.5 (Figure 111) and Section 8.3.2.7.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -213,9 +216,16 @@ module ut_rdi_sm;
   // this edge, so the stimulus always changes its inputs away from the edge to
   // avoid a race between the driver and the DUT.
   //
-  // Spec ref: UCIe 1.0, Section 8.1.2 - Interface clocking requirements.
-  // -------------------------------------------------------------------------
   initial lclk = 1'b0;
+
+  // -------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz reference link clock for RDI state machine testing.
+  // State requests are sampled and status updated on rising edges.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1.2 - Interface Clocking.
+  // -------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
 
   // -------------------------------------------------------------------------

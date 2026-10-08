@@ -25,9 +25,33 @@
 //   UCIe 1.0 Section 4.5.3.3.3, clock repair pattern.
 //   UCIe 1.0 Section 4.1.1, LSB-first lane data order.
 //
-// Revision history
-//   v0.0.1  2026-09-24  Phase A initial directed pattern test.
-//   v0.0.2  2026-09-24  Remove clock-edge stimulus races between patterns.
+// PATTERN TIMING AND STRUCTURE
+//
+//   VALTRAIN Pattern (Table 21):
+//     UI [0..3] = 4'hF (1111b), UI [4..7] = 4'h0 (0000b) per byte lane.
+//
+//   Per Lane ID Pattern (Table 23):
+//     Repeats 16-UI cycle: [0..3]=4'h5 (0101b), [4..11]=Lane ID, [12..15]=4'h5.
+//
+//   Clock Repair Pattern (Section 4.5.3.3.3):
+//     24-UI repeating sequence: 16 high UIs followed by 8 low UIs.
+//
+// VERIFICATION METHODOLOGY
+//   1. Instantiates 16-lane pattern_gen under test in 500 MHz lclk domain.
+//   2. Cycles through all pattern selection mux states (VALTRAIN, Per Lane ID,
+//      Clock Repair, and Idle).
+//   3. Evaluates 128-bit output vector per clock cycle (8 UIs x 16 lanes).
+//   4. Confirms that lane-specific IDs appear on their corresponding lane
+//      positions without cross-lane contamination.
+//
+// REVISION HISTORY
+// ----------------------------------------------------------------------------
+//   Rev     Date        Author      Description
+//   ------  ----------  ----------  ------------------------------------------
+//   v0.0.1  2026-09-24  -           Phase A initial directed pattern test.
+//   v0.0.2  2026-09-24  -           Remove clock-edge stimulus races between patterns.
+//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
+//                                    and add per-construct comments.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -60,10 +84,14 @@ module ut_pattern_gen;
     .pat_done(pat_done)
   );
 
-  // The production logical PHY runs at 500 MHz. This direct test uses the
-  // same lclk period while it samples full parallel UI words. No mainband
-  // clock is needed because pattern_gen stops at the gearbox boundary.
-  // Spec ref: UCIe 1.0 Section 5.1.1, 4 GT/s operation.
+  // -------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Drives 500 MHz link clock for testing parallel training pattern generation.
+  // Pattern generator produces 8 UIs per lclk cycle to feed the 4 GT/s gearboxes.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.4.1 and Section 5.1.1.
+  // -------------------------------------------------------------------------
   always #1 lclk = ~lclk;
 
   task automatic check_lane_byte(

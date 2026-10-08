@@ -1,18 +1,52 @@
 // ============================================================================
-// File      : tb/sbinit/tb_reset_to_sbinit.sv
+// Module    : tb_reset_to_sbinit
 // Project   : UCIe 1.0 Simplified Endpoint
-// Purpose   : Two-die RESET-to-SBINIT waveform testbench.
+// File      : tb/sbinit/tb_reset_to_sbinit.sv
+// ----------------------------------------------------------------------------
 //
-// Die 0 is the initiator. Die 1 is the endpoint. Both reset inputs assert
-// asynchronously at time zero. Die 0 receives a software Start pulse. Die 1
-// has no local Start pulse and enters training from the received SBINIT pattern.
-// The run stops after both LTSMs enter MBINIT.PARAM, which marks SBINIT done.
+// SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 4.5.3.1 - RESET State (4 ms minimum dwell)
+//   UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT State and Raw Waveform
+//   UCIe 1.0 Specification, Section 5.13    - Sideband Signaling (800 MHz SDR)
+//   UCIe 1.0 Specification, Section 8.1     - Raw Die-to-Die Interface (RDI)
+//   UCIe 1.0 Specification, Section 8.2     - Flit-Aware D2D Interface (FDI)
 //
-// The VCD contains:
-//   - Scalar sideband clock/data in both directions.
-//   - Mainband data/valid in both directions.
-//   - FDI and RDI request, response, data, and state signals for both dies.
-//   - FDI state, RDI state, LTSM state, SBINIT phase, and received messages.
+// DESCRIPTION
+//   Dual-die testbench verifying full RESET-to-SBINIT progression between two
+//   communicating endpoints across scalar physical pins.
+//   Die 0 acts as initiator triggered by software start. Die 1 has no local start
+//   and wakes upon detecting the peer's raw SBINIT waveform. Verifies 4 ms
+//   minimum RESET dwell, alternating 64-UI pattern exchange, post-detection tails,
+//   and clean transition into packet mode.
+//
+// DUAL-DIE INITIALIZATION TOPOLOGY
+//
+//   +----------------------+   Scalar Pins   +----------------------+
+//   | Die 0 (Initiator)    |================>| Die 1 (Responder)    |
+//   |                      |<================|                      |
+//   | software start = 1   |                 | software start = 0   |
+//   +----------------------+                 +----------------------+
+//
+// VERIFICATION SEQUENCE & CHECKS
+//   1. Asynchronous Reset: Both dies assert reset at time zero. Die 0 executes
+//      4 ms minimum dwell in LT_RESET per Section 4.5.3.1.
+//   2. Raw Pattern Transmission: Upon dwell expiration and software start,
+//      Die 0 begins transmitting 64-UI alternating patterns with 32-UI gaps.
+//   3. Remote Wake-up: Die 1 detects Die 0's raw pattern, exits RESET dwell,
+//      and begins transmitting its own raw SBINIT pattern.
+//   4. Lock & Handshake: After 2 consecutive matches, both dies enter post-detection
+//      tails (4 iterations) and advance into packet mode for SBINIT.Done exchange.
+//   5. Transition to MBINIT: Both dies successfully exchange SBINIT.Done request/
+//      response messages and transition into MBINIT.PARAM.
+//
+// REVISION HISTORY
+// ----------------------------------------------------------------------------
+//   Rev     Date        Author      Description
+//   ------  ----------  ----------  ------------------------------------------
+//   v0.0.1  2026-09-24  -           Initial creation of dual-die SBINIT TB.
+//   v0.0.2  2026-09-28  -           Migrate sideband pins to scalar SDR strobe.
+//   v0.0.3  2026-10-08  -           Documentation compliance pass: add detailed
+//                                    header and per-construct comments.
 // ============================================================================
 `ifndef TbResetToSbinit_SV
 `define TbResetToSbinit_SV
@@ -36,12 +70,34 @@ module tb_reset_to_sbinit;
     mbclk = 1'b0;
   end
 
+  // --------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz reference link clock for die-to-die initialization test.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Link Clock Frequency.
+  // --------------------------------------------------------------------------
   always #1.000 lclk = ~lclk;       // 500 MHz
+
+  // --------------------------------------------------------------------------
+  // always: Sideband Clock Generator (800 MHz sbclk)
+  //
+  // Generates 800 MHz sideband clock, asynchronous to link clock domain.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband Signaling.
+  // --------------------------------------------------------------------------
   always #0.625 sbclk = ~sbclk;     // 800 MHz, asynchronous to lclk
 
-  // Mainband clock stays parked through SBINIT. The requested waveform still
-  // includes the mainband wires and valid signals, which remain idle here.
   logic mbclk_en;
+
+  // --------------------------------------------------------------------------
+  // always: Gated Mainband Clock Generator (2 GHz mbclk)
+  //
+  // Mainband clock stays parked through SBINIT and toggles at 2 GHz (0.25 ns half-
+  // period) when mbclk_en is asserted in LINKINIT or ACTIVE states.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Mainband Clocking.
+  // --------------------------------------------------------------------------
   always begin
     if (mbclk_en === 1'b1) begin
       #0.250 mbclk = ~mbclk;
@@ -263,6 +319,14 @@ module tb_reset_to_sbinit;
   wire            d1_rdi_pl_inband_pres = dut_die1.rdi_pl_inband_pres;
   wire            d1_rdi_pl_stallreq = dut_die1.rdi_pl_stallreq;
 
+  // --------------------------------------------------------------------------
+  // assign: mbclk_en - Mainband Forwarded Clock Gating Control
+  //
+  // Enables the 2 GHz mainband clock during LINKINIT and ACTIVE states when
+  // mainband data transmission or link initialization patterns are active.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // --------------------------------------------------------------------------
   assign mbclk_en = (d0_ltsm_state == LT_LINKINIT) ||
                     (d1_ltsm_state == LT_LINKINIT) ||
                     (d0_ltsm_state == LT_ACTIVE) ||
@@ -504,6 +568,14 @@ module tb_reset_to_sbinit;
     d1_prev_ltsm_state = LT_RESET;
   end
 
+  // --------------------------------------------------------------------------
+  // always: State Transition Trace Logger
+  //
+  // Logs LTSM, RDI, FDI, and sideband phase transitions for both dies to stdout
+  // for cycle-accurate initialization debug.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // --------------------------------------------------------------------------
   always @(posedge lclk) begin
     if (d0_ltsm_state !== d0_prev_ltsm_state) begin
       $display("TRACE %0t DIE0 LTSM=%02h RDI=%01h FDI=%01h FDI_PUB=%01h SBPH=%01h",

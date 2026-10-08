@@ -4,21 +4,62 @@
 // Purpose   : Two-Die (Die0 <-> Die1) Link Initialization Waveform Testbench
 //
 // SPECIFICATION REFERENCES
-//   UCIe 1.0 Specification, Section 4.5.3 - Link Training State Machine (LTSM)
-//   UCIe 1.0 Specification, Section 7.5.1 - UCIe Link DVSEC (Link Control)
-//   UCIe 1.0 Specification, Section 8.1   - Raw Die-to-Die Interface (RDI, Table 114)
-//   UCIe 1.0 Specification, Section 8.2   - Flit-Aware Die-to-Die Interface (FDI, Table 115)
-//   UCIe 1.0 Specification, Section 8.1.6 - RDI Bring-up Flow (Active Entry)
+//   UCIe 1.0 Specification, Section 4.5.3   - Link Training State Machine (LTSM)
+//   UCIe 1.0 Specification, Section 7.5.1   - UCIe Link DVSEC (Link Control)
+//   UCIe 1.0 Specification, Section 8.1     - Raw Die-to-Die Interface (RDI, Table 114)
+//   UCIe 1.0 Specification, Section 8.1.5   - RDI State Machine (Figure 111)
+//   UCIe 1.0 Specification, Section 8.1.6   - RDI Bring-up Flow (Active Entry)
+//   UCIe 1.0 Specification, Section 8.2     - Flit-Aware Die-to-Die Interface (FDI, Table 115)
+//   UCIe 1.0 Specification, Section 8.2.5   - FDI State Machine (Figure 119)
+//   UCIe 1.0 Specification, Section 8.3.2.1 - Link Down Event & Request Withdrawal
+//   UCIe 1.0 Specification, Section 8.3.2.7 - LinkError State & Residency Dwell
+//   UCIe 1.0 Specification, Section 8.3.3.1 - LinkReset Flow (Figure 125)
+//   UCIe 1.0 Specification, Section 8.3.3.2 - LinkError Flow & Recovery (Figure 126)
+//
+// TWO-DIE ARCHITECTURE & TESTBENCH TOPOLOGY
+//
+//      Die 0 (Initiator / Upstream)             Die 1 (Target / Downstream)
+//   +-------------------------------+       +-------------------------------+
+//   | Protocol Layer 0 (Stimulus)   |       | Protocol Layer 1 (Stimulus)   |
+//   |   lp_state_req / lp_data      |       |   lp_state_req / lp_data      |
+//   +---------------+---------------+       +---------------+---------------+
+//                   | FDI (Table 115)                       | FDI (Table 115)
+//                   v                                       v
+//   +---------------+---------------+       +---------------+---------------+
+//   | ucie_main (dut_die0)          |       | ucie_main (dut_die1)          |
+//   |   D2D Adapter 0               |       |   D2D Adapter 1               |
+//   |   Logical PHY 0               |       |   Logical PHY 1               |
+//   +-------+---------------+-------+       +-------+---------------+-------+
+//           |               |                       |               |
+//           | mb_tx/rx_data | (mainband lanes)      | mb_tx/rx_data |
+//           +===============(=======================)===============+
+//           |               |                       |               |
+//           | sb_tx/rx_data | (sideband serial)     | sb_tx/rx_data |
+//           +---------------(-----------------------)---------------+
 //
 // TEST SEQUENCE:
-//   1. Both dies start from hardware reset (lreset_n=0, sbreset_n=0).
-//   2. Both dies enter synchronous reset state from hardware reset.
-//   3. Protocol Layer on both dies writes 1b to "Start UCIe Link Training"
-//      bit in UCIe Link Control register (offset 0x00) via FDI sideband CfgWr.
-//   4. Clean execution of SBINIT, MBINIT, MBTRAIN, and LINKINIT without errors.
-//   5. Active state achieved in LTSM, RDI SM, and FDI SM on both dies,
-//      broadcasted to partner die and Protocol Layer.
-//   6. Simulation finishes cleanly after link reaches stable ACTIVE.
+//   1. Both dies release hardware reset synchronously (lreset_n=1, sbreset_n=1).
+//   2. Physical layer enforces initial 40 us (FAST_SIM) RESET minimum dwell.
+//   3. Protocol Layer on both dies asserts Start UCIe Link Training and FDI ACTIVE.
+//   4. Full link training progresses: SBINIT -> MBINIT (CAL, REPAIR, REV) ->
+//      MBTRAIN (VREF, CLK, VTCENTER, LINKSPEED) -> LINKINIT -> ACTIVE.
+//   5. LTSM, RDI SM, and FDI SM enter ACTIVE on both dies; link Active broadcasted.
+//   6. 512-Byte bidirectional streaming verification in Format 1 Raw Mode.
+//   7. STEP 1 (Figure 125): Die 0 requests LinkReset; Die 1 receives sideband
+//      request and observes Link Down Event; both transition to RESET; 40 us
+//      RESET dwell; link restarts and successfully trains back to ACTIVE.
+//   8. STEP 2 (Figure 126): Die 0 asserts lp_linkerror; Die 1 receives sideband
+//      LinkError request; both observe Link Down Event and withdraw to NOP;
+//      both enter TRAINERROR (LinkError); sideband handshake bypasses dwell;
+//      both transition directly to RESET without LinkReset per Figure 111/119/126;
+//      40 us RESET dwell; fresh Start restarts training back to ACTIVE.
+//
+// REVISION HISTORY:
+//   v0.0.1  2026-09-22  Initial link initialization waveform testbench.
+//   v0.0.2  2026-10-06  Add 512B bidirectional streaming transfer verification.
+//   v0.0.3  2026-10-07  Add Figure 125 LinkReset entry and exit flow.
+//   v0.0.4  2026-10-08  Implement UCIe 1.0 Section 8.3.3.2 Figure 126 LinkError
+//                       entry, direct exit to RESET, and recovery bring-up.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -39,10 +80,35 @@ module tb_link_init_wave;
     mbclk = 1'b0;
   end
 
+  // --------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz reference link clock (2.0 ns period, 1.0 ns half-period)
+  // for dual-die link training simulation.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Link Clock Frequency.
+  // --------------------------------------------------------------------------
   always #1.000 lclk = ~lclk;
+
+  // --------------------------------------------------------------------------
+  // always: Sideband Clock Generator (800 MHz sbclk)
+  //
+  // Generates 800 MHz sideband clock (1.25 ns period, 0.625 ns half-period).
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband Signaling.
+  // --------------------------------------------------------------------------
   always #0.625 sbclk = ~sbclk;
 
   logic mbclk_en;
+
+  // --------------------------------------------------------------------------
+  // always: Gated Mainband Forwarded Clock Generator (2 GHz mbclk)
+  //
+  // Generates 2 GHz forwarded clock fCK (0.5 ns period) enabled when mbclk_en
+  // is asserted during high-speed training and ACTIVE states.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Mainband Clocking.
+  // --------------------------------------------------------------------------
   always begin
     if (mbclk_en === 1'b1) begin
       #0.250 mbclk = ~mbclk;
@@ -368,7 +434,14 @@ module tb_link_init_wave;
   wire [7:0] d1_sb_rx_msgcode      = dut_die1.u_lphy.sb_rx_msgcode;
   wire [7:0] d1_sb_rx_msgsubcode   = dut_die1.u_lphy.sb_rx_msgsubcode;
 
-  // Mainband clock gating enable
+  // --------------------------------------------------------------------------
+  // assign: mbclk_en - Mainband Clock Gating Enable Driver
+  //
+  // Enables the 2 GHz forwarded clock fCK whenever either die enters
+  // MBTRAIN.LINKSPEED, LINKINIT, or ACTIVE states.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // --------------------------------------------------------------------------
   assign mbclk_en = (d0_ltsm_state == LT_MB_LINKSPEED) ||
                     (d1_ltsm_state == LT_MB_LINKSPEED) ||
                     (d0_ltsm_state == LT_LINKINIT)     ||
@@ -379,18 +452,37 @@ module tb_link_init_wave;
   // ==========================================================================
   // Protocol Layer BFM Stimulus & Automated Handshakes
   // ==========================================================================
-  // Automatic stallack response
+  // --------------------------------------------------------------------------
+  // always: Die 0 Automatic FDI Stall Acknowledge Responder
+  //
+  // Automatically mirrors stall request to stall acknowledge per Section 8.3.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
+  // --------------------------------------------------------------------------
   always @(posedge lclk or negedge d0_lreset_n) begin
     if (!d0_lreset_n) d0_lp_stallack <= 1'b0;
     else              d0_lp_stallack <= d0_pl_stallreq;
   end
 
+  // --------------------------------------------------------------------------
+  // always: Die 1 Automatic FDI Stall Acknowledge Responder
+  //
+  // Automatically mirrors stall request to stall acknowledge per Section 8.3.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
+  // --------------------------------------------------------------------------
   always @(posedge lclk or negedge d1_lreset_n) begin
     if (!d1_lreset_n) d1_lp_stallack <= 1'b0;
     else              d1_lp_stallack <= d1_pl_stallreq;
   end
 
-  // Automatic rx_active_sts response
+  // --------------------------------------------------------------------------
+  // always: Die 0 Automatic RX Active Status Responder
+  //
+  // Responds to Adapter rx_active_req by asserting rx_active_sts per Section 8.3.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2 - State Request Handshake.
+  // --------------------------------------------------------------------------
   always @(posedge lclk or negedge d0_lreset_n) begin
     if (!d0_lreset_n)
       d0_lp_rx_active_sts <= 1'b0;
@@ -400,6 +492,13 @@ module tb_link_init_wave;
       d0_lp_rx_active_sts <= 1'b0;
   end
 
+  // --------------------------------------------------------------------------
+  // always: Die 1 Automatic RX Active Status Responder
+  //
+  // Responds to Adapter rx_active_req by asserting rx_active_sts per Section 8.3.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2 - State Request Handshake.
+  // --------------------------------------------------------------------------
   always @(posedge lclk or negedge d1_lreset_n) begin
     if (!d1_lreset_n)
       d1_lp_rx_active_sts <= 1'b0;
@@ -520,6 +619,13 @@ module tb_link_init_wave;
     d1_prev_state = LT_RESET;
   end
 
+  // --------------------------------------------------------------------------
+  // always: LTSM Transition Logger
+  //
+  // Prints timestamped state transitions for both dies to stdout for waveform debug.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training State Machine.
+  // --------------------------------------------------------------------------
   always @(posedge lclk) begin
     if (d0_ltsm_state !== d0_prev_state) begin
       $display("[%0t ns] DIE0 LTSM Transition: %s (%02h) -> %s (%02h) | RDI=%01h FDI=%01h",

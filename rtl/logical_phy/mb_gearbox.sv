@@ -120,6 +120,9 @@
 //                                    a rejected window, and keeps the fault
 //                                    sticky until lreset_n. No public port
 //                                    changes.
+//   0.0.6 2026-10-08  Documentation compliance pass: adjust signal declarations
+//                                    and add dedicated construct comments for framing
+//                                    expectation and boundary monitoring.
 // ============================================================================
 `ifndef MbGearbox_SV
 `define MbGearbox_SV
@@ -155,6 +158,9 @@ module tx_gearbox #(
   // of cycle 0 and the two UI of cycle 1, so valid is high for cycles 0 and 1.
   localparam logic [CYC_W-1:0] LAST_VALID_CYC = CYC_W'(NSLICE/4 - 1);
 
+  logic [NBYTES*8-1:0] word_q;
+  logic                valid_q;
+
   // -------------------------------------------------------------------------
   // always_ff: lclk Domain Word and Framing Registers
   //
@@ -171,9 +177,6 @@ module tx_gearbox #(
   //
   // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing.
   // -------------------------------------------------------------------------
-  logic [NBYTES*8-1:0] word_q;
-  logic                valid_q;
-
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       word_q  <= {NBYTES*8{1'b0}};
@@ -183,6 +186,10 @@ module tx_gearbox #(
       if (tx_load) word_q <= tx_word;
     end
   end
+
+  logic [NBYTES*8-1:0] ser_q;
+  logic                ser_val_q;
+  logic [CYC_W-1:0]    cyc_q;
 
   // -------------------------------------------------------------------------
   // always_ff: mbclk Domain Snapshot and Cycle Counter
@@ -204,10 +211,6 @@ module tx_gearbox #(
   // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock);
   //           Section 4.1.1 - Byte to Lane Mapping.
   // -------------------------------------------------------------------------
-  logic [NBYTES*8-1:0] ser_q;
-  logic                ser_val_q;
-  logic [CYC_W-1:0]    cyc_q;
-
   always_ff @(posedge mbclk or negedge lreset_n) begin
     if (!lreset_n) begin
       ser_q     <= {NBYTES*8{1'b0}};
@@ -221,6 +224,8 @@ module tx_gearbox #(
       cyc_q <= (cyc_q == LAST_CYC) ? {CYC_W{1'b0}} : cyc_q + 1'b1;
     end
   end
+
+  logic [NLANES-1:0] hi_w, lo_w;
 
   // -------------------------------------------------------------------------
   // always @*: Per-Lane Phase-Gather Combinational Mux
@@ -240,8 +245,6 @@ module tx_gearbox #(
   //
   // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
   // -------------------------------------------------------------------------
-  logic [NLANES-1:0] hi_w, lo_w;
-
   always @* begin
     case (cyc_q)
       2'd0: begin
@@ -271,6 +274,8 @@ module tx_gearbox #(
     endcase
   end
 
+  logic [NLANES-1:0] tx_mux;
+
   // -------------------------------------------------------------------------
   // always: DDR Pin Mux — Level-Sensitive Output Selection
   //
@@ -285,7 +290,6 @@ module tx_gearbox #(
   // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock DDR).
   // -------------------------------------------------------------------------
   // Uses NBA so output transitions cleanly in the inactive region of the edge.
-  logic [NLANES-1:0] tx_mux;
   always @(mbclk or hi_w or lo_w) tx_mux <= mbclk ? hi_w : lo_w;
 
   // -------------------------------------------------------------------------
@@ -353,6 +357,8 @@ module rx_gearbox #(
   // is high in cycles 0 and 1 and low in cycles 2 and 3.
   localparam logic [CYC_W-1:0] LAST_VALID_CYC = CYC_W'(NSLICE/4 - 1);
 
+  logic [NLANES-1:0] even_cap_q;
+
   // -------------------------------------------------------------------------
   // always_ff (negedge mbclk): High-Phase Lane Capture Register
   //
@@ -369,8 +375,6 @@ module rx_gearbox #(
   // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock DDR);
   //           Section 4.1.1 - Byte to Lane Mapping.
   // -------------------------------------------------------------------------
-  logic [NLANES-1:0] even_cap_q;
-
   always_ff @(negedge mbclk or negedge lreset_n) begin
     if (!lreset_n) even_cap_q <= {NLANES{1'b0}};
     else           even_cap_q <= mb_rx_data;
@@ -403,10 +407,16 @@ module rx_gearbox #(
   logic [CYC_W-1:0]    cyc_q;
   logic                asm_val_q;   // written by the framing monitor below
 
+  // -------------------------------------------------------------------------
+  // always_ff: Word Assembly Pipeline Register
+  //
   // One single-edge process owns asm_q, word_hold_q and cyc_q, so no two
   // blocks write slices of the same vector. asm_val_q keeps a single writer
   // as well: the framing monitor below. It is declared here because the lclk
   // output register samples it together with word_hold_q.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   always_ff @(posedge mbclk or negedge lreset_n) begin
     if (!lreset_n) begin
       asm_q       <= {NBYTES*8{1'b0}};
@@ -481,13 +491,29 @@ module rx_gearbox #(
   // -------------------------------------------------------------------------
   logic frame_ref_q;    // cycle-0 qualifier level of the window in progress
   logic frame_ok_q;     // window matches the legal pattern so far
+  logic frame_exp_w;
 
+  // -------------------------------------------------------------------------
+  // assign: frame_exp_w - expected framing qualifier level
+  //
   // Level that the cycle ending at this mbclk edge must carry. frame_ref_q is
   // the cycle-0 level, so a window with a word requires 1, 1, 0, 0 and an
   // idle window requires 0, 0, 0, 0.
-  logic frame_exp_w;
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   assign frame_exp_w = frame_ref_q && (cyc_q <= LAST_VALID_CYC);
 
+  // -------------------------------------------------------------------------
+  // always_ff: Valid Framing Boundary Monitor & Fault Detector
+  //
+  // Monitors the four mbclk cycles of each 8-UI word window against the
+  // mandatory 1100 framing pattern. Any boundary mismatch flags framing_fault
+  // sticky high and rejects word validity (asm_val_q = 0) per Section 4.1.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing;
+  //           Section 4.5.3.8 - TRAINERROR escalation.
+  // -------------------------------------------------------------------------
   always_ff @(posedge mbclk or negedge lreset_n) begin
     if (!lreset_n) begin
       frame_ref_q   <= 1'b0;

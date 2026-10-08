@@ -14,7 +14,7 @@
 // intervals, arbitrates pending obligations, validates PARAM DATA64
 // compatibility, and handles LINKSPEED success and failure outcomes.
 //
-// The test covers nine independent scenarios:
+// The test covers ten independent scenarios:
 //
 //   1.  Role Separation
 //       A peer PARAM request never satisfies the local PARAM response
@@ -58,16 +58,20 @@
 //
 //   8.  Recovery Policy
 //       A malformed packet starts TRAINERROR Entry, the public error hold
-//       reports LinkError, LinkReset is the only accepted recovery request,
-//       and both LinkReset and Disabled recoveries require the RESET dwell
-//       plus a fresh Start trigger.
+//       reports LinkError, and recovery (Start / Active / LinkReset) exits
+//       directly to RESET per Section 8.3.2.7 and Figures 111, 119, 126 once
+//       the residency dwell is satisfied.
 //
 //   9.  Private Mainband Framing Fault
-//       One lclk pulse of the Phase E framing_fault_event input is a fatal
-//       mainband error: it must start the existing TRAINERROR Entry
-//       exchange and hold LinkError. RESET ignores the event, and the link
-//       must recover through LinkReset plus a fresh Start trigger without
-//       the cleared event re-firing.
+//       A private framing fault event from the receive gearbox escalates to
+//       TRAINERROR, RESET ignores it, and the cleared event permits direct
+//       exit to RESET upon recovery assertion without a LinkReset exchange.
+//
+//   10. LinkError Minimum Residency Dwell Gate
+//       Following an unacknowledged SBINIT timeout into LT_TRAINERROR,
+//       linkerror_dwell_satisfied begins at 0. Recovery attempts are blocked
+//       before le_tmr expiry, unsolicited TE_RSP is rejected, and expiry of
+//       le_tmr satisfies the dwell to allow direct exit to RESET (§8.3.2.7).
 
 // Phase F Evidence Export
 // -----------------------
@@ -121,7 +125,9 @@
 //     Table 47        — Sideband Packet Types
 //     Table 56        — MBINIT.PARAM DATA64 request and response
 //     PLAN.md         — Section 15.9 Phase F (Evidence Export)
-// ----------------
+// ----------------------------------------------------------------------------
+// REVISION HISTORY
+// ----------------------------------------------------------------------------
 //   v0.0.1  2026-09-24  Initial creation. Phase B policy verification.
 //   v0.0.2  2026-09-25  Reconcile with the final Phase B contract. Drive
 //                        the sb_tx_accepted input so a local request can be
@@ -155,6 +161,11 @@
 //                        description and revision entry.
 //   v0.0.7  2026-09-25  Restore comment markers on the MBTRAIN and TRAINERROR
 //                        specification references.
+//   v0.0.8  2026-10-08  Add Scenario 10 for UCIe 1.0 Section 8.3.2.7 LinkError
+//                        minimum residency dwell gating (blocked before le_tmr
+//                        expiry, unsolicited TE_RSP rejection, and timer release).
+//                        Update Scenarios 8 and 9 to verify direct exit to RESET
+//                        per Figure 126.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -214,6 +225,15 @@ module ut_ltsm_policy;
 
   // ---- pattern counter (LINKINIT pat_done stand-in)
   logic [13:0] pat_ui;
+
+  // -------------------------------------------------------------------------
+  // assign: pat_done - LFSR Training Pattern Done Qualifier
+  //
+  // Asserts when the stand-in pattern counter reaches LFSR_PATTERN_UI - 1 (4095)
+  // while pat_enable and pat_lfsr_enable are active.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.5 - LINKINIT.
+  // -------------------------------------------------------------------------
   assign pat_done = pat_enable && pat_lfsr_enable &&
                     (pat_ui == LFSR_PATTERN_UI - 1);
 
@@ -230,6 +250,14 @@ module ut_ltsm_policy;
   logic [63:0] cap_data;
   int          param_rsp_count;
 
+  // -------------------------------------------------------------------------
+  // always: Sideband Transmit Packet Capture Monitor
+  //
+  // Captures opcode, message code, subcode, and data fields on sb_tx_load pulses
+  // to allow verification tasks to inspect transmitted sideband messages.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+  // -------------------------------------------------------------------------
   always @(posedge lclk) begin
     if (sb_tx_load) begin
       tx_op_q    <= sb_tx_opcode;
@@ -301,19 +329,35 @@ module ut_ltsm_policy;
     .rst_tmr_expired(rst_tmr_expired), .le_tmr_start(le_tmr_start), .le_tmr_expired(le_tmr_expired)
   );
 
-  // The local request is accepted only when the mailbox accepts the send.
-  // tx_grant lets a test decline that acceptance deterministically.
+  // -------------------------------------------------------------------------
+  // assign: sb_tx_accepted - Sideband Transmit Acceptance Handshake
+  //
+  // Qualifies packet acceptance: sb_tx_load asserted, mailbox not busy,
+  // and tx_grant active. Allows tests to stall acceptance deterministically.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband CDC.
+  // -------------------------------------------------------------------------
   assign sb_tx_accepted = sb_tx_load && !sb_tx_busy && tx_grant;
 
-  // =========================================================================
-  // Clock generator: 500 MHz lclk
-  // =========================================================================
   initial lclk = 1'b0;
+
+  // -------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz link clock with 2.0 ns period for LTSM policy test suite.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Link Clock Frequency.
+  // -------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
 
-  // =========================================================================
-  // Pattern UI counter (stand-in for the pattern generator)
-  // =========================================================================
+  // -------------------------------------------------------------------------
+  // always: Training Pattern UI Counter
+  //
+  // Advances pattern UI count on posedge lclk during pat_enable to simulate
+  // the 4K-UI LFSR pattern generation required in MBTRAIN.LINKSPEED.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.4.12 - LINKSPEED.
+  // -------------------------------------------------------------------------
   always @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n || !pat_enable) pat_ui <= '0;
     else                          pat_ui <= pat_ui + 1'b1;

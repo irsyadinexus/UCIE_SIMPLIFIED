@@ -78,6 +78,8 @@
 //                        referenced Figure 48, which is Data Lane remapping.
 //                        Byte-to-lane mapping is Figure 42 (x16 byte map) and
 //                        Figure 43 (Standard package x8 degraded).
+//   v0.0.4  2026-10-08  Documentation compliance pass: expand comments on lower
+//                        and upper lane generate assigns with spec subsection references.
 // ============================================================================
 `ifndef ByteLaneMapper_SV
 `define ByteLaneMapper_SV
@@ -126,16 +128,34 @@ module byte_lane_mapper #(
       wire [7:0] src_default = byte_reversal ? bytes_in[NBYTES-1-l] : bytes_in[l];
 
       if (l < NLANES_X8) begin : g_lower
-        // Lower lanes: x16 -> byte l; x8 lanes 0-7 -> byte l; else inactive.
         wire [7:0] src_x8_l = byte_reversal ? bytes_in[NBYTES-1-l] : bytes_in[l];
+
+        // ---------------------------------------------------------------------
+        // assign: data_out[l] - Lower Lane Data Multiplexer (Lanes 0..7)
+        //
+        // Drives lower half lanes. In x16 mode, routes byte l (or reversed byte).
+        // In x8 degrade mode on lanes 0..7, routes byte l. If lanes 8..15 survive,
+        // lower lanes are zeroed per Section 4.3.7. Gated by enable.
+        //
+        // Spec ref: UCIe 1.0 Section 4.1.1 (Figure 42) and Section 4.3.7.
+        // ---------------------------------------------------------------------
         assign data_out[l] = !enable                   ? 8'b0 :
                              !lnk_is_x8               ? src_default :
                              (degrade_lanes == DEGRADE_LANES_0_7) ? src_x8_l :
                                                                    8'b0;
       end else begin : g_upper
-        // Upper lanes: x16 -> byte l; x8 lanes 8-15 -> byte l-8; else inactive.
         wire [7:0] src_x8_h = byte_reversal ? bytes_in[NBYTES-1-(l-NLANES_X8)]
                                             : bytes_in[l-NLANES_X8];
+
+        // ---------------------------------------------------------------------
+        // assign: data_out[l] - Upper Lane Data Multiplexer (Lanes 8..15)
+        //
+        // Drives upper half lanes. In x16 mode, routes byte l (or reversed byte).
+        // In x8 degrade mode on lanes 8..15, routes byte l-8. If lanes 0..7 survive,
+        // upper lanes are zeroed per Section 4.3.7. Gated by enable.
+        //
+        // Spec ref: UCIe 1.0 Section 4.1.1 (Figure 43) and Section 4.3.7.
+        // ---------------------------------------------------------------------
         assign data_out[l] = !enable                   ? 8'b0 :
                              !lnk_is_x8               ? src_default :
                              (degrade_lanes == DEGRADE_LANES_8_15) ? src_x8_h :
@@ -164,6 +184,15 @@ module byte_lane_mapper #(
   // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
   // =========================================================================
   logic unused;
+
+  // -------------------------------------------------------------------------
+  // always_comb: Combinational Lint Suppression Block
+  //
+  // References lclk and lreset_n to suppress unused input warnings while
+  // keeping purely combinational mapper semantics per Section 4.1.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   always_comb begin
     unused = lclk | lreset_n;
   end

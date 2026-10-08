@@ -122,6 +122,8 @@
 //                        - Add csr_be[7:0] port and merge enabled bytes on writes (Section 7.5).
 //                        - Preserve private-clear priority over CSR write (Section 7.5).
 //                        - Preserve one-cycle read latency.
+//   v0.0.6  2026-10-08  Documentation compliance pass: adjust construct comments
+//                        for lint suppression block.
 `ifndef PhyCsr_SV
 `define PhyCsr_SV
 `include "ucie_pkg.sv"
@@ -316,13 +318,18 @@ module phy_csr (
   // the design; this block exists only to satisfy tools that judge usage
   // combinationally rather than sequentially.
   //
-  // The assigned value is never read, so synthesis discards the whole block
-  // and it adds no logic to the CSR.
-  //
-  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers (CSR access to the link
-  //           configuration and status registers).
-  // =========================================================================
   logic unused;
+
+  // -------------------------------------------------------------------------
+  // always_comb: Combinational Lint Suppression Block
+  //
+  // References lclk and lreset_n combinationally to satisfy linters and
+  // prevent unused port warnings on tools that judge usage combinationally.
+  // The CSR block is otherwise pure sequential logic clocked on lclk.
+  // The assigned value is never read, so synthesis discards this block.
+  //
+  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers.
+  // -------------------------------------------------------------------------
   always_comb begin
     unused = lclk | lreset_n;
   end

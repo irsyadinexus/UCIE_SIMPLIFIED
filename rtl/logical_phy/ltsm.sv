@@ -137,11 +137,16 @@
 //  +-----------+                 +-----------+
 //  | TRAINERROR|  4.5.3.8        |   L1L2    | 4.5.3.9
 //  |  (16h)    |                 |  (17h)    | Low-power; clock may gate.
-//  +-----------+                 +-----------+
-//  (only LinkReset recovers)     (unsupported in this profile)
+//  +-----+-----+                 +-----------+
+//        |                       (unsupported in this profile)
+//        v (direct exit to RESET per Fig 111, 119, 126 & §8.3.2.7)
+//  +-----+-----+
+//  |   RESET   |  4.5.3.1  Full 4 ms physical layer RESET minimum dwell.
+//  +-----------+           Exits on fresh Start or RDI NOP-to-Active trigger.
 //
-//  LinkReset or Disabled exchange -> RESET -> full 4 ms dwell. Recovery
-//  RESET exits only on a fresh software Start or RDI NOP-to-Active event.
+//  LinkError exits directly to RESET per Section 8.3.2.7 and Figures 111,
+//  119, and 126 once the 8 ms residency dwell is satisfied (or bypassed by
+//  sideband LinkError handshake). No LinkReset exchange occurs from LinkError.
 //
 // --------------------------------------------------------------------------
 // Sub-state exit rule  (spec 4.5.3.3 and 4.5.3.4)
@@ -300,6 +305,11 @@
 //                        PHY Active-data gate when a private transition
 //                        starts, including the TRAINERROR Entry exchange
 //                        before the registered state leaves ACTIVE.
+//   v0.0.17 2026-10-08  Implement UCIe 1.0 Section 8.3.2.7 LinkError minimum
+//                        residency timer (8 ms fallback), sideband LinkError
+//                        handshake bypass, direct transition to RESET (Figures
+//                        111, 119, 126), response draining prior to reset,
+//                        and exclusion of LinkReset exchange from LinkError.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -586,23 +596,33 @@ module ltsm #(
 
   // =========================================================================
   // Previous-state edge detector
-  // =========================================================================
-  // state_q_prev makes state-entry pulses independent from private exchanges.
-  // RESET uses the pulse to restart its full 4 ms minimum dwell. ACTIVE uses
-  // it to produce the one-cycle Start-copy clear after Active Entry succeeds.
-  // UCIe 1.0 Sections 4.5.3.1 and 4.5.3.5 define these two entry actions.
-  // PLAN.md Sections 15.4 and 15.9 Phase C require both actions on every entry.
-  // =========================================================================
   ltsm_state_t state_q_prev;
 
+  // -------------------------------------------------------------------------
+  // always_ff: Previous LTSM State Register
+  //
+  // Captures the previous cycle LTSM state to detect state entry edges.
+  // RESET uses the entry pulse to restart its full 4 ms minimum dwell,
+  // while ACTIVE uses it to produce the one-cycle Start-copy clear.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 and Section 4.5.3.5;
+  //           PLAN.md Sections 15.4 and 15.9 Phase C.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) state_q_prev <= LT_RESET;
     else           state_q_prev <= state_q;
   end
 
+  // -------------------------------------------------------------------------
+  // always_ff: Reset Epoch RDI NOP Qualifier Register
+  //
   // A Reset epoch accepts an RDI Active edge only after it samples the
-  // equivalent of NOP. This prevents a stale held Active level from
-  // restarting the physical link after LinkReset or Disabled recovery.
+  // equivalent of NOP (!rdi_active_req && !rdi_linkreset_req && !rdi_disabled_req).
+  // This prevents a stale held Active level from restarting physical link
+  // training after LinkReset or Disabled recovery.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.1 and Section 4.5.3.1.
+  // -------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n)
       reset_rdi_req_sampled_q <= 1'b0;
@@ -1158,6 +1178,17 @@ module ltsm #(
   // -------------------------------------------------------------------------
   wire transition_start_event = phase_c_exchange_start ||
                                 (state_d != state_q);
+
+  // -------------------------------------------------------------------------
+  // assign: transition_active - Physical Layer Transition Guard
+  //
+  // Asserts whenever an LTSM state change or Phase C exchange starts or remains
+  // pending. Guards the physical layer datapath and tells the adapter to stop
+  // sending mainband data before any state commit occurs.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 and Section 8.1.6;
+  //           PLAN.md Sections 15.4, 15.6, and 15.9 Phase E.
+  // -------------------------------------------------------------------------
   assign transition_active = transition_start_event ||
                              (phase_c_mode_q != PC_NONE);
 
@@ -1280,6 +1311,17 @@ module ltsm #(
   // UCIe 1.0 Section 8.3.2.8 requires fresh training after recovery.
   // PLAN.md Sections 15.4 and 15.9 Phase C preserve both requirements.
   assign rst_tmr_start = (state_d == LT_RESET) && (state_q != LT_RESET);
+
+  // -------------------------------------------------------------------------
+  // assign: le_tmr_start - LinkError 8 ms residency timer start trigger
+  //
+  // Generates a one-cycle pulse when the state machine enters LT_TRAINERROR
+  // to start the unscaled 8 ms residency timer (u_linkerror_timer).
+  // This timer enforces the physical layer dwell required when sideband
+  // is non-functional to allow the remote partner time to detect timeouts.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.7 - LinkError State.
+  // -------------------------------------------------------------------------
   assign le_tmr_start  = (state_d == LT_TRAINERROR) && (state_q != LT_TRAINERROR);
 
   // The registered running level spans each public residency or private
@@ -1764,8 +1806,18 @@ module ltsm #(
       LT_PHYRETRAIN: state_d = state_q;
       LT_L1L2:       state_d = state_q;
 
-      // TRAINERROR holds until a LinkReset request starts and completes the
-      // supported recovery exchange. Start and Active events cannot exit it.
+      // -----------------------------------------------------------------
+      // UCIe 1.0 Section 8.3.2.7 & Figure 126: LinkError Direct Exit to RESET
+      // -----------------------------------------------------------------
+      // LT_TRAINERROR holds until the 8 ms residency dwell is satisfied
+      // (either via sideband ACK bypass or fallback 8 ms timer expiration)
+      // AND an approved recovery trigger (fresh Start event, RDI Active
+      // request, or LinkReset request) is asserted with errors cleared.
+      // Prior to exiting directly to RESET, all in-flight or pending sideband
+      // responses are fully drained to prevent CDC truncation in raw mode.
+      // Spec ref: UCIe 1.0 Sections 4.5.3.8, 8.1.5 (Fig 111), 8.2.5 (Fig 119),
+      //           8.3.2.7 (LinkError State), and 8.3.3.2 (Figure 126).
+      // -----------------------------------------------------------------
       LT_TRAINERROR: begin
         if (linkerror_dwell_satisfied && linkerror_recovery_trigger &&
             !trainerror_peer_rsp_pending_d && !sb_tx_busy && !sb_tx_load)
@@ -2036,6 +2088,15 @@ module ltsm #(
                             ((sbinit_phase_q == SBI_PATTERN_ACTIVE) ||
                              (sbinit_phase_q == SBI_PATTERN_IDLE)));
 
+  // -------------------------------------------------------------------------
+  // assign: pattern_run_enable - SBINIT Raw Pattern Generation Enable
+  //
+  // Enables the raw pattern generator during SBINIT pattern execution.
+  // Runs continuously prior to remote pattern detection, and extends for
+  // exactly 3 full 64-UI iterations after detection to ensure the peer locks.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 and Section 5.13.
+  // -------------------------------------------------------------------------
   assign pattern_run_enable = (state_q == LT_SBINIT) &&
                               (sbinit_phase_q == SBI_PATTERN_ACTIVE) &&
                               (!pattern_trigger_pending_q ||
@@ -2053,26 +2114,52 @@ module ltsm #(
   //            PLAN.md Sections 15.4 and 15.9 Phase C.
   // =========================================================================
 
-  // Mainband pattern generation:
-  // Per UCIe 1.0 Section 4.5.3.4.12, continuous mode LFSR pattern is sent
-  // on mainband during MBTRAIN.LINKSPEED.
-  // Transmitters are idle during LINKINIT per Section 4.5.3.4.12 Step 7 and Section 4.5.3.5.
+  // -------------------------------------------------------------------------
+  // assign: pat_enable - Mainband Pattern Generator Enable
+  //
+  // Enables mainband pattern transmission during MBTRAIN.LINKSPEED per
+  // Section 4.5.3.4.12. Transmitters remain idle during LINKINIT per Step 7.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.4.12 and Section 4.5.3.5.
+  // -------------------------------------------------------------------------
   assign pat_enable = (state_q == LT_MB_LINKSPEED);
 
-  // The selection mux maps PAT_LFSR to MBTRAIN.LINKSPEED per Section 4.5.3.4.12.
+  // -------------------------------------------------------------------------
+  // assign: pat_select - Pattern Multiplexer Selection Driver
+  //
+  // Selects which training pattern drives the physical lanes:
+  // - VALTRAIN for VALVREF and DATAVREF sub-states.
+  // - PAT_LFSR for LINKSPEED 4K-UI pseudorandom training sequence.
+  // - CLKREPAIR for RXDESKEW clock phase alignment.
+  // - PERLANEID for per-lane identification during link init.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.4.12 and Section 4.4.1.
+  // -------------------------------------------------------------------------
   assign pat_select = (state_q == LT_MB_VALVREF)   ? PAT_VALTRAIN  :
                       (state_q == LT_MB_DATAVREF)  ? PAT_VALTRAIN  :
                       (state_q == LT_MB_LINKSPEED) ? PAT_LFSR      :
                       (state_q == LT_MB_RXDESKEW)  ? PAT_CLKREPAIR :
                                                      PAT_PERLANEID;
 
-  // LFSR reset:
-  // 1. Emits reset strobe on entry to MBTRAIN.LINKSPEED (to start 4K UI LFSR from seed).
-  // 2. Emits reset strobe on entry to LINKINIT per UCIe 1.0 Section 4.5.3.5:
-  //    "The LFSR must be RESET upon entering this state."
+  // -------------------------------------------------------------------------
+  // assign: pat_lfsr_reset - Training LFSR Synchronous Reset Strobe
+  //
+  // Resets the pseudorandom LFSR to its per-lane seed on entry to
+  // MBTRAIN.LINKSPEED (to run the 4K UI pattern) and on entry to LINKINIT
+  // per Section 4.5.3.5: "The LFSR must be RESET upon entering this state."
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.4.12 and Section 4.5.3.5.
+  // -------------------------------------------------------------------------
   assign pat_lfsr_reset = ((state_q == LT_MB_LINKSPEED) || (state_q == LT_LINKINIT)) && state_entry;
 
-  // The LFSR advances during MBTRAIN.LINKSPEED, and is idle during LINKINIT.
+  // -------------------------------------------------------------------------
+  // assign: pat_lfsr_enable - Training LFSR Advance Clock Enable
+  //
+  // Advances the 23-bit Fibonacci LFSR by 8 UIs per lclk cycle during
+  // MBTRAIN.LINKSPEED. Idle during LINKINIT diagnostic dwell.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.4.12 and Section 4.4.1.
+  // -------------------------------------------------------------------------
   assign pat_lfsr_enable = (state_q == LT_MB_LINKSPEED);
   // =========================================================================
   // LTSM status and private Phase C outputs
@@ -2119,12 +2206,32 @@ module ltsm #(
   // PLAN.md Sections 15.4 and 15.9 require LinkReset-only recovery.
   assign train_error = (state_q == LT_TRAINERROR) || (phase_c_mode_q == PC_TRAINERROR);
 
-  // link_reset_out identifies the public RESET state after transition work.
-  // LinkReset and Disabled private exchanges do not assert it prematurely.
-  // UCIe 1.0 Section 4.5.3.1 defines the RESET state and dwell.
-  // UCIe 1.0 Section 8.3.2.8 defines transition handshake completion.
+  // -------------------------------------------------------------------------
+  // assign: link_reset_out - LTSM Public RESET Indication Driver
+  //
+  // Identifies that the LTSM has completed transition handshakes and is in
+  // LT_RESET. Active during the full 4 ms minimum dwell per Section 4.5.3.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 and Section 8.3.2.8.
+  // -------------------------------------------------------------------------
   assign link_reset_out     = (state_q == LT_RESET);
+
+  // -------------------------------------------------------------------------
+  // assign: phy_linkreset_req - Physical Layer LinkReset Request Status
+  //
+  // Indicates that a private Phase C LinkReset request exchange is active.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.3 - LinkReset Handshake.
+  // -------------------------------------------------------------------------
   assign phy_linkreset_req  = (phase_c_mode_q == PC_LINKRESET);
+
+  // -------------------------------------------------------------------------
+  // assign: phy_disabled_req - Physical Layer Disabled Request Status
+  //
+  // Indicates that a private Phase C Disabled request exchange is active.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.4 - Disabled Handshake.
+  // -------------------------------------------------------------------------
   assign phy_disabled_req   = (phase_c_mode_q == PC_DISABLED);
   // Runtime PHYRETRAIN is outside the fixed profile and never completes.
   // The retained public compatibility output therefore remains inactive.

@@ -47,7 +47,7 @@
 //  |  +------------------+   +-------+-------+    |                     |
 //  |                                  |            |                     |
 //  |  +------------------+            v            v                     |
-//  |  | ucie_timer x 2   |        mb_tx_data   sideband pins             |
+//  |  | ucie_timer x 3   |        mb_tx_data   sideband pins             |
 //  |  +------------------+    Active gate + per-byte TX/RX scramblers    |
 //  +--------------------------------------------------------------------+
 //
@@ -204,6 +204,13 @@
   //                        rdi_lp_linkerror input (Section 8.1).
   // v0.0.26 2026-10-02  Drive RDI pl_inband_pres from LTSM training
   //                        completion instead of packet reception during SBINIT.
+  // v0.0.27 2026-10-08  Integrate LinkError minimum residency timer (u_linkerror_timer)
+  //                        per UCIe 1.0 Section 8.3.2.7 running strictly unscaled
+  //                        8 ms (C_RESIDENCY). Add comprehensive comments for
+  //                        fatal edge detection, aggregation, and timer blocks.
+  // v0.0.28 2026-10-08  Documentation compliance pass: add detailed
+  //                        construct comments (5-30 lines) with UCIe 1.0
+  //                        spec citations across all always/assign blocks.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -644,15 +651,24 @@ module logical_phy #(
   // Raw and packet valid are selected together, so data and framing cannot
   // come from different sideband sources.
   // Spec ref: UCIe 1.0 Section 4.5.3.2; PLAN.md Sections 14.4 and 15.4.
-  // ===========================================================================
-  // Sideband Pin Multiplexing (spec 4.1.5, 4.5.3.2, 5.13)
-  // ===========================================================================
-  // Raw mode owns the public physical pins for the entire pattern phase, including its
-  // 1 ms idle windows. Packet pins become visible only after the boundary-safe
-  // mode change has reset and released the codec.
-  // Only scalar clock and scalar data are muxed to the physical pins.
-  // ===========================================================================
+  // ---------------------------------------------------------------------------
+  // assign: sb_tx_clk - Physical Transmit Strobe Pin Multiplexer
+  //
+  // Routes either the raw SBINIT 800 MT/s SDR pattern strobe (during RESET/SBINIT)
+  // or the serialized packet strobe (post-SBINIT) to the physical sb_tx_clk pin.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5, Section 4.5.3.2, Section 5.13.
+  // ---------------------------------------------------------------------------
   assign sb_tx_clk  = raw_mode_active_s ? raw_sb_tx_clk  : codec_sb_tx_clk;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_tx_data - Physical Transmit Serial Data Pin Multiplexer
+  //
+  // Routes either raw alternating bits or serialized packet bitstream to the
+  // physical sb_tx_data pin based on raw_mode_active_s.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5, Section 4.5.3.2, Section 5.13.
+  // ---------------------------------------------------------------------------
   assign sb_tx_data = raw_mode_active_s ? raw_sb_tx_data : codec_sb_tx_data;
 
   // ===========================================================================
@@ -719,12 +735,18 @@ module logical_phy #(
     end
   endfunction
 
-  // Small non-starving arbiter with mandatory LTSM/response priority and
-  // alternating Adapter/LTSM request selection. Does not own remote request
-  // credits or tags here.
   wire ltsm_is_resp    = is_response_packet(ltsm_tx_packet);
   wire adapter_is_resp = is_response_packet(adapter_sb_tx_packet);
 
+  // ---------------------------------------------------------------------------
+  // always_comb: Sideband Transmit Arbiter Selection Matrix
+  //
+  // Evaluates contention between LTSM training packets and Adapter sideband
+  // messages. Enforces mandatory LTSM priority during training states,
+  // strict response priority over requests, and round-robin request interleaving.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+  // ---------------------------------------------------------------------------
   always_comb begin
     ltsm_grant    = 1'b0;
     adapter_grant = 1'b0;
@@ -755,6 +777,14 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // always_ff: Round-Robin Fairness Toggle Register
+  //
+  // Toggles the arbiter fairness priority flop upon grant acceptance when both
+  // LTSM and Adapter have pending requests to prevent link starvation.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       arb_prio_q <= 1'b0;
@@ -763,9 +793,41 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: tx_cdc_send - TX CDC Mailbox Send Strobe
+  //
+  // Initiates delivery of the arbitrated packet into the transmit CDC mailbox
+  // whenever a client has grant and the sideband transmitter is not busy.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.
+  // ---------------------------------------------------------------------------
   assign tx_cdc_send         = (ltsm_grant || adapter_grant) && !sb_tx_busy;
+
+  // ---------------------------------------------------------------------------
+  // assign: tx_cdc_packet - Arbitrated Transmit Packet Data Multiplexer
+  //
+  // Multiplexes either LTSM or Adapter packet onto the CDC mailbox input.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Layouts.
+  // ---------------------------------------------------------------------------
   assign tx_cdc_packet       = ltsm_grant ? ltsm_tx_packet : adapter_sb_tx_packet;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_tx_accepted - LTSM Transmit Acceptance Acknowledge
+  //
+  // Acknowledges to LTSM that its packet has been accepted by the arbiter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // ---------------------------------------------------------------------------
   assign sb_tx_accepted      = ltsm_grant && !sb_tx_busy;
+
+  // ---------------------------------------------------------------------------
+  // assign: adapter_sb_tx_ready - Adapter Transmit Ready Handshake
+  //
+  // Signals to D2D Adapter that the arbiter is ready to accept its packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+  // ---------------------------------------------------------------------------
   assign adapter_sb_tx_ready = adapter_grant && !sb_tx_busy;
 
   // ===========================================================================
@@ -783,7 +845,14 @@ module logical_phy #(
     .dst_data   (codec_tx_cdc_data),
     .dst_valid  (codec_tx_cdc_valid)
   );
-  // Synchronize codec busy into lclk.
+  // ---------------------------------------------------------------------------
+  // always_ff: Codec Busy Synchronizer into Link Clock Domain
+  //
+  // 2-stage synchronizer transferring the sbclk codec busy status into the
+  // lclk link domain to prevent starting new transactions before prior finish.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 5.13.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_busy_meta_q <= 1'b0;
@@ -794,7 +863,15 @@ module logical_phy #(
     end
   end
 
-  // In-flight tracking: ensure lclk busy interval covers the entire transaction
+  // ---------------------------------------------------------------------------
+  // always_ff: Transmit In-Flight Shadow Tracker
+  //
+  // Tracks mailbox-to-codec transit latency in lclk, asserting in-flight busy
+  // immediately upon tx_cdc_send and holding it until the synchronized codec
+  // busy edge has been observed and subsequently clears.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_tx_inflight_q  <= 1'b0;
@@ -814,13 +891,25 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: sb_tx_busy - Composite Sideband Transmit Busy Flag
+  //
+  // Aggregates CDC mailbox busy, synchronized codec busy, in-flight tracking,
+  // and codec readiness into a single gating busy level for upstream callers.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.3.
+  // ---------------------------------------------------------------------------
   assign sb_tx_busy = tx_cdc_busy | codec_tx_busy_sync_q |
                       codec_tx_inflight_q | !codec_packet_ready_sync_q;
 
-  // Buffer each mailbox delivery until the codec accepts it. The mailbox
-  // valid pulse remains high through the codec acceptance edge, so retire
-  // an existing pending packet before capturing a new delivery. This keeps
-  // one CDC event equal to one codec transaction.
+  // ---------------------------------------------------------------------------
+  // always_ff: Sideband Transmit Codec Holding Register (sbclk domain)
+  //
+  // Buffers packet delivered by CDC mailbox until accepted by u_sb_codec.
+  // Retires pending packet on codec_tx_ready acceptance edge.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge sbclk or negedge sbreset_n) begin
     if (!sbreset_n) begin
       codec_tx_pending_q <= 1'b0;
@@ -833,8 +922,31 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: codec_tx_valid - Codec Transmit Request Valid Driver
+  //
+  // Asserts valid to sb_codec when a packet is pending in the holding buffer.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
+  // ---------------------------------------------------------------------------
   assign codec_tx_valid         = codec_tx_pending_q;
+
+  // ---------------------------------------------------------------------------
+  // assign: codec_tx_pkt - Codec Transmit Packet Payload Driver
+  //
+  // Drives registered packet contents into the sb_codec parallel port.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Layouts.
+  // ---------------------------------------------------------------------------
   assign codec_tx_pkt           = codec_tx_packet_q;
+
+  // ---------------------------------------------------------------------------
+  // assign: codec_tx_busy_combined - Combined Codec and Buffer Busy Status
+  //
+  // Reflects overall sbclk sideband transmit path occupancy.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // ---------------------------------------------------------------------------
   assign codec_tx_busy_combined = codec_tx_busy || codec_tx_pending_q;
 
   // ===========================================================================
@@ -864,10 +976,24 @@ module logical_phy #(
     .rx_overflow    (codec_rx_overflow)
   );
 
-  // Hold codec RX events until the lclk mailbox accepts them
+  // ---------------------------------------------------------------------------
+  // assign: codec_rx_ready - Codec Receive Pop Acknowledge
+  //
+  // Acknowledges and pops received packet from the sb_codec queue when the
+  // receive CDC mailbox is available to accept the new transfer.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 and Section 6.1.3.
+  // ---------------------------------------------------------------------------
   assign codec_rx_ready = codec_rx_valid && !sb_rx_cdc_busy;
 
-  // Synchronize sticky codec overflow error into lclk fatal policy
+  // ---------------------------------------------------------------------------
+  // always_ff: Sticky Codec Overflow Synchronizer into Link Clock Domain
+  //
+  // Synchronizes sticky receive queue overflow flag from sbclk to lclk and
+  // detects the rising edge to generate an unrecoverable fatal error event.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control and Integrity.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       codec_rx_overflow_meta_q <= 1'b0;
@@ -880,6 +1006,13 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: codec_rx_overflow_rise - Codec Receive Overflow Rising Edge Pulse
+  //
+  // Generates single-cycle pulse on overflow onset to trigger fatal error handling.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // ---------------------------------------------------------------------------
   assign codec_rx_overflow_rise = codec_rx_overflow_sync_q && !codec_rx_overflow_prev_q;
 
   // ===========================================================================
@@ -906,21 +1039,107 @@ module logical_phy #(
   wire route_to_ltsm    = (ltsm_state != LT_ACTIVE) || is_phy_training_packet(rx_cdc_packet);
   wire route_to_adapter = !route_to_ltsm;
 
-  // LTSM policy boundary unpack: preserves existing ltsm.sv port interface
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_pkt_vld - LTSM Sideband Packet Valid Qualifier
+  //
+  // Asserts valid to LTSM when an incoming sideband packet is routed to it.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // ---------------------------------------------------------------------------
   assign sb_rx_pkt_vld    = rx_cdc_valid && route_to_ltsm;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_opcode - LTSM Packet Opcode Field Unpack
+  //
+  // Unpacks 5-bit opcode from received packet to feed LTSM policy logic.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 47).
+  // ---------------------------------------------------------------------------
   assign sb_rx_opcode     = rx_cdc_packet.opcode;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_srcid - LTSM Packet Source ID Field Unpack
+  //
+  // Unpacks 3-bit source ID from received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Tables 48/49).
+  // ---------------------------------------------------------------------------
   assign sb_rx_srcid      = rx_cdc_packet.src_id;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_dstid - LTSM Packet Destination ID Field Unpack
+  //
+  // Unpacks 3-bit destination ID from received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Tables 48/49).
+  // ---------------------------------------------------------------------------
   assign sb_rx_dstid      = rx_cdc_packet.dst_id;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_msginfo - LTSM Message Info Field Unpack
+  //
+  // Unpacks 16-bit message info field from received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // ---------------------------------------------------------------------------
   assign sb_rx_msginfo    = rx_cdc_packet.msg_info;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_msgcode - LTSM Message Code Field Unpack
+  //
+  // Unpacks 8-bit message code from received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // ---------------------------------------------------------------------------
   assign sb_rx_msgcode    = rx_cdc_packet.msg_code;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_msgsubcode - LTSM Message Subcode Field Unpack
+  //
+  // Unpacks 8-bit message subcode from received packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // ---------------------------------------------------------------------------
   assign sb_rx_msgsubcode = rx_cdc_packet.msg_subcode;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_payload - LTSM Payload Data Bus Unpack
+  //
+  // Unpacks 64-bit payload data from received packet for LTSM training use.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Layouts.
+  // ---------------------------------------------------------------------------
   assign sb_rx_payload    = rx_cdc_packet.data;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_cp_err - LTSM Control Parity / Format Error Forwarding
+  //
+  // Forwards header parity or structural formatting errors into LTSM fatal policy.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // ---------------------------------------------------------------------------
   assign sb_rx_cp_err     = rx_cdc_cp_error | rx_cdc_format_error;
+
+  // ---------------------------------------------------------------------------
+  // assign: sb_rx_dp_err - LTSM Data Parity Error Forwarding
+  //
+  // Forwards payload data parity errors into LTSM fatal policy.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // ---------------------------------------------------------------------------
   assign sb_rx_dp_err     = rx_cdc_dp_error;
 
   // Adapter RX client holding buffer: delivers packet and retains until acknowledged
   wire adapter_rx_in_vld = rx_cdc_valid && route_to_adapter;
 
+  // ---------------------------------------------------------------------------
+  // always_ff: Adapter Sideband Receive Client Holding Register
+  //
+  // Buffers packet routed to the D2D Adapter and retains it until the adapter
+  // asserts adapter_sb_rx_ready acknowledgment.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       adapter_rx_hold_q    <= 1'b0;
@@ -943,10 +1162,49 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: adapter_sb_rx_valid - Adapter Sideband Receive Valid Handshake
+  //
+  // Indicates an active or buffered packet is ready for D2D Adapter consumption.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+  // ---------------------------------------------------------------------------
   assign adapter_sb_rx_valid        = adapter_rx_hold_q || adapter_rx_in_vld;
+
+  // ---------------------------------------------------------------------------
+  // assign: adapter_sb_rx_packet - Adapter Receive Packet Data Multiplexer
+  //
+  // Routes either held or direct CDC packet into the Adapter sideband interface.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Layouts.
+  // ---------------------------------------------------------------------------
   assign adapter_sb_rx_packet       = adapter_rx_hold_q ? adapter_rx_pkt_q : rx_cdc_packet;
+
+  // ---------------------------------------------------------------------------
+  // assign: adapter_sb_rx_cp_error - Adapter Receive Control Parity Flag
+  //
+  // Forwards CP error indication to Adapter sideband interface.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // ---------------------------------------------------------------------------
   assign adapter_sb_rx_cp_error     = adapter_rx_hold_q ? adapter_rx_cp_err_q : rx_cdc_cp_error;
+
+  // ---------------------------------------------------------------------------
+  // assign: adapter_sb_rx_dp_error - Adapter Receive Data Parity Flag
+  //
+  // Forwards DP error indication to Adapter sideband interface.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // ---------------------------------------------------------------------------
   assign adapter_sb_rx_dp_error     = adapter_rx_hold_q ? adapter_rx_dp_err_q : rx_cdc_dp_error;
+
+  // ---------------------------------------------------------------------------
+  // assign: adapter_sb_rx_format_error - Adapter Receive Format Error Flag
+  //
+  // Forwards structural formatting error indication to Adapter sideband interface.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data Integrity.
+  // ---------------------------------------------------------------------------
   assign adapter_sb_rx_format_error = adapter_rx_hold_q ? adapter_rx_fmt_err_q : rx_cdc_format_error;
 
   // ---------------------------------------------------------------------------
@@ -985,6 +1243,15 @@ module logical_phy #(
   assign ltsm_software_start_event =
     (adapter_start_link_train | csr_start_link_train) &&
     !ltsm_software_start_q;
+
+  // ---------------------------------------------------------------------------
+  // assign: ltsm_rdi_active_event - RDI ACTIVE Request Rising Edge Pulse
+  //
+  // Detects the 0->1 rising edge transition of rdi_lp_state_req == RDI_REQ_ACTIVE.
+  // Triggers the LTSM LinkMgmt.RDI Active Entry handshake per Section 8.1.6.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1.6 - Active Entry Handshake.
+  // ---------------------------------------------------------------------------
   assign ltsm_rdi_active_event =
     (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE) && !rdi_active_req_q;
 
@@ -1121,10 +1388,21 @@ module logical_phy #(
   );
 
   // ---------------------------------------------------------------------------
-  // LinkError Minimum Residency Timer (UCIe 1.0 Section 8.3.2.7)
+  // Module Instantiation: u_linkerror_timer - 8 ms LinkError Residency Timer
   // ---------------------------------------------------------------------------
-  // Strict 8 ms residency timer (C_RESIDENCY = 4,000,000 lclk cycles at 500 MHz),
-  // enforcing the dead-sideband fallback dwell time.
+  // Implements the dedicated fallback residency dwell timer required by UCIe 1.0
+  // Section 8.3.2.7. When the link enters LT_TRAINERROR and the sideband is
+  // non-functional, the physical layer must dwell in LinkError for at least
+  // 8 ms (4,000,000 cycles at 500 MHz, unscaled regardless of FAST_SIM) to
+  // ensure the remote partner detects timeouts and enters LinkError.
+  //
+  // Connectivity:
+  //   - Triggered by le_tmr_start one-cycle pulse on entry to LT_TRAINERROR.
+  //   - Runs while ltsm_state == LT_TRAINERROR.
+  //   - Drives le_tmr_expired into u_ltsm to satisfy linkerror_dwell_satisfied.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.7 - LinkError State;
+  //           Table 71 - Link Error Handshake.
   // ---------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_RESIDENCY)) u_linkerror_timer (
     .clk      (lclk),
@@ -1327,6 +1605,14 @@ module logical_phy #(
     end
   end
 
+  // ---------------------------------------------------------------------------
+  // always_ff: RDI Stall Request Registered Driver
+  //
+  // Flops the RDI pl_stallreq signal onto the interface per Section 8.3.1.
+  // Kept deasserted in this configuration.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n)
       rdi_stall_req_q <= 1'b0;
@@ -1334,41 +1620,103 @@ module logical_phy #(
       rdi_stall_req_q <= rdi_stall_req_d;
   end
 
+  // ---------------------------------------------------------------------------
+  // assign: rdi_pl_stallreq - RDI Stall Request Pin Driver
+  //
+  // Forwards registered stall request flag to RDI output port.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
+  // ---------------------------------------------------------------------------
   assign rdi_pl_stallreq = rdi_stall_req_q;
 
   // ---------------------------------------------------------------------------
-  // Legacy LTSM start-link-train OR gate removed in Phase C.
+  // assign: csr_wr - PHY CSR Write Strobe Routing
   //
-  // The private event sampler above converts the top-level and CSR levels
-  // into one-shot requests. This prevents a held Start level from restarting
-  // training after LinkReset or Disabled recovery.
+  // Routes dedicated internal write strobe from adapter to u_phy_csr.
   //
-  // Spec ref: UCIe 1.0, Section 8.3.2.8; PLAN.md Section 15.9 Phase C.
-  // ---------------------------------------------------------------------------
-
-  // ---------------------------------------------------------------------------
-  // CSR access path (spec 7.5 sideband register access)
-  // ---------------------------------------------------------------------------
-  // The CSR write/read path connects directly to the phy_csr_* channel from the
-  // adapter, enabling byte-enabled register reads and writes into u_phy_csr.
-  // External register accesses are routed through this internal path rather
-  // than being stubbed to constants.
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
   // ---------------------------------------------------------------------------
   assign csr_wr            = phy_csr_wr;
+
+  // ---------------------------------------------------------------------------
+  // assign: csr_rd - PHY CSR Read Strobe Routing
+  //
+  // Routes dedicated internal read strobe from adapter to u_phy_csr.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // ---------------------------------------------------------------------------
   assign csr_rd            = phy_csr_rd;
+
+  // ---------------------------------------------------------------------------
+  // assign: csr_addr - PHY CSR Address Bus Routing
+  //
+  // Routes register address from adapter to u_phy_csr.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // ---------------------------------------------------------------------------
   assign csr_addr          = phy_csr_addr;
+
+  // ---------------------------------------------------------------------------
+  // assign: csr_wdata - PHY CSR Write Data Bus Routing
+  //
+  // Routes 32-bit register write data from adapter to u_phy_csr.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // ---------------------------------------------------------------------------
   assign csr_wdata         = phy_csr_wdata;
+
+  // ---------------------------------------------------------------------------
+  // assign: csr_be - PHY CSR Byte Enable Bus Routing
+  //
+  // Routes 4-bit byte enables from adapter to u_phy_csr.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // ---------------------------------------------------------------------------
   assign csr_be            = phy_csr_be;
+
+  // ---------------------------------------------------------------------------
+  // assign: phy_csr_rdata - PHY CSR Read Data Bus Return
+  //
+  // Returns read data from u_phy_csr back to the adapter register channel.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // ---------------------------------------------------------------------------
   assign phy_csr_rdata     = csr_rdata;
+
+  // ---------------------------------------------------------------------------
+  // assign: phy_csr_rdata_vld - PHY CSR Read Data Valid Flag Return
+  //
+  // Returns read data valid qualification back to the adapter register channel.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // ---------------------------------------------------------------------------
   assign phy_csr_rdata_vld = csr_rdata_vld;
+
   // ---------------------------------------------------------------------------
-  // Configuration interface stub  (spec 6.1 sideband cfg)
-  // ---------------------------------------------------------------------------
-  // The pl_cfg interface is unused in this build. Outputs are tied low so
-  // the cfg bus is inert.
+  // assign: pl_cfg - Unused Configuration Data Bus Tie-off
+  //
+  // Tied low; pl_cfg is unused in this fixed-profile configuration.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Configuration.
   // ---------------------------------------------------------------------------
   assign pl_cfg     = {NC{1'b0}};
+
+  // ---------------------------------------------------------------------------
+  // assign: pl_cfg_vld - Unused Configuration Valid Flag Tie-off
+  //
+  // Tied low; pl_cfg_vld is unused in this fixed-profile configuration.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Configuration.
+  // ---------------------------------------------------------------------------
   assign pl_cfg_vld = 1'b0;
+
+  // ---------------------------------------------------------------------------
+  // assign: pl_cfg_crd - Unused Configuration Credit Flag Tie-off
+  //
+  // Tied low; pl_cfg_crd is unused in this fixed-profile configuration.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Configuration.
+  // ---------------------------------------------------------------------------
   assign pl_cfg_crd = 1'b0;
 
   // ===========================================================================
@@ -1480,7 +1828,24 @@ module logical_phy #(
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
   //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
   // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // assign: tx_user_transfer - Transmit Mainband Active Transfer Qualifier
+  //
+  // Qualifies that user data gate is open (user_data_enable) AND Adapter provides
+  // valid data (rdi_lp_valid) before advancing the TX scrambler array.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 4.4.1.
+  // ---------------------------------------------------------------------------
   assign tx_user_transfer = user_data_enable && rdi_lp_valid;
+
+  // ---------------------------------------------------------------------------
+  // assign: rx_user_transfer - Receive Mainband Active Transfer Qualifier
+  //
+  // Qualifies that user data gate is open, RX gearbox has valid framed data,
+  // AND the receive epoch has completed quiet-gap synchronization.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 4.4.1.
+  // ---------------------------------------------------------------------------
   assign rx_user_transfer = user_data_enable && rx_gearbox_valid &&
                             rx_epoch_synced_q;
 
@@ -1548,7 +1913,22 @@ module logical_phy #(
   // Spec ref: UCIe 1.0 Sections 4.1.2, 4.4.1, and 8.1.6;
   //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
   // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // assign: tx_user_valid - Gated Transmit User Data Valid Driver
+  //
+  // Gated valid feeding the TX gearbox, synchronously forced low when gate closes.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 8.1.6.
+  // ---------------------------------------------------------------------------
   assign tx_user_valid = tx_user_valid_q && user_data_enable;
+
+  // ---------------------------------------------------------------------------
+  // assign: rx_user_valid - Gated Receive User Data Valid Driver
+  //
+  // Gated valid feeding RDI pl_valid, synchronously forced low when gate closes.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 8.1.6.
+  // ---------------------------------------------------------------------------
   assign rx_user_valid = rx_user_valid_q && user_data_enable;
 
   // ---------------------------------------------------------------------------
@@ -1687,12 +2067,37 @@ module logical_phy #(
   //           PLAN.md Sections 15.6 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
   logic rdi_lp_linkerror_q;
+  // ---------------------------------------------------------------------------
+  // always_ff: Adapter LinkError edge synchronizer and history register
+  //
+  // Samples the private rdi_lp_linkerror input from the D2D Adapter on each
+  // rising edge of lclk to detect a rising edge (rdi_lp_linkerror_rise).
+  // This edge pulse is combined with other fatal fault sources to trigger
+  // escalation into the LTSM fatal policy and TRAINERROR Entry exchange.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114) and Section 8.2;
+  //           Section 8.3.2.7 - LinkError State.
+  // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) rdi_lp_linkerror_q <= 1'b0;
     else           rdi_lp_linkerror_q <= rdi_lp_linkerror;
   end
   wire rdi_lp_linkerror_rise = rdi_lp_linkerror && !rdi_lp_linkerror_q;
 
+  // ---------------------------------------------------------------------------
+  // assign: ltsm_framing_fault_event - private physical fatal event aggregator
+  //
+  // Combines three independent hardware fatal indications into a single
+  // unified pulse driving the LTSM fatal policy:
+  //   1. rx_framing_fault_rise   - gearbox 1100 sync pattern tracking loss.
+  //   2. codec_rx_overflow_rise  - sideband receiver buffer overflow.
+  //   3. rdi_lp_linkerror_rise   - adapter/protocol fatal error assertion.
+  // Gated by ltsm_fatal_policy_armed (active in all post-RESET states).
+  // Also holds rx_framing_fault_pending_q if a fault arrived during RESET.
+  //
+  // Spec ref: UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2;
+  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  // ---------------------------------------------------------------------------
   assign ltsm_framing_fault_event = ((rx_framing_fault_rise || codec_rx_overflow_rise || rdi_lp_linkerror_rise) &&
                                      ltsm_fatal_policy_armed) ||
                                     rx_framing_fault_pending_q;
@@ -1826,38 +2231,45 @@ module logical_phy #(
   // Scrambling; Section 8.1 - Raw Die-to-Die Interface (RDI);
   // Table 114 - RDI Signal List. PLAN.md Sections 15.6 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // assign: rdi_pl_trdy - RDI Target Ready Handshake Pass-Through
+  //
+  // Loopback connection passing Adapter initiator ready (rdi_lp_irdy) directly
+  // through to target ready (rdi_pl_trdy) for unthrottled streaming.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
+  // ---------------------------------------------------------------------------
   assign rdi_pl_trdy  = rdi_lp_irdy;
-  assign rdi_pl_valid = rx_user_valid;
-  assign rdi_pl_data  = rx_user_valid ? rx_user_word : {DATA_W{1'b0}};
 
   // ---------------------------------------------------------------------------
-  // Lint Suppression: `unused` (continuous assign)
+  // assign: rdi_pl_valid - RDI Receive Mainband Valid Data Qualifier
+  //
+  // Driven from descrambled, gate-qualified receive valid (rx_user_valid).
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
   // ---------------------------------------------------------------------------
-  // Continuous assign so Icarus Verilog evaluates all bit-select references.
-  //
-  // A reduced endpoint leaves several ports and signals intentionally
-  // unimplemented: the stall handshake, the CSR read data bus, the retrain and
-  // sideband timeout hooks, and the per-lane byte map are all wired for
-  // interface completeness but carry no logic in this proof of concept. Without
-  // a reference, `iverilog -Wall` reports them as unused and the zero-warning
-  // compile gate fails.
-  //
-  // Folding every one of them into a single catch-all assign keeps them live
-  // for the elaborator while adding no logic: the expression is never read, so
-  // synthesis discards it entirely. It is a deliberate, documented suppression
-  // rather than a hidden one.
-  //
-  // adapter_active_req is the public Adapter Active copy. Phase D keeps the
-  // RDI Active policy independent of it, so it is consumed here for lint only
-  // and never changes behavior. local_active_req left this list in Phase E,
-  // where it became the RDI half of the Active user-data gate.
-  //
-  // Spec ref: UCIe 1.0, Section 8.3.1 - Stallreq/Ack Mechanism (the
-  //           pl_stallreq / lp_stallack handshake). lp_state_req is a
-  //           separate state request specified in Section 8.3.2.
-  //           PLAN.md Sections 15.5 and 15.9 Phase E.
+  assign rdi_pl_valid = rx_user_valid;
+
   // ---------------------------------------------------------------------------
+  // assign: rdi_pl_data - RDI Receive Mainband Data Bus Driver
+  //
+  // Drives descrambled receive word when valid, zeroed when invalid.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
+  // ---------------------------------------------------------------------------
+  assign rdi_pl_data  = rx_user_valid ? rx_user_word : {DATA_W{1'b0}};
+
   logic unused;
+
+  // ---------------------------------------------------------------------------
+  // assign: unused - Lint Suppression for Intentionally Unused Internal Nets
+  //
+  // OR-reduces intentionally unused protocol nets to suppress linter warnings
+  // while ensuring clean elaboration without dangling driver warnings.
+  // Synthesis tools discard this net entirely as it is never read.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 and Section 8.3.1.
+  // ---------------------------------------------------------------------------
   assign unused = adapter_active_req | rdi_stall_complete |
                   phy_retrain_done | sb_msg_timeout |
                   sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |

@@ -118,6 +118,9 @@
 //                           obligations, and PMNAK responses. Expose adapter_fatal/linkerror.
 //                        8. Assign allocated tag to remote mailbox requests in
 //                           rem_table arbiter (Sections 6.1, 7.5).
+//   v0.1.1  2026-10-08  Documentation compliance pass: add detailed
+//                        construct comment blocks (5-30 lines) with UCIe 1.0
+//                        spec citations across all always/assign blocks.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -559,16 +562,55 @@ module adapter_sb_if #(
     endcase
   end
 
+  // --------------------------------------------------------------------------
+  // assign: fdi_rx_hdr_complete - Reconstructed 64-Bit FDI Header
+  //
+  // Captures the complete 64-bit header word across 8 consecutive FDI phases
+  // with the final byte inlined on phase 7.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 (Table 115 - FDI Sideband).
+  // --------------------------------------------------------------------------
   assign fdi_rx_hdr_complete = (fdi_rx_state_q == FDI_RX_HDR && fdi_rx_cnt_q == 3'd7) ?
                                {lp_cfg, fdi_rx_hdr_q[55:0]} : fdi_rx_hdr_q;
+
+  // --------------------------------------------------------------------------
+  // assign: fdi_rx_pld_complete - Reconstructed 64-Bit FDI Payload
+  //
+  // Captures the complete 64-bit payload word across 8 consecutive FDI phases
+  // with the final byte inlined on phase 7.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 (Table 115 - FDI Sideband).
+  // --------------------------------------------------------------------------
   assign fdi_rx_pld_complete = (fdi_rx_state_q == FDI_RX_PLD && fdi_rx_cnt_q == 3'd7) ?
                                {lp_cfg, fdi_rx_pld_q[55:0]} : fdi_rx_pld_q;
 
-  // Unpack decoded FDI packet
+  // --------------------------------------------------------------------------
+  // assign: fdi_rx_pkt_header - FDI Packet Header Decoder
+  //
+  // Unpacks raw 64-bit header word into typed sb_packet_t header fields.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign fdi_rx_pkt_header = sb_decode_header(fdi_rx_hdr_complete);
+
+  // --------------------------------------------------------------------------
+  // assign: fdi_rx_pkt_data - FDI Packet Payload Formatter
+  //
+  // Formats and zero-pads received payload based on opcode definition.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // --------------------------------------------------------------------------
   assign fdi_rx_pkt_data = (sb_payload_bytes(fdi_rx_pkt_header.opcode) > 0) ?
                            sb_pad_data(fdi_rx_pkt_header.opcode, fdi_rx_pld_complete) :
                            64'h0;
+
+  // --------------------------------------------------------------------------
+  // assign: fdi_rx_pkt - Composite Typed FDI Sideband Packet
+  //
+  // Combines decoded header fields and formatted data payload into sb_packet_t.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign fdi_rx_pkt = {fdi_rx_pkt_header[151:64], fdi_rx_pkt_data};
 
   // ==========================================================================
@@ -582,6 +624,17 @@ module adapter_sb_if #(
   logic           fdi_illegal_dst;
   logic           fdi_is_mem;
 
+  // --------------------------------------------------------------------------
+  // always_comb: FDI Packet Structural Validation and Error Checking
+  //
+  // Evaluates structural conformance of received FDI packets:
+  // - Reserved header bits, CP parity, illegal payload combinations.
+  // - Data parity (DP) verification for packets with data.
+  // - Validates source ID matches Stack 0 (3'b000 per Table 48).
+  // - Validates destination ID targets Adapter (3'b001) or PHY (3'b010).
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 and Table 48.
+  // --------------------------------------------------------------------------
   always @* begin
     fdi_dec_err     = sb_decode_error(fdi_rx_hdr_complete);
     fdi_dp_err      = (sb_payload_bytes(fdi_rx_pkt.opcode) > 0) &&
@@ -601,9 +654,25 @@ module adapter_sb_if #(
   // of a register request. Releases slot and pulses pl_cfg_crd when completion
   // is transmitted over pl_cfg.
   // ==========================================================================
+  // --------------------------------------------------------------------------
+  // assign: fdi_req_reserve_event - Inbound FDI Request Slot Reservation Strobe
+  //
+  // Detects the start of an incoming register request at phase 0 to deduct
+  // an available receive buffer slot.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Credit Flow Control.
+  // --------------------------------------------------------------------------
   assign fdi_req_reserve_event = (fdi_rx_state_q == FDI_RX_IDLE) && lp_cfg_vld &&
                                  (sb_packet_kind(lp_cfg[4:0]) == SB_PKT_REG_REQ);
 
+  // --------------------------------------------------------------------------
+  // always_comb: FDI Slot and Credit Accounting Combinational Next-State
+  //
+  // Manages 4 available inbound request buffer slots (fdi_rx_crd_q) and outbound
+  // FDI request credits (fdi_tx_crd_q). Triggers fatal error on buffer overrun.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Credit Flow Control.
+  // --------------------------------------------------------------------------
   always @* begin
     fdi_rx_crd_d          = fdi_rx_crd_q;
     fdi_tx_crd_d          = fdi_tx_crd_q;
@@ -637,6 +706,15 @@ module adapter_sb_if #(
   logic [63:0] target_data;
   sb_packet_t  rd_pkt;
 
+  // --------------------------------------------------------------------------
+  // always_comb: Inbound CSR Request Execution & Response Dispatch FSM
+  //
+  // Decodes inbound configuration requests targeting Adapter or PHY CSRs,
+  // controls register read/write pulses, formats completions (SC, UR, CA),
+  // and routes completions to the FDI transmit queue or remote response path.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   always @* begin
     csr_fsm_d                   = csr_fsm_q;
     csr_held_d                  = csr_held_q;
@@ -817,18 +895,103 @@ module adapter_sb_if #(
     endcase
   end
 
-  // Drive CSR ports
+  // --------------------------------------------------------------------------
+  // assign: csr_target - Adapter CSR Target Identifier
+  //
+  // Drives target decode (TARGET_ADAPTER vs TARGET_PHY) for current held request.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign csr_target    = csr_held_q.target;
+
+  // --------------------------------------------------------------------------
+  // assign: csr_addr - Adapter CSR Register Address Bus
+  //
+  // Routes 32-bit register doubleword address to adapter_regfile.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign csr_addr      = csr_held_q.addr;
+
+  // --------------------------------------------------------------------------
+  // assign: csr_wdata - Adapter CSR Write Data Bus
+  //
+  // Routes 32-bit write data to adapter_regfile.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign csr_wdata     = csr_held_q.wdata;
+
+  // --------------------------------------------------------------------------
+  // assign: csr_be - Adapter CSR Byte Enables
+  //
+  // Routes 4-bit byte enable mask to adapter_regfile.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign csr_be        = csr_held_q.be;
+
+  // --------------------------------------------------------------------------
+  // assign: csr_wr - Adapter CSR Write Strobe
+  //
+  // Asserts write strobe to adapter_regfile during CSR_ST_WR_HOLD.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign csr_wr        = (csr_fsm_q == CSR_ST_WR_HOLD) && (csr_held_q.target == TARGET_ADAPTER);
+
+  // --------------------------------------------------------------------------
+  // assign: csr_rd - Adapter CSR Read Strobe
+  //
+  // Asserts single-cycle read strobe to adapter_regfile for TARGET_ADAPTER.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign csr_rd        = csr_rd_pulse_q && (csr_held_q.target == TARGET_ADAPTER);
 
+  // --------------------------------------------------------------------------
+  // assign: phy_csr_addr - Dedicated PHY CSR Address Bus
+  //
+  // Routes 32-bit register address to logical_phy CSR port.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign phy_csr_addr  = csr_held_q.addr;
+
+  // --------------------------------------------------------------------------
+  // assign: phy_csr_wdata - Dedicated PHY CSR Write Data Bus
+  //
+  // Routes 32-bit write data to logical_phy CSR port.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign phy_csr_wdata = csr_held_q.wdata;
+
+  // --------------------------------------------------------------------------
+  // assign: phy_csr_be - Dedicated PHY CSR Byte Enables
+  //
+  // Routes 4-bit byte enable mask to logical_phy CSR port.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign phy_csr_be    = csr_held_q.be;
+
+  // --------------------------------------------------------------------------
+  // assign: phy_csr_wr - Dedicated PHY CSR Write Strobe
+  //
+  // Asserts write strobe to logical_phy CSR port for TARGET_PHY.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign phy_csr_wr    = (csr_fsm_q == CSR_ST_WR_HOLD) && (csr_held_q.target == TARGET_PHY);
+
+  // --------------------------------------------------------------------------
+  // assign: phy_csr_rd - Dedicated PHY CSR Read Strobe
+  //
+  // Asserts single-cycle read strobe to logical_phy CSR port for TARGET_PHY.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign phy_csr_rd    = csr_rd_pulse_q && (csr_held_q.target == TARGET_PHY);
 
   // ==========================================================================
@@ -843,6 +1006,14 @@ module adapter_sb_if #(
   // ==========================================================================
   logic [3:0] rem_slot_free;
   int rem_free_idx;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Remote Request Table Free Slot Priority Finder
+  //
+  // Finds the lowest-indexed free slot among the 4 remote tracking entries.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Request Tracking.
+  // --------------------------------------------------------------------------
   always @* begin
     rem_slot_free = ~rem_table_valid_q;
     rem_free_idx = 0;
@@ -854,22 +1025,80 @@ module adapter_sb_if #(
 
   // Completion Tag Matching across all 4 entries
   sb_packet_t rem_tbl_0, rem_tbl_1, rem_tbl_2, rem_tbl_3;
+
+  // --------------------------------------------------------------------------
+  // assign: rem_tbl_0 - Remote Request Entry 0 Content Tap
+  //
+  // Exposes entry 0 packet contents for tag comparison and completion matching.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign rem_tbl_0 = rem_table_pkt_q[0];
+
+  // --------------------------------------------------------------------------
+  // assign: rem_tbl_1 - Remote Request Entry 1 Content Tap
+  //
+  // Exposes entry 1 packet contents for tag comparison and completion matching.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign rem_tbl_1 = rem_table_pkt_q[1];
+
+  // --------------------------------------------------------------------------
+  // assign: rem_tbl_2 - Remote Request Entry 2 Content Tap
+  //
+  // Exposes entry 2 packet contents for tag comparison and completion matching.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign rem_tbl_2 = rem_table_pkt_q[2];
+
+  // --------------------------------------------------------------------------
+  // assign: rem_tbl_3 - Remote Request Entry 3 Content Tap
+  //
+  // Exposes entry 3 packet contents for tag comparison and completion matching.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign rem_tbl_3 = rem_table_pkt_q[3];
 
   logic [3:0] rem_tag_match;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Completion Tag Matching Comparator Array
+  //
+  // Compares incoming completion tag against all 4 outstanding request tags.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Tag Management.
+  // --------------------------------------------------------------------------
   always @* begin
     rem_tag_match[0] = rem_table_valid_q[0] && (rem_tbl_0.tag == adapter_sb_rx_packet.tag);
     rem_tag_match[1] = rem_table_valid_q[1] && (rem_tbl_1.tag == adapter_sb_rx_packet.tag);
     rem_tag_match[2] = rem_table_valid_q[2] && (rem_tbl_2.tag == adapter_sb_rx_packet.tag);
     rem_tag_match[3] = rem_table_valid_q[3] && (rem_tbl_3.tag == adapter_sb_rx_packet.tag);
   end
+
   int rem_match_cnt;
+
+  // --------------------------------------------------------------------------
+  // assign: rem_match_cnt - Sum of Matching Tags (Duplicate Detection)
+  //
+  // Counts matching tags across the table. Values > 1 indicate fatal protocol
+  // violation per Section 6.1.3.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data Integrity.
+  // --------------------------------------------------------------------------
   assign rem_match_cnt = rem_tag_match[0] + rem_tag_match[1] + rem_tag_match[2] + rem_tag_match[3];
 
   int rem_match_idx;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Matching Entry Index Selection Encoder
+  //
+  // Encodes the one-hot tag match vector into the matching slot index (0..3).
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Tag Matching.
+  // --------------------------------------------------------------------------
   always @* begin
     rem_match_idx = 0;
     if      (rem_tag_match[0]) rem_match_idx = 0;
@@ -878,7 +1107,15 @@ module adapter_sb_if #(
     else if (rem_tag_match[3]) rem_match_idx = 3;
   end
 
-  // Remote Table Sequential & Timer Update Process
+  // --------------------------------------------------------------------------
+  // always_comb: Remote Table Sequential & Timer Update Process
+  //
+  // Advances per-entry 8 ms message timers (C_SB_MSG), handles Stall timer
+  // resets, retires entries on terminal completions (SC, UR, CA), generates
+  // timeout UR completions, and allocates entries on transmit acceptance.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control and Timers.
+  // --------------------------------------------------------------------------
   always @(rdi_pl_state_sts,
            rem_table_valid_q[0], rem_table_valid_q[1], rem_table_valid_q[2], rem_table_valid_q[3],
            rem_table_route_q[0], rem_table_route_q[1], rem_table_route_q[2], rem_table_route_q[3],
@@ -975,16 +1212,67 @@ module adapter_sb_if #(
     end
   end
 
-  // Multiplex completion pushes into FIFO queues
+  // --------------------------------------------------------------------------
+  // assign: fdi_cpl_push - Inbound FDI Completion Push Strobe
+  //
+  // Combines completion pushes from local CSR engine and remote completion router.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // --------------------------------------------------------------------------
   assign fdi_cpl_push     = csr_fdi_cpl_push | rem_fdi_cpl_push;
+
+  // --------------------------------------------------------------------------
+  // assign: fdi_cpl_push_pkt - Inbound FDI Completion Push Packet Multiplexer
+  //
+  // Selects between local CSR completion and remote response completion packet.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign fdi_cpl_push_pkt = csr_fdi_cpl_push ? csr_fdi_cpl_push_pkt : rem_fdi_cpl_push_pkt;
 
+  // --------------------------------------------------------------------------
+  // assign: rem_cpl_push - Remote Completion Queue Push Strobe
+  //
+  // Forwards push strobe for remote completions into the outbound FIFO queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // --------------------------------------------------------------------------
   assign rem_cpl_push     = csr_rem_cpl_push;
+
+  // --------------------------------------------------------------------------
+  // assign: rem_cpl_push_pkt - Remote Completion Queue Push Packet
+  //
+  // Drives packet payload into the outbound remote completion FIFO queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign rem_cpl_push_pkt = csr_rem_cpl_push_pkt;
 
-  // Single-driver sticky error updates
+  // --------------------------------------------------------------------------
+  // assign: fdi_format_err_d - Sticky FDI Format Error Aggregator
+  //
+  // Accumulates intra-transaction phase gap and packet decode formatting faults.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 and Section 6.1.3.
+  // --------------------------------------------------------------------------
   assign fdi_format_err_d = fdi_format_err_q | fdi_rx_format_err_event | fdi_decode_format_err_event;
+
+  // --------------------------------------------------------------------------
+  // assign: protocol_err_d - Sticky Sideband Protocol Error Aggregator
+  //
+  // Accumulates unexpected completions, duplicate tags, and corrupt packets.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data Integrity.
+  // --------------------------------------------------------------------------
   assign protocol_err_d   = protocol_err_q   | fdi_protocol_err_event  | rem_protocol_err_event | adapter_sb_rx_err_event;
+
+  // --------------------------------------------------------------------------
+  // assign: adapter_fatal_d - Sticky Adapter Fatal Error Aggregator
+  //
+  // Rolls up fatal sideband conditions; cleared only on link RESET.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 and Section 8.3.2.7.
+  // --------------------------------------------------------------------------
   assign adapter_fatal_d  = (rdi_pl_state_sts == RDI_STS_RESET) ? 1'b0 :
                            (adapter_fatal_q | fdi_fatal_event | rem_fatal_event | s3_fatal_event | adapter_sb_rx_err_event);
 
@@ -997,6 +1285,15 @@ module adapter_sb_if #(
   // Messages and completions are never credit-gated.
   // ==========================================================================
   int add_crd;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Remote Request Credit Accounting and Return Processor
+  //
+  // Maintains 4 independent request credits. Saturated at 4 upon Cr bit and
+  // NOP.Crd returns. Accumulates pending credit returns for peer notification.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Credit-Based Flow Control.
+  // --------------------------------------------------------------------------
   always @* begin
     remote_req_crd_d    = remote_req_crd_q;
     pending_cr_d        = pending_cr_q;
@@ -1059,8 +1356,24 @@ module adapter_sb_if #(
   // Completions are always-sink and never credit-gated.
   // ==========================================================================
   sb_packet_t cur_fdi_cpl;
+
+  // --------------------------------------------------------------------------
+  // assign: cur_fdi_cpl - FDI Completion Queue Head Packet Tap
+  //
+  // Taps the completion packet currently at the read head of the FDI FIFO queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 - FDI Sideband Interface.
+  // --------------------------------------------------------------------------
   assign cur_fdi_cpl = fdi_cpl_q[fdi_cpl_rd_ptr_q];
 
+  // --------------------------------------------------------------------------
+  // always_comb: FDI Completion FIFO Pointer and Count Updates
+  //
+  // Updates circular write/read pointers and occupancy count for the 4-entry
+  // inbound FDI completion queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // --------------------------------------------------------------------------
   always @* begin
     fdi_cpl_wr_ptr_d = fdi_cpl_wr_ptr_q;
     fdi_cpl_rd_ptr_d = fdi_cpl_rd_ptr_q;
@@ -1082,8 +1395,24 @@ module adapter_sb_if #(
   end
 
   sb_packet_t cur_rem_fifo_cpl;
+
+  // --------------------------------------------------------------------------
+  // assign: cur_rem_fifo_cpl - Remote Completion FIFO Head Packet Tap
+  //
+  // Taps the completion packet currently at the head of the outbound remote FIFO.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   assign cur_rem_fifo_cpl = rem_cpl_fifo_q[rem_cpl_rd_ptr_q];
 
+  // --------------------------------------------------------------------------
+  // always_comb: Remote Completion FIFO Pointer and Count Updates
+  //
+  // Updates circular write/read pointers and occupancy count for the 4-entry
+  // outbound remote completion queue.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // --------------------------------------------------------------------------
   always @* begin
     rem_cpl_wr_ptr_d = rem_cpl_wr_ptr_q;
     rem_cpl_rd_ptr_d = rem_cpl_rd_ptr_q;
@@ -1115,6 +1444,14 @@ module adapter_sb_if #(
   logic [63:0] cur_fdi_tx_pld;
   logic        cur_fdi_tx_has_pld;
 
+  // --------------------------------------------------------------------------
+  // always_comb: FDI Transmit Packet Header/Payload Encoder
+  //
+  // Encodes the packet at the read head of the FDI completion queue into 64-bit
+  // header and padded payload words with valid CP/DP parity fields.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet Formats.
+  // --------------------------------------------------------------------------
   always @(fdi_cpl_q[0], fdi_cpl_q[1], fdi_cpl_q[2], fdi_cpl_q[3],
            fdi_cpl_rd_ptr_q) begin
     cur_fdi_tx_pkt     = fdi_cpl_q[fdi_cpl_rd_ptr_q];
@@ -1123,6 +1460,14 @@ module adapter_sb_if #(
     cur_fdi_tx_pld     = sb_pad_data(cur_fdi_tx_pkt.opcode, cur_fdi_tx_pkt.data);
   end
 
+  // --------------------------------------------------------------------------
+  // always_comb: FDI Transmit Serializer FSM & Phase Sequencing
+  //
+  // Drives 8 consecutive phases of header over pl_cfg, followed by optional
+  // 8 phases of payload without gaps per Section 8.2.3. Releases slot credit.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 - FDI Sideband Interface.
+  // --------------------------------------------------------------------------
   always @* begin
     pl_tx_state_d         = pl_tx_state_q;
     pl_tx_cnt_d           = pl_tx_cnt_q;
@@ -1181,8 +1526,31 @@ module adapter_sb_if #(
     endcase
   end
 
+  // --------------------------------------------------------------------------
+  // assign: pl_cfg - FDI Transmit Configuration Data Bus
+  //
+  // Outputs serialized byte stream to Protocol Layer across 8 consecutive phases.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 (Table 115 - FDI Sideband).
+  // --------------------------------------------------------------------------
   assign pl_cfg     = pl_cfg_q;
+
+  // --------------------------------------------------------------------------
+  // assign: pl_cfg_vld - FDI Transmit Configuration Valid Strobe
+  //
+  // Asserts valid during active 8-phase transmission bursts without internal gaps.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 (Table 115 - FDI Sideband).
+  // --------------------------------------------------------------------------
   assign pl_cfg_vld = pl_cfg_vld_q;
+
+  // --------------------------------------------------------------------------
+  // assign: pl_cfg_crd - FDI Receive Buffer Credit Return Strobe
+  //
+  // Returns request buffer credits to Protocol Layer upon completion retirement.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 (Table 115 - FDI Sideband).
+  // --------------------------------------------------------------------------
   assign pl_cfg_crd = pl_cfg_crd_q;
 
   // ==========================================================================
@@ -1196,6 +1564,15 @@ module adapter_sb_if #(
   // Completes Adapter0 Active reciprocal obligations. PMNAK handles L1/L2.
   // ==========================================================================
   sb_packet_t advcap_tx_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: AdvCap.Adapter Capability Advertised Packet Assembler
+  //
+  // Assembles 64-bit capability packet: Raw Mode (bit 0), Streaming (bit 4),
+  // Stack 0 (bit 7), exact payload mask 64'h0000_0000_0000_0091 per Section 3.1.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1 and Table 54.
+  // --------------------------------------------------------------------------
   always @* begin
     advcap_tx_pkt             = '0;
     advcap_tx_pkt.opcode      = SB_OP_MSG_DATA64;
@@ -1209,6 +1586,14 @@ module adapter_sb_if #(
   end
 
   sb_packet_t ad0_active_req_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Adapter0 Active Request Message Assembler
+  //
+  // Assembles LinkMgmt.RDI Active request message targeting remote adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1 and Table 53.
+  // --------------------------------------------------------------------------
   always @* begin
     ad0_active_req_pkt             = '0;
     ad0_active_req_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1220,6 +1605,14 @@ module adapter_sb_if #(
   end
 
   sb_packet_t ad0_active_rsp_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Adapter0 Active Response Message Assembler
+  //
+  // Assembles LinkMgmt.RDI Active response message targeting remote adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1 and Table 53.
+  // --------------------------------------------------------------------------
   always @* begin
     ad0_active_rsp_pkt             = '0;
     ad0_active_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1231,6 +1624,14 @@ module adapter_sb_if #(
   end
 
   sb_packet_t pmnak_rsp_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Power Management PMNAK Response Message Assembler
+  //
+  // Assembles PMNAK response message rejecting unsupported PM L1/L2 requests.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1 and Table 53.
+  // --------------------------------------------------------------------------
   always @* begin
     pmnak_rsp_pkt             = '0;
     pmnak_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1242,6 +1643,14 @@ module adapter_sb_if #(
   end
 
   sb_packet_t linkreset_req_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: LinkReset Request Message Assembler
+  //
+  // Assembles LinkMgmt.RDI LinkReset request message targeting remote adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.3 and Table 53.
+  // --------------------------------------------------------------------------
   always @* begin
     linkreset_req_pkt             = '0;
     linkreset_req_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1253,6 +1662,14 @@ module adapter_sb_if #(
   end
 
   sb_packet_t linkreset_rsp_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: LinkReset Response Message Assembler
+  //
+  // Assembles LinkMgmt.RDI LinkReset response message targeting remote adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.3 and Table 53.
+  // --------------------------------------------------------------------------
   always @* begin
     linkreset_rsp_pkt             = '0;
     linkreset_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1264,6 +1681,14 @@ module adapter_sb_if #(
   end
 
   sb_packet_t disabled_req_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Disabled Request Message Assembler
+  //
+  // Assembles LinkMgmt.RDI Disabled request message targeting remote adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.4 and Table 53.
+  // --------------------------------------------------------------------------
   always @* begin
     disabled_req_pkt             = '0;
     disabled_req_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1275,6 +1700,14 @@ module adapter_sb_if #(
   end
 
   sb_packet_t disabled_rsp_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Disabled Response Message Assembler
+  //
+  // Assembles LinkMgmt.RDI Disabled response message targeting remote adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.4 and Table 53.
+  // --------------------------------------------------------------------------
   always @* begin
     disabled_rsp_pkt             = '0;
     disabled_rsp_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1285,7 +1718,14 @@ module adapter_sb_if #(
     if (!lreset_n) disabled_rsp_pkt = disabled_rsp_pkt;
   end
 
-  // Stage 3 Sequential Control
+  // --------------------------------------------------------------------------
+  // always_comb: Stage 3 Adapter Initialization Protocol FSM
+  //
+  // Coordinates Stage 3 bringing-up: capability exchange, validation,
+  // 8 ms timeout monitoring, Adapter0 Active handshakes, and link resets.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1 - Stage 3 Adapter Init.
+  // --------------------------------------------------------------------------
   always @* begin
     s3_state_d           = s3_state_q;
     cap_timer_d          = cap_timer_q;
@@ -1553,9 +1993,40 @@ module adapter_sb_if #(
     end
   end
 
+  // --------------------------------------------------------------------------
+  // assign: adapter_state_req_vld - Adapter State Machine Transition Strobe
+  //
+  // Asserts valid to drive adapter state transitions requested by Stage 3.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2 - State Request and Status.
+  // --------------------------------------------------------------------------
   assign adapter_state_req_vld = state_req_vld_q;
+
+  // --------------------------------------------------------------------------
+  // assign: adapter_state_req - Adapter Requested Link State
+  //
+  // Encodes target RDI state (ACTIVE, RESET) requested by Stage 3 engine.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2 - State Request and Status.
+  // --------------------------------------------------------------------------
   assign adapter_state_req     = state_req_q;
+
+  // --------------------------------------------------------------------------
+  // assign: stage3_done - Stage 3 Adapter Initialization Complete Flag
+  //
+  // Signals that Stage 3 capability and Active exchanges completed successfully.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1 - Stage 3 Adapter Init.
+  // --------------------------------------------------------------------------
   assign stage3_done           = stage3_done_q;
+
+  // --------------------------------------------------------------------------
+  // assign: adapter_capability_done - Capability Exchange Complete Flag
+  //
+  // Signals that mutual AdvCap.Adapter exchange succeeded.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1 - Stage 3 Adapter Init.
+  // --------------------------------------------------------------------------
   assign adapter_capability_done = adapter_capability_done_q;
 
   // ==========================================================================
@@ -1572,6 +2043,14 @@ module adapter_sb_if #(
   // Piggybacks Cr bit whenever pending_cr_q > 0.
   // ==========================================================================
   sb_packet_t nop_crd_pkt;
+
+  // --------------------------------------------------------------------------
+  // always_comb: Autonomous NOP.Crd Credit Return Message Assembler
+  //
+  // Assembles NOP.Crd credit return message with MsgInfo carrying return count.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Credit Flow Control.
+  // --------------------------------------------------------------------------
   always @* begin
     nop_crd_pkt             = '0;
     nop_crd_pkt.opcode      = SB_OP_MSG_NODATA;
@@ -1581,6 +2060,15 @@ module adapter_sb_if #(
     nop_crd_pkt.msg_info    = {13'h0, pending_cr_q};
   end
 
+  // --------------------------------------------------------------------------
+  // always_comb: Outbound Adapter Sideband Transmit Priority Arbiter
+  //
+  // Arbitrates between completions (highest priority, uncredit-gated),
+  // link management responses, management requests, autonomous NOP.Crd,
+  // and credit-gated remote register requests. Piggybacks pending Cr bits.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1 - Sideband Protocol.
+  // --------------------------------------------------------------------------
   always @(rem_cpl_fifo_q[0], rem_cpl_fifo_q[1], rem_cpl_fifo_q[2], rem_cpl_fifo_q[3],
            rem_cpl_rd_ptr_q, rem_cpl_count_q,
            owed_rsp_dis_q, owed_rsp_lr_q, owed_rsp_pmnak_q,
@@ -1648,27 +2136,110 @@ module adapter_sb_if #(
     end
   end
 
-  // Always sink incoming packets on adapter_sb_rx
+  // --------------------------------------------------------------------------
+  // assign: adapter_sb_rx_ready - Always-Sink Receive Acknowledge
+  //
+  // Sinks incoming packets immediately into holding registers and FIFO queues.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Flow Control.
+  // --------------------------------------------------------------------------
   assign adapter_sb_rx_ready = 1'b1;
 
-  // Remote Mailbox Client Completion Handshake
+  // --------------------------------------------------------------------------
+  // assign: rem_cpl_vld - Remote Mailbox Completion Valid Handshake
+  //
+  // Asserts valid to notify remote mailbox client of completed register access.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign rem_cpl_vld = rem_cpl_vld_q;
+
+  // --------------------------------------------------------------------------
+  // assign: rem_cpl_pkt - Remote Mailbox Completion Packet Driver
+  //
+  // Drives completion packet payload to remote mailbox client.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // --------------------------------------------------------------------------
   assign rem_cpl_pkt = rem_cpl_pkt_q;
 
   // ==========================================================================
   // Section 10: Status, Fatal, and Monitor Outputs
   // ==========================================================================
+  // --------------------------------------------------------------------------
+  // assign: adapter_fatal - Adapter Fatal Fault Status Driver
+  //
+  // Asserts sticky fatal status when an unrecoverable protocol error occurs.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 and Section 8.3.2.7.
+  // --------------------------------------------------------------------------
   assign adapter_fatal      = adapter_fatal_q;
+
+  // --------------------------------------------------------------------------
+  // assign: adapter_linkerror - Adapter LinkError Trigger Driver
+  //
+  // Forwards fatal fault condition to trigger RDI LinkError state entry.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1.5 (Figure 111) and Section 8.3.2.7.
+  // --------------------------------------------------------------------------
   assign adapter_linkerror  = adapter_fatal_q;
+
+  // --------------------------------------------------------------------------
+  // assign: protocol_error - Sideband Protocol Error Flag
+  //
+  // Asserted sticky on corrupt opcodes, parity errors, or tag mismatches.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data Integrity.
+  // --------------------------------------------------------------------------
   assign protocol_error     = protocol_err_q;
+
+  // --------------------------------------------------------------------------
+  // assign: fdi_format_error - FDI Configuration Format Error Flag
+  //
+  // Asserted sticky on missing phase cycles or malformed FDI requests.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 - FDI Sideband Interface.
+  // --------------------------------------------------------------------------
   assign fdi_format_error   = fdi_format_err_q;
+
+  // --------------------------------------------------------------------------
+  // assign: sb_credit_returned - Sideband Credit Return Monitor Strobe
+  //
+  // Pulses on every credit return to remote peer.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Credit Flow Control.
+  // --------------------------------------------------------------------------
   assign sb_credit_returned = sb_credit_ret_pulse;
+
+  // --------------------------------------------------------------------------
+  // assign: sb_stall_sent - Sideband Stall Response Monitor Strobe
+  //
+  // Pulses whenever a Stall response packet is transmitted.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 52).
+  // --------------------------------------------------------------------------
   assign sb_stall_sent      = sb_stall_sent_pulse;
+
+  // --------------------------------------------------------------------------
+  // assign: sb_msg_timeout - Sideband Message Timeout Monitor Pulse
+  //
+  // Pulses whenever an 8 ms message timer expires.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Message Timers.
+  // --------------------------------------------------------------------------
   assign sb_msg_timeout     = rem_timeout_pulse | s3_timeout_pulse;
 
   // ==========================================================================
   // Section 11: Sequential State Registers
   // ==========================================================================
+  // --------------------------------------------------------------------------
+  // always_ff: Adapter Sideband Sequential State Register Bank
+  //
+  // Synchronous registers for all sideband state machines, credits, FIFOs,
+  // and error flags clocked on 500 MHz link clock (lclk).
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 3.1.1, Section 6.1, Section 8.2.3.
+  // --------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
       fdi_rx_state_q        <= FDI_RX_IDLE;

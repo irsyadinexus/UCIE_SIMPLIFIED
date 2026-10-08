@@ -16,6 +16,27 @@
 // RDI State Transition Table  (spec 8.1.5 / Figure 111, fixed profile)
 // --------------------------------------------------------------------------
 //
+// RDI STATE TRANSITIONS (spec 8.1.5, Figure 111)
+//
+//                 +-------------------------------------------------------+
+//                 |                                                       |
+//                 v                                                       |
+//             +-------+  REQ_ACTIVE + Active Entry Done    +--------+     |
+//             | RESET | ---------------------------------> | ACTIVE |     |
+//             +-------+                                    +--------+     |
+//              ^  ^   \                                     /   |   \     |
+//              |  |    \                                   /    |    \    |
+//              |  |     v                                 v     |     v   |
+//              |  |   +----------+                  +-------+   |   +----------+
+//              |  +-- | DISABLED | <--------------- | PMNAK |   |   |LINKRESET |
+//              |      +----------+                  +-------+   |   +----------+
+//              |                                                |
+//              |                                                v
+//              |                                          +-----------+
+//              +----------------------------------------- | LINKERROR |
+//                     phy_link_reset (direct per Fig 111) +-----------+
+//                     (spec 8.1.5 & 8.3.2.7)
+//
 //   State       Code   Exits
 //   ----------  -----  ----------------------------------------------------
 //   RESET        0h    REQ_ACTIVE + completed Active Entry -> ACTIVE
@@ -25,13 +46,13 @@
 //                      REQ_DISABLED                       -> DISABLED
 //   PMNAK        3h    REQ_ACTIVE + completed Active Entry -> ACTIVE
 //   LINKRESET    9h    phy_link_reset (LTSM RESET result)  -> RESET
-//   LINKERROR    Ah    REQ_LINKRESET                      -> LINKRESET
+//   LINKERROR    Ah    phy_link_reset (direct per Fig 111) -> RESET
 //   DISABLED     Ch    phy_link_reset (LTSM RESET result)  -> RESET
 //   ----------  -----  ----------------------------------------------------
 //
 //   Preemption, highest first:
-//     1. phy_train_error   -> LINKERROR  (spec 8.1.5)
-//     2. phy_link_reset    -> RESET      (spec 8.1.5)
+//     1. phy_train_error   -> LINKERROR  (spec 8.1.5, Figure 111)
+//     2. phy_link_reset    -> RESET      (spec 8.1.5, Figure 111)
 //
 //   Main cycle:
 //
@@ -42,7 +63,7 @@
 //     ACTIVE --REQ_DISABLED -->  DISABLED
 //     RESET  --REQ_DISABLED -->  DISABLED
 //     LINKRESET / DISABLED --phy_link_reset (LTSM RESET result)--> RESET
-//     phy_train_error  --> LINKERROR --REQ_LINKRESET--> LINKRESET
+//     phy_train_error  --> LINKERROR --phy_link_reset (direct per Fig 111)--> RESET
 //
 //   Not published in the fixed profile: L1 (4h), L2 (8h), RETRAIN (Bh).
 //   REQ_L1 and REQ_L2 return PMNAK instead. REQ_RETRAIN is ignored: ACTIVE is
@@ -109,6 +130,10 @@
 //                        policy-inert adapter_active_req input.
 //   v0.0.7  2026-10-02  Define rdi_pl_inband_pres as the LTSM
 //                        training-complete indication required by Table 114.
+//   v0.0.8  2026-10-08  Update LinkError recovery transition per UCIe 1.0 Section
+//                        8.1.5 (Figure 111) and Section 8.3.2.7: LinkError exits
+//                        directly to Reset (never LinkReset). Add comprehensive
+//                        comments for stall completion logic.
 // ============================================================================
 `ifndef RdiStateMachine_SV
 `define RdiStateMachine_SV
@@ -161,16 +186,17 @@ module rdi_state_machine (
 
   // =========================================================================
   // Completed Active Entry qualification  (spec 8.1.6)
-  // =========================================================================
-  // The RDI publishes ACTIVE only after the physical layer finished its
-  // Active Entry work. Two indications must hold at the same time:
-  //   phy_link_trained      - the physical link completed training.
-  //   phy_active_entry_done - the LTSM completed the Active Entry exchange and
-  //                           reports the private result (PLAN.md Phase C).
-  // Requiring the explicit result keeps a training-complete indication alone
-  // from publishing RDI ACTIVE.
-  // =========================================================================
   logic active_entry_complete;
+
+  // -------------------------------------------------------------------------
+  // assign: active_entry_complete - Active Entry Completion Qualifier
+  //
+  // Qualifies that the physical layer completed training (phy_link_trained)
+  // AND the LTSM completed the private LinkMgmt.RDI Active Entry exchange
+  // (phy_active_entry_done) before the RDI state machine may enter ACTIVE.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1.6 - Active Entry Handshake.
+  // -------------------------------------------------------------------------
   assign active_entry_complete = phy_link_trained && phy_active_entry_done;
 
   // =========================================================================
@@ -207,7 +233,8 @@ module rdi_state_machine (
   //               REQ_DISABLED -> DISABLED. REQ_RETRAIN holds ACTIVE.
   //   PMNAK     : REQ_ACTIVE + completed Active Entry -> ACTIVE.
   //   LINKRESET : held until phy_link_reset preempts to RESET. Spec 8.1.5.
-  //   LINKERROR : REQ_LINKRESET -> LINKRESET. Only recovery path. Spec 8.1.5.
+  //   LINKERROR : held until phy_link_reset preempts directly to RESET.
+//               Per Figure 111 and Section 8.3.2.7, LinkReset is excluded.
   //   DISABLED  : held until phy_link_reset preempts to RESET. Spec 8.1.5.
   //   L1, L2, RETRAIN are never entered in the fixed profile, so a state
   //   register value outside the set above falls back to RESET.
@@ -334,11 +361,61 @@ module rdi_state_machine (
   //           Section 8.3.2 - State Request and Status;
   //           Table 114 - RDI Signal List.
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_inband_pres - Training-Complete In-Band Indication Driver
+  //
+  // Signals that physical link training has completed and the PHY is ready
+  // for RDI ACTIVE operation. Remains asserted until RESET or LinkError.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
+  // -------------------------------------------------------------------------
   assign rdi_pl_inband_pres   = phy_inband_pres;
+
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_linkerror - RDI LinkError Status Indication Driver
+  //
+  // Asserted while the RDI is in LINKERROR state (4'hA), notifying the
+  // D2D Adapter that an unrecoverable fault occurred and recovery is required.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1.5 (Figure 111) and Section 8.3.2.7.
+  // -------------------------------------------------------------------------
   assign rdi_pl_linkerror     = (state_q == RDI_STS_LINKERROR);
+
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_phyinrecenter - Retrain Indication (Unsupported)
+  //
+  // Retrain is unsupported in the fixed profile; tied to 0 per Section 8.1.5.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
+  // -------------------------------------------------------------------------
   assign rdi_pl_phyinrecenter = 1'b0;
+
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_cerror - Correctable Error Status Forwarding
+  //
+  // Forwards correctable error indication from the physical layer to Adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
+  // -------------------------------------------------------------------------
   assign rdi_pl_cerror        = cerror;
+
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_nferror - Non-Fatal Error Status Forwarding
+  //
+  // Forwards non-fatal error indication from the physical layer to Adapter.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
+  // -------------------------------------------------------------------------
   assign rdi_pl_nferror       = nferror;
+
+  // -------------------------------------------------------------------------
+  // assign: rdi_pl_trainerror - LTSM Training Fatal Error Forwarding
+  //
+  // Asserted when the physical LTSM declares an unrecoverable training error.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List);
+  //           Section 4.5.3.8 - TRAINERROR State.
+  // -------------------------------------------------------------------------
   assign rdi_pl_trainerror    = phy_train_error;
 
   // =========================================================================
@@ -435,6 +512,18 @@ module rdi_state_machine (
   assign stall_ack = (stall_phase_q == STALL_ACKED) ||
                      (stall_phase_q == STALL_RELEASED);
 
+  // -------------------------------------------------------------------------
+  // assign: stall_complete - completion pulse of the four-phase stall handshake
+  //
+  // Asserted when the stall handshake has successfully finished: the stall
+  // request has been released by the local controller (STALL_RELEASED phase)
+  // and the adapter has deasserted its stall acknowledgement (!rdi_lp_stallack).
+  // This signal allows the RDI state machine to commit state transitions
+  // (such as transitioning from ACTIVE to LINKRESET or DISABLED) knowing
+  // that the datapath has been fully drained and quiesced.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
+  // -------------------------------------------------------------------------
   assign stall_complete = (stall_phase_q == STALL_RELEASED) &&
                           !rdi_lp_stallack;
   // =========================================================================

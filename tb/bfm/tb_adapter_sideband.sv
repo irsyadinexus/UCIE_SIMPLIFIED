@@ -1,6 +1,64 @@
 // ============================================================================
-// File        : tb_adapter_sideband.sv
-// Description : FDI phase parser to typed Adapter sideband request smoke test.
+// Module      : tb_adapter_sideband
+// Project     : UCIe 1.0 Simplified Endpoint
+// File        : tb/bfm/tb_adapter_sideband.sv
+// ----------------------------------------------------------------------------
+//
+// SPECIFICATION REFERENCES
+//   UCIe 1.0 Specification, Section 3.1.1 - Stage 3: Adapter Initialization
+//   UCIe 1.0 Specification, Section 6.1   - Sideband Protocol Specification
+//   UCIe 1.0 Specification, Section 7.5   - UCIe Registers (CSR definition)
+//   UCIe 1.0 Specification, Section 8.2.3 - FDI Sideband Interface (Table 115)
+//
+// DESCRIPTION
+//   Unit smoke testbench for the D2D Adapter sideband interface (adapter_sb_if).
+//   Verifies the 8-phase FDI header reconstruction, optional 8-phase payload
+//   reconstruction, local CSR configuration access execution, and typed packet
+//   exchange across the private adapter client interface.
+//
+// ARCHITECTURAL DIAGRAM
+//
+//   +----------------------+              +----------------------+
+//   | Protocol Layer BFM   |-- lp_cfg --->| adapter_sb_if        |
+//   |                      |<-- pl_cfg ---|                      |
+//   +----------------------+              +----------+-----------+
+//                                                    |
+//                                          adapter_sb_tx / rx
+//                                                    v
+//                                         [Logical PHY Interface]
+//
+// TESTBENCH VERIFICATION STRATEGY
+//   1. FDI Header Assembly: Emits 8 consecutive phases of lp_cfg bytes with
+//      lp_cfg_vld asserted. Verifies correct 64-bit header reconstruction.
+//   2. FDI Payload Assembly: Emits optional 8 consecutive payload phases for
+//      packets requiring 32-bit or 64-bit data. Verifies payload padding.
+//   3. Gap Fault Detection: Injects illegal gaps during multi-phase transfers
+//      to confirm immediate sticky assertion of fdi_format_error per spec.
+//   4. Outgoing Completion Verification: Monitors pl_cfg serialization over
+//      8 back-to-back phases and observes pl_cfg_crd credit returns.
+//   5. CSR Target Decoding: Validates separate routing between local adapter
+//      register file (Target 3'b001) and physical layer CSRs (Target 3'b010).
+//
+// REVISION HISTORY
+// ----------------------------------------------------------------------------
+//   Rev     Date        Author      Description
+//   ------  ----------  ----------  ------------------------------------------
+//   v0.0.1  2026-09-28  -           Initial creation of adapter sideband test.
+//   v0.0.2  2026-10-08  -           Documentation compliance pass: expand header
+//                                    and add per-construct comments.
+// TESTBENCH EXECUTION FLOW
+//   1. Assert lreset_n and wait for the adapter sideband FSM to leave reset.
+//   2. Drive an incoming FDI 32-bit configuration write across 8 header phases
+//      and 8 payload phases with lp_cfg_vld held high on every phase.
+//   3. Verify the adapter decodes the request and issues csr_wr to the local
+//      register file for destination Adapter (3'b001).
+//   4. Verify the adapter serializes a matching completion response on pl_cfg
+//      over 8 back-to-back phases with no internal gaps.
+//   5. Repeat for destination PHY (3'b010) and confirm the phy_csr_* channel
+//      is driven instead of the local register file.
+//   6. Inject an intra-transaction gap and confirm sticky fdi_format_error.
+//   7. Report pass or fail and finish.
+//
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -83,6 +141,15 @@ module tb_adapter_sideband;
   );
 
   initial lclk = 1'b0;
+
+  // -------------------------------------------------------------------------
+  // always: Link Clock Generator (500 MHz lclk)
+  //
+  // Generates 500 MHz reference link clock with 2.0 ns period (1.0 ns half-period)
+  // for the D2D Adapter sideband interface under test.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Link Clock Frequency.
+  // -------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
 
   initial begin : test_sequence

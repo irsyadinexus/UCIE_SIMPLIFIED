@@ -250,6 +250,11 @@
 //   v0.0.16 2026-09-28  Migrate sideband crossings to scalar clock/data pins
 //                        and park the forwarded mainband clock without idle
 //                        event churn.
+//   v0.0.17 2026-10-08  Update framing fault recovery per UCIe 1.0 Section 8.3.2.7
+//                        and Figures 111, 119, 126: both dies observe Link Down
+//                        Event, withdraw requests to NOP, and transition directly
+//                        from LinkError to RESET without LinkReset exchange.
+//                        Support FAST_SIM parameterization for reset dwell.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -291,9 +296,16 @@ module tb_loopback_top;
   // LINKINIT keeps fCK active for the diagnostic training pattern, and ACTIVE
   // keeps it active for the scrambled user-data path.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.3 and 5.2; PLAN.md Section 15.6.
-  // -------------------------------------------------------------------------
   logic mbclk_en;
+
+  // -------------------------------------------------------------------------
+  // assign: mbclk_en - Mainband Clock Gating Enable Driver
+  //
+  // Enables the 2 GHz forwarded clock fCK whenever either die is in
+  // MBTRAIN.LINKSPEED, LINKINIT, or ACTIVE states.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 and Section 5.1.1.
+  // -------------------------------------------------------------------------
   assign mbclk_en = (d0_ltsm_state == LT_MB_LINKSPEED) ||
                     (d1_ltsm_state == LT_MB_LINKSPEED) ||
                     (d0_ltsm_state == LT_LINKINIT)     ||
@@ -398,10 +410,41 @@ module tb_loopback_top;
   // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping;
   //           Section 4.1.2 - Valid Framing.
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // assign: mb_a2b_wire - Die 0 to Die 1 Mainband Data Bus
+  //
+  // Direct pin connection forwarding 16 DDR lane wires from Die 0 to Die 1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   assign mb_a2b_wire     = mb_a2b_data;
+
+  // -------------------------------------------------------------------------
+  // assign: mb_a2b_val_wire - Die 0 to Die 1 Mainband Framing Wire Multiplexer
+  //
+  // Forwards valid framing bit with fault injection capability to test Rx framing.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   assign mb_a2b_val_wire = mb_a2b_val_inject_en ? mb_a2b_val_inject
                                                 : mb_a2b_valid;
+
+  // -------------------------------------------------------------------------
+  // assign: mb_b2a_wire - Die 1 to Die 0 Mainband Data Bus
+  //
+  // Direct pin connection forwarding 16 DDR lane wires from Die 1 to Die 0.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   assign mb_b2a_wire     = mb_b2a_data;
+
+  // -------------------------------------------------------------------------
+  // assign: mb_b2a_val_wire - Die 1 to Die 0 Mainband Framing Wire Multiplexer
+  //
+  // Forwards valid framing bit with fault injection capability to test Rx framing.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing.
+  // -------------------------------------------------------------------------
   assign mb_b2a_val_wire = mb_b2a_val_inject_en ? mb_b2a_val_inject
                                                 : mb_b2a_valid;
 
@@ -479,58 +522,151 @@ module tb_loopback_top;
   //
   // Spec ref: UCIe 1.0, Section 8.1.5 - RDI State Status Machine.
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // assign: d0_rdi_state_sts - Die 0 RDI State Probe
+  //
+  // Taps Die 0 RDI state machine status for coverage monitoring.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1.5 - RDI State Status Machine.
+  // -------------------------------------------------------------------------
   assign d0_rdi_state_sts = rdi_sts_0;
+
+  // -------------------------------------------------------------------------
+  // assign: d1_rdi_state_sts - Die 1 RDI State Probe
+  //
+  // Taps Die 1 RDI state machine status for coverage monitoring.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1.5 - RDI State Status Machine.
+  // -------------------------------------------------------------------------
   assign d1_rdi_state_sts = rdi_sts_1;
 
   wire [7:0] ltsm_0 = dut_a.u_lphy.u_ltsm.state_q;
   wire [7:0] ltsm_1 = dut_b.u_lphy.u_ltsm.state_q;
+
   // -------------------------------------------------------------------------
-  // assign (2): LTSM State Observation
+  // assign: d0_ltsm_state - Die 0 LTSM State Probe
   //
-  // Copies the hierarchically referenced Link Training State Machine
-  // register from each DUT into a testbench-level logic signal. The LTSM
-  // state is observed by the coverage monitor and is also used to gate the
-  // forwarded clock `mbclk` (via `mbclk_en`).
+  // Taps Die 0 LTSM state for coverage monitoring and mbclk gating.
   //
-  // Spec ref: UCIe 1.0, Section 4.5.3 - Link Training State Machine.
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
   // -------------------------------------------------------------------------
   assign d0_ltsm_state = ltsm_0;
+
+  // -------------------------------------------------------------------------
+  // assign: d1_ltsm_state - Die 1 LTSM State Probe
+  //
+  // Taps Die 1 LTSM state for coverage monitoring and mbclk gating.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // -------------------------------------------------------------------------
   assign d1_ltsm_state = ltsm_1;
 
   // -------------------------------------------------------------------------
-  // assign (8): Sideband and Link-Active Observation
+  // assign: d0_sb_rx_opcode - Die 0 Sideband Receive Opcode Probe
   //
-  // These assignments extract lclk-domain sideband packet fields and valid
-  // strobes after each logical PHY's sbclk-to-lclk mailbox. The coverage
-  // monitor therefore observes coherent packet fields in its lclk domain.
+  // Taps Die 0 received sideband opcode for protocol coverage.
   //
-  // Spec ref: UCIe 1.0, Section 4.1.5 - Sideband transmission.
-  // Spec ref: UCIe 1.0, Section 5.13 - Sideband signaling.
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 47).
   // -------------------------------------------------------------------------
   assign d0_sb_rx_opcode     = dut_a.u_lphy.sb_rx_opcode;
-  assign d0_sb_rx_msgcode    = dut_a.u_lphy.sb_rx_msgcode;
-  assign d0_sb_rx_msgsubcode = dut_a.u_lphy.sb_rx_msgsubcode;
-  assign d0_sbinit_phase     = dut_a.u_lphy.u_ltsm.sbinit_phase_q;
-  assign d0_sb_rx_pkt_vld    = dut_a.u_lphy.sb_rx_pkt_vld;
-  assign d1_sb_rx_opcode     = dut_b.u_lphy.sb_rx_opcode;
-  assign d1_sb_rx_msgcode    = dut_b.u_lphy.sb_rx_msgcode;
-  assign d1_sb_rx_msgsubcode = dut_b.u_lphy.sb_rx_msgsubcode;
-  assign d1_sbinit_phase     = dut_b.u_lphy.u_ltsm.sbinit_phase_q;
-  assign d1_sb_rx_pkt_vld    = dut_b.u_lphy.sb_rx_pkt_vld;
+
   // -------------------------------------------------------------------------
-  // assign (2): Link Active Observation
+  // assign: d0_sb_rx_msgcode - Die 0 Sideband Receive MsgCode Probe
   //
-  // The Phase D cutover removed the ucie_main `link_active_obs` port, so the
-  // testbench observes link-up through the public FDI status instead: the
-  // adapter publishes FDI ACTIVE (4'h1) only after the RDI reports ACTIVE,
-  // which requires the completed LTSM Active Entry result and the protocol
-  // layer's lp_rx_active_sts answer. The value feeds the coverage monitor and
-  // the main-sequence Active gates; the LTSM state remains the functional
-  // reference for the RESET dwell checks.
+  // Taps Die 0 received sideband message code for protocol coverage.
   //
-  // Spec ref: UCIe 1.0, Section 8.2 - FDI; Section 8.1.6 - Active Entry.
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
+  assign d0_sb_rx_msgcode    = dut_a.u_lphy.sb_rx_msgcode;
+
+  // -------------------------------------------------------------------------
+  // assign: d0_sb_rx_msgsubcode - Die 0 Sideband Receive MsgSubcode Probe
+  //
+  // Taps Die 0 received sideband message subcode for protocol coverage.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
+  assign d0_sb_rx_msgsubcode = dut_a.u_lphy.sb_rx_msgsubcode;
+
+  // -------------------------------------------------------------------------
+  // assign: d0_sbinit_phase - Die 0 SBINIT Phase Probe
+  //
+  // Taps Die 0 SBINIT internal sub-phase for handshake verification.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
+  assign d0_sbinit_phase     = dut_a.u_lphy.u_ltsm.sbinit_phase_q;
+
+  // -------------------------------------------------------------------------
+  // assign: d0_sb_rx_pkt_vld - Die 0 Sideband Receive Valid Probe
+  //
+  // Taps Die 0 received sideband valid strobe for coverage monitor.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
+  // -------------------------------------------------------------------------
+  assign d0_sb_rx_pkt_vld    = dut_a.u_lphy.sb_rx_pkt_vld;
+
+  // -------------------------------------------------------------------------
+  // assign: d1_sb_rx_opcode - Die 1 Sideband Receive Opcode Probe
+  //
+  // Taps Die 1 received sideband opcode for protocol coverage.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.1 (Table 47).
+  // -------------------------------------------------------------------------
+  assign d1_sb_rx_opcode     = dut_b.u_lphy.sb_rx_opcode;
+
+  // -------------------------------------------------------------------------
+  // assign: d1_sb_rx_msgcode - Die 1 Sideband Receive MsgCode Probe
+  //
+  // Taps Die 1 received sideband message code for protocol coverage.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
+  assign d1_sb_rx_msgcode    = dut_b.u_lphy.sb_rx_msgcode;
+
+  // -------------------------------------------------------------------------
+  // assign: d1_sb_rx_msgsubcode - Die 1 Sideband Receive MsgSubcode Probe
+  //
+  // Taps Die 1 received sideband message subcode for protocol coverage.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2.1 (Table 50).
+  // -------------------------------------------------------------------------
+  assign d1_sb_rx_msgsubcode = dut_b.u_lphy.sb_rx_msgsubcode;
+
+  // -------------------------------------------------------------------------
+  // assign: d1_sbinit_phase - Die 1 SBINIT Phase Probe
+  //
+  // Taps Die 1 SBINIT internal sub-phase for handshake verification.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
+  assign d1_sbinit_phase     = dut_b.u_lphy.u_ltsm.sbinit_phase_q;
+
+  // -------------------------------------------------------------------------
+  // assign: d1_sb_rx_pkt_vld - Die 1 Sideband Receive Valid Probe
+  //
+  // Taps Die 1 received sideband valid strobe for coverage monitor.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
+  // -------------------------------------------------------------------------
+  assign d1_sb_rx_pkt_vld    = dut_b.u_lphy.sb_rx_pkt_vld;
+
+  // -------------------------------------------------------------------------
+  // assign: d0_link_active_obs - Die 0 Link Active Status Probe
+  //
+  // Taps Die 0 FDI ACTIVE state indication (4'h1) for test synchronization.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 - FDI; Section 8.1.6.
   // -------------------------------------------------------------------------
   assign d0_link_active_obs = (d0_pl_state_sts == FDI_STS_ACTIVE);
+
+  // -------------------------------------------------------------------------
+  // assign: d1_link_active_obs - Die 1 Link Active Status Probe
+  //
+  // Taps Die 1 FDI ACTIVE state indication (4'h1) for test synchronization.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2 - FDI; Section 8.1.6.
+  // -------------------------------------------------------------------------
   assign d1_link_active_obs = (d1_pl_state_sts == FDI_STS_ACTIVE);
 
   // ------------------------------------------------------- DUTs
@@ -667,6 +803,13 @@ module tb_loopback_top;
   // after local reset. The LTSM clears the Start copy upon Active Entry,
   // requiring a fresh CSR write or NOP-to-Active request to restart training
   // after a RESET dwell.
+  // -------------------------------------------------------------------------
+  // always: Die 0 FDI Stall Acknowledge Automatic Responder
+  //
+  // Automatically echoes stall request to acknowledge per Section 8.3.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
+  // -------------------------------------------------------------------------
   always @(posedge lclk or negedge d0_lreset_n) begin
     if (!d0_lreset_n)
       d0_lp_stallack <= 1'b0;
@@ -674,6 +817,13 @@ module tb_loopback_top;
       d0_lp_stallack <= d0_pl_stallreq;
   end
 
+  // -------------------------------------------------------------------------
+  // always: Die 1 FDI Stall Acknowledge Automatic Responder
+  //
+  // Automatically echoes stall request to acknowledge per Section 8.3.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
+  // -------------------------------------------------------------------------
   always @(posedge lclk or negedge d1_lreset_n) begin
     if (!d1_lreset_n)
       d1_lp_stallack <= 1'b0;
@@ -681,6 +831,13 @@ module tb_loopback_top;
       d1_lp_stallack <= d1_pl_stallreq;
   end
 
+  // -------------------------------------------------------------------------
+  // always: Die 0 FDI RX Active Status Automatic Responder
+  //
+  // Responds to pl_rx_active_req by asserting lp_rx_active_sts per Section 8.3.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2 - State Request Handshake.
+  // -------------------------------------------------------------------------
   always @(posedge lclk or negedge d0_lreset_n) begin
     if (!d0_lreset_n)
       d0_lp_rx_active_sts <= 1'b0;
@@ -690,6 +847,13 @@ module tb_loopback_top;
       d0_lp_rx_active_sts <= 1'b0;
   end
 
+  // -------------------------------------------------------------------------
+  // always: Die 1 FDI RX Active Status Automatic Responder
+  //
+  // Responds to pl_rx_active_req by asserting lp_rx_active_sts per Section 8.3.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2 - State Request Handshake.
+  // -------------------------------------------------------------------------
   always @(posedge lclk or negedge d1_lreset_n) begin
     if (!d1_lreset_n)
       d1_lp_rx_active_sts <= 1'b0;
@@ -1177,9 +1341,15 @@ module tb_loopback_top;
       cov_framing_fault_seen = 1'b1;
   end
 
-  // Check the delayed-start contract on the actual two-die surface. Pattern
-  // and packet subphases are private observations only. Public DUT ports stay
-  // unchanged.
+  // -------------------------------------------------------------------------
+  // always: Two-Die Reset Alignment and Initialization Monitor
+  //
+  // Verifies that local reset pairs (lreset_n and sbreset_n) remain aligned,
+  // monitors pattern trigger pending timing, and enforces the 4 ms minimum
+  // residency requirement in LT_RESET per Section 4.5.3.1.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 - RESET State.
+  // -------------------------------------------------------------------------
   always @(posedge lclk) begin
     if (((d0_lreset_n !== d0_sbreset_n) ||
          (d1_lreset_n !== d1_sbreset_n)) && !reset_pair_error_seen) begin

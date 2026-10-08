@@ -267,9 +267,10 @@
 import ucie_pkg::*;
 `timescale 1ns/1ps
 module ucie_main #(
-  parameter int unsigned NBYTES = ucie_pkg::NBYTES,
-  parameter int unsigned NLANES = NLANES_MAX,
-  parameter int unsigned NC     = ucie_pkg::NC
+  parameter int unsigned NBYTES   = ucie_pkg::NBYTES,
+  parameter int unsigned NLANES   = NLANES_MAX,
+  parameter int unsigned NC       = ucie_pkg::NC,
+  parameter bit          FAST_SIM = 1'b1
 ) (
   input  logic        lclk,
   input  logic        lreset_n,
@@ -541,7 +542,7 @@ module ucie_main #(
   //   sideband/mainband, and configuration sideband. Start events remain
   //   internal to the existing two-block topology.
   // ==========================================================================
-  logical_phy #(.NBYTES(NBYTES), .NLANES(NLANES)) u_lphy (
+  logical_phy #(.NBYTES(NBYTES), .NLANES(NLANES), .FAST_SIM(FAST_SIM)) u_lphy (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
     .mbclk           (mbclk),

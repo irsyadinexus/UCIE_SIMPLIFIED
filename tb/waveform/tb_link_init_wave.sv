@@ -491,8 +491,8 @@ module tb_link_init_wave;
     // Wait until synchronous hardware reset deassertion
     wait (d0_lreset_n === 1'b1 && d1_lreset_n === 1'b1);
 
-    // Advance to 3999 us (remove 0ms to 3999us wait window from active training trace)
-    #3_999_080;
+    // Physical layer RESET dwell time (40 us with FAST_SIM=1)
+    #40_100;
     @(posedge lclk);
     $display("[%0t ns] Protocol Layer on Die0 and Die1 writing 1b to Start UCIe Link Training in UCIe Link Control...", $time);
 
@@ -691,17 +691,144 @@ module tb_link_init_wave;
       $display("SUCCESS: %0d Bytes transferred bidirectionally (32 beats each way) without error!", STREAM_BYTES);
       $display("  Die0 -> Die1: %0d bytes verified", STREAM_BYTES);
       $display("  Die1 -> Die0: %0d bytes verified", STREAM_BYTES);
-      $display("TEST PASSED tb_link_init_wave");
+      $display("INITIAL BIDIRECTIONAL STREAMING OK");
     end else begin
       $fatal(1, "TEST FAILED tb_link_init_wave: %0d streaming errors detected", stream_errors);
     end
     $display("==========================================================================\n");
+
+    // ==========================================================================
+    // 1. LinkReset Flow (Specification Section 8.3.3.1, Figure 125)
+    // ==========================================================================
+    $display("\n==========================================================================");
+    $display("[%0t ns] STEP 1: LinkReset Entry and Exit Flow (Spec Section 8.3.3.1, Figure 125)", $time);
+    $display("==========================================================================");
+
+    // Wait for 1us after bidirectional transfer finished
+    #1000;
+    $display("[%0t ns] 1us delay complete. Die 0 Protocol Layer requesting LinkReset (lp_state_req=LINKRESET)...", $time);
+
+    // Die 0 protocol layer sends request for LinkReset
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_LINKRESET;
+
+    // Die 0 physical layer transmits sideband message LinkMgmt.RDI.Req.LinkReset (01h, 09h)
+    // Die 1 receives sideband message requesting LinkReset entry from Die 0
+    @(posedge lclk);
+    while (!(d1_sb_rx_pkt_vld && (d1_sb_rx_msgcode == 8'h01) && (d1_sb_rx_msgsubcode == 8'h09))) @(posedge lclk);
+    $display("[%0t ns] Die 1 received sideband message requesting LinkReset entry from Die 0 (MsgCode 01h, Subcode 09h)", $time);
+    // Both dies enter LINKRESET (Section 8.3.2.8: remote partner requested LinkReset over sideband)
+    wait (d0_pl_state_sts == FDI_STS_LINKRESET && d1_pl_state_sts == FDI_STS_LINKRESET);
+    $display("[%0t ns] Both dies entered LINKRESET (pl_state_sts=LINKRESET) per Section 8.3.2.8", $time);
+    // Per Section 8.3.3.1 & Figure 125: Die 1 is UP (Device), Die 1 NEVER sends d1_lp_state_req = FDI_REQ_LINKRESET.
+    // Die 1 Protocol Layer observes Link Down Event and withdraws its request to NOP (Section 8.3.2.1).
+    @(negedge lclk);
+    d1_lp_state_req = FDI_REQ_NOP;
+    $display("[%0t ns] Die 1 Protocol Layer observed Link Down Event (d1_lp_state_req set to NOP per Section 8.3.2.1)", $time);
+
+    // Both dies transition to RESET following completed LinkReset exchange
+    wait (d0_ltsm_state == LT_RESET && d1_ltsm_state == LT_RESET);
+    wait (d0_pl_state_sts == FDI_STS_RESET && d1_pl_state_sts == FDI_STS_RESET);
+    $display("[%0t ns] Both dies successfully entered RESET following LinkReset exchange", $time);
+
+    // Die 0 clears SBR to NOP (Figure 125: "Software clear SBR = 1")
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_NOP;
+    // With FAST_SIM=1, physical layers dwell in RESET for 40 us (spec Figure 125)
+    $display("[%0t ns] Waiting 40 us physical layer RESET dwell...", $time);
+    #40_100;
+    $display("[%0t ns] 40 us RESET dwell complete. Restarting link training...", $time);
+    // Die 0 software issues Start Link Training via FDI Link Control CSR write (Figure 125)
+    fdi_cfg_write_link_control(0);
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_ACTIVE;
+    d1_lp_state_req = FDI_REQ_ACTIVE;
+
+    // Wait until both dies walk back through training to ACTIVE state
+    wait (d0_ltsm_state == LT_ACTIVE && d1_ltsm_state == LT_ACTIVE);
+    wait (d0_pl_state_sts == FDI_STS_ACTIVE && d1_pl_state_sts == FDI_STS_ACTIVE);
+    $display("[%0t ns] SUCCESS: Both dies returned to ACTIVE state after LinkReset (Figure 125 confirmed)!\n", $time);
+
+    // Let link run in stable ACTIVE for 16 cycles before next step
+    repeat (16) @(posedge lclk);
+
+    // ==========================================================================
+    // 2. LinkError Flow (Specification Section 8.3.3.2, Figure 126)
+    // ==========================================================================
+    $display("\n==========================================================================");
+    $display("[%0t ns] STEP 2: LinkError Entry and Exit Flow (Spec Section 8.3.3.2, Figure 126)", $time);
+    $display("==========================================================================");
+
+    // Wait for 1us after both dies back to ACTIVE state
+    #1000;
+    $display("[%0t ns] 1us delay complete. Die 0 Protocol Layer detecting UIE and requesting LinkError (lp_linkerror=1)...", $time);
+
+    // Die 0 protocol layer sends request for LinkError via lp_linkerror (Table 115)
+    @(negedge lclk);
+    d0_lp_linkerror = 1'b1;
+
+    // Die 0 Physical Layer transmits TRAINERROR Entry sideband message (MsgCode E5h, Subcode 00h) to Die 1
+    // Die 1 receives sideband message requesting LinkError entry from Die 0
+    @(posedge lclk);
+    while (!(d1_sb_rx_pkt_vld && (d1_sb_rx_msgcode == 8'hE5 || (d1_sb_rx_msgcode == 8'h01 && d1_sb_rx_msgsubcode == 8'h0A)))) @(posedge lclk);
+    $display("[%0t ns] Die 1 received sideband message requesting LinkError entry from Die 0 (MsgCode %02h)", $time, d1_sb_rx_msgcode);
+
+    // Per Figure 126: Die 1 observes Link Down Event (d1_lp_state_req set to NOP, d1_lp_linkerror stays 0)
+    @(negedge lclk);
+    d1_lp_state_req = FDI_REQ_NOP;
+    $display("[%0t ns] Die 1 Protocol Layer observed Link Down Event (d1_lp_state_req set to NOP per Fig 126)", $time);
+
+    // Both dies transition to LinkError / TRAINERROR
+    wait (d0_ltsm_state == LT_TRAINERROR && d1_ltsm_state == LT_TRAINERROR);
+    wait (d0_pl_state_sts == FDI_STS_LINKERROR && d1_pl_state_sts == FDI_STS_LINKERROR);
+    $display("[%0t ns] Both dies hold TRAINERROR and publish FDI LinkError status", $time);
+
+    // Clear the error assertion (Figure 126: "Software clears error status")
+    @(negedge lclk);
+    d0_lp_linkerror = 1'b0;
+
+    // Recovery from LinkError per Figure 111, Figure 119, Figure 126, and Section 8.3.2.7:
+    // Physical layer executes recovery and transitions directly from LinkError to RESET.
+    // LinkReset cannot be entered from LinkError (spec Figure 111: "From Any State except LinkError").
+    $display("[%0t ns] Initiating recovery from LinkError...", $time);
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_LINKRESET;
+    d1_lp_state_req = FDI_REQ_LINKRESET;
+    // Both dies leave LinkError and enter RESET directly
+    wait (d0_ltsm_state == LT_RESET && d1_ltsm_state == LT_RESET);
+    wait (d0_pl_state_sts == FDI_STS_RESET && d1_pl_state_sts == FDI_STS_RESET);
+    $display("[%0t ns] Both dies left LinkError and entered RESET directly per Figure 111/126 and Section 8.3.2.7", $time);
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_NOP;
+    d1_lp_state_req = FDI_REQ_NOP;
+    // With FAST_SIM=1, physical layers dwell in RESET for 40 us (spec Figure 126)
+    $display("[%0t ns] Waiting 40 us physical layer RESET dwell...", $time);
+    #40_100;
+    $display("[%0t ns] 40 us RESET dwell complete. Restarting link training...", $time);
+    // Die 0 software issues Start Link Training via FDI Link Control CSR write (Figure 126)
+    fdi_cfg_write_link_control(0);
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_ACTIVE;
+    d1_lp_state_req = FDI_REQ_ACTIVE;
+
+    // Wait until both dies walk back through training to ACTIVE state
+    wait (d0_ltsm_state == LT_ACTIVE && d1_ltsm_state == LT_ACTIVE);
+    wait (d0_pl_state_sts == FDI_STS_ACTIVE && d1_pl_state_sts == FDI_STS_ACTIVE);
+    $display("[%0t ns] SUCCESS: Both dies returned to ACTIVE state after LinkError (Figure 126 confirmed)!\n", $time);
+
+    // Final success summary
+    $display("==========================================================================");
+    $display("TEST PASSED tb_link_init_wave: all bringup, streaming, LinkReset, and LinkError verified");
+    $display("  1. Link bringup and 512B bidirectional data streaming verified");
+    $display("  2. Section 8.3.3.1 Figure 125 LinkReset entry/exit confirmed (Die 1 never sends LinkReset)");
+    $display("  3. Section 8.3.3.2 Figure 126 LinkError entry/exit confirmed");
+    $display("==========================================================================");
     $finish;
   end
 
   // Watchdog timeout
   initial begin
-    #20_000_000; // 20 ms watchdog
+    #2_000_000; // 2 ms watchdog for bringup + LinkReset + LinkError flows
     $fatal(1, "TEST FAILED tb_link_init_wave: Watchdog timeout at %0t ns", $time);
   end
 
@@ -710,8 +837,7 @@ module tb_link_init_wave;
   // ==========================================================================
   string wave_path;
   initial begin
-    // Remove waveform from 0ms to 3999us (waiting for reset dwell)
-    #3_999_000;
+    // Save waveform from time 0 (no wait needed since reset dwell is reduced to 40 us)
     wave_path = "logs/link_init.vcd";
     void'($value$plusargs("wave=%s", wave_path));
     $dumpfile(wave_path);

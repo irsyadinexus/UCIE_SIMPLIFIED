@@ -170,7 +170,11 @@ package ucie_pkg;
   //   cycles = T_ns * LCLK_HZ / 1_000_000_000
   // At lclk = 500 MHz (period 2 ns), 4 ms = 2,000,000 cycles and
   // 8 ms = 4,000,000 cycles.
-  localparam int unsigned C_RESET_MIN = int'(longint'(T_RESET_MIN_NS) * LCLK_HZ / 32'd1_000_000_000);
+  // FAST_SIM parameter reduces physical layer RESET dwell from 4 ms to 40 us
+  // (20,000 cycles at 500 MHz). All other timers remain strictly true to spec.
+  localparam int unsigned T_RESET_MIN_FAST_NS = 32'd40_000;    // 40 us (FAST_SIM)
+  localparam int unsigned C_RESET_MIN      = int'(longint'(T_RESET_MIN_NS) * LCLK_HZ / 32'd1_000_000_000);
+  localparam int unsigned C_RESET_MIN_FAST = int'(longint'(T_RESET_MIN_FAST_NS) * LCLK_HZ / 32'd1_000_000_000);
   localparam int unsigned C_RESIDENCY = int'(longint'(T_RESIDENCY_NS) * LCLK_HZ / 32'd1_000_000_000);
   localparam int unsigned C_SB_MSG    = int'(longint'(T_SB_MSG_NS)    * LCLK_HZ / 32'd1_000_000_000);
   localparam int unsigned C_STALL     = int'(longint'(T_STALL_NS)     * LCLK_HZ / 32'd1_000_000_000);

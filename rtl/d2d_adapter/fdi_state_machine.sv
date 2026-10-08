@@ -369,10 +369,11 @@ module fdi_state_machine (
       F_RESET: begin
         // RDI reports Active, the Protocol Layer answers with
         // lp_rx_active_sts, then FDI reports Active.
-        if (rdi_state_sts == RDI_STS_LINKERROR)  fdi_d = F_LINKERROR;
-        else if (rdi_state_sts == RDI_STS_DISABLED) fdi_d = F_DISABLED;
+        if (rdi_state_sts == RDI_STS_LINKERROR)       fdi_d = F_LINKERROR;
+        else if (rdi_state_sts == RDI_STS_LINKRESET)  fdi_d = F_LINKRESET;
+        else if (rdi_state_sts == RDI_STS_DISABLED)   fdi_d = F_DISABLED;
         else if (rdi_state_sts == RDI_STS_ACTIVE && lp_rx_active_sts && adapter_stage3_ready)
-                                               fdi_d = F_ACTIVE;
+                                                      fdi_d = F_ACTIVE;
         else                                    fdi_d = F_RESET;
       end
       F_ACTIVE: begin
@@ -404,13 +405,13 @@ module fdi_state_machine (
         else                                         fdi_d = fdi_q;
       end
       F_LINKERROR: begin
-        // LinkError exits only through Reset, per spec 8.1.5 Exit-Link-Error.
+        // LinkError exits only through Reset, per spec Figure 111, Figure 119, and 8.3.2.7.
         if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
-        else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
         else                                         fdi_d = fdi_q;
       end
       F_DISABLED: begin
-        if (rdi_state_sts == RDI_STS_RESET)          fdi_d = F_RESET;
+        if (rdi_state_sts == RDI_STS_LINKERROR)      fdi_d = F_LINKERROR;
+        else if (rdi_state_sts == RDI_STS_RESET)     fdi_d = F_RESET;
         else if (rdi_state_sts == RDI_STS_LINKRESET) fdi_d = F_LINKRESET;
         else                                         fdi_d = fdi_q;
       end

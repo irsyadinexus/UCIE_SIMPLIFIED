@@ -253,6 +253,9 @@ module ut_ltsm_policy;
   localparam int          C_DEADLINE      = 20000;
   localparam int          C_DEADLINE_LONG = 200000;
 
+  logic le_tmr_start;
+  logic le_tmr_expired;
+
   // =========================================================================
   // DUT Instantiation
   // =========================================================================
@@ -295,7 +298,7 @@ module ut_ltsm_policy;
     .pat_lfsr_enable(pat_lfsr_enable), .pat_done(pat_done),
     .tmr_start(tmr_start), .tmr_run(tmr_run),
     .rst_tmr_start(rst_tmr_start), .tmr_expired(tmr_expired),
-    .rst_tmr_expired(rst_tmr_expired)
+    .rst_tmr_expired(rst_tmr_expired), .le_tmr_start(le_tmr_start), .le_tmr_expired(le_tmr_expired)
   );
 
   // The local request is accepted only when the mailbox accepts the send.
@@ -334,6 +337,13 @@ module ut_ltsm_policy;
   ucie_timer #(.LIMIT_CYCLES(C_RESIDENCY)) u_tmr (
     .clk(lclk), .reset_n(lreset_n), .start(tmr_start),
     .running(tmr_run), .expired(tmr_expired)
+  );
+
+  // Short limit for policy test: does not re-verify the full 8 ms countdown (verified in ut_ltsm.sv)
+  localparam int unsigned C_LE_FAST = 40;
+  ucie_timer #(.LIMIT_CYCLES(C_LE_FAST)) u_le_tmr (
+    .clk(lclk), .reset_n(lreset_n), .start(le_tmr_start),
+    .running(ltsm_state == ucie_pkg::LT_TRAINERROR), .expired(le_tmr_expired)
   );
 
   // =========================================================================
@@ -664,6 +674,7 @@ module ut_ltsm_policy;
   task expect_fatal;
     begin
       await_tx_code(MC_TE_REQ);
+      adapter_active_req = 1'b0;
       if ((cap_code == MC_TE_REQ) && (cap_sub == MS_TE_ENTRY))
         drive_nodata(MC_TE_RSP, MS_TE_ENTRY);
       fork
@@ -1249,6 +1260,7 @@ module ut_ltsm_policy;
       drive_rx(bad_opcode, bad_srcid, bad_dstid, bad_msginfo,
                bad_msgcode, bad_msgsubcode, bad_payload, bad_cp, bad_dp);
       await_tx_code(MC_TE_REQ);
+      adapter_active_req = 1'b0;
       @(posedge tmr_expired);
       @(posedge lclk);
       #0.1;
@@ -1257,25 +1269,16 @@ module ut_ltsm_policy;
         errs = errs + 1;
       end
 
-      // A Start pulse during TRAINERROR is stale and must not trigger recovery.
+      // Recovery per Section 8.3.2.7 & Figure 126:
+      // Start / Active triggers exit from TRAINERROR to RESET once residency dwell is satisfied.
       @(negedge lclk);
       start_link_train = 1'b1;
       @(posedge lclk);
       @(negedge lclk);
       start_link_train = 1'b0;
-
-      // LinkReset is the only supported TRAINERROR recovery request.
-      rdi_linkreset_req = 1'b1;
-      await_tx_code(MC_LM_RDI_REQ);
-      if (cap_sub != MS_LM_LINKRESET) begin
-        $display("FAIL recovery: missing LinkReset request");
-        errs = errs + 1;
-      end
-      drive_nodata(MC_LM_RDI_RSP, MS_LM_LINKRESET);
-      rdi_linkreset_req = 1'b0;
       wait_state_bounded(LT_RESET, C_DEADLINE);
       if (ltsm_state != LT_RESET || train_error) begin
-        $display("FAIL recovery: LinkReset did not enter RESET");
+        $display("FAIL recovery: Start did not enter RESET");
         errs = errs + 1;
       end
 
@@ -1421,16 +1424,11 @@ module ut_ltsm_policy;
         $display("  PASS: framing-fault event entered TRAINERROR");
       end
 
-      // The cleared one-lclk event must not block the approved recovery.
+      // The cleared one-lclk event must not block the approved recovery per Figure 126 / Section 8.3.2.7.
+      // TRAINERROR exits directly to RESET without a LinkReset sideband exchange.
       rdi_linkreset_req = 1'b1;
-      await_tx_code(MC_LM_RDI_REQ);
-      if (cap_sub != MS_LM_LINKRESET) begin
-        $display("FAIL framing_fault: missing LinkReset request");
-        errs = errs + 1;
-      end
-      drive_nodata(MC_LM_RDI_RSP, MS_LM_LINKRESET);
-      rdi_linkreset_req = 1'b0;
       wait_state_bounded(LT_RESET, C_DEADLINE);
+      rdi_linkreset_req = 1'b0;
       if (ltsm_state != LT_RESET) begin
         $display("FAIL framing_fault: LinkReset did not enter RESET");
         errs = errs + 1;
@@ -1463,6 +1461,101 @@ module ut_ltsm_policy;
   endtask
 
   // =========================================================================
+  // Scenario 10: LinkError Minimum Residency Dwell Gate (Spec Section 8.3.2.7)
+  // =========================================================================
+  // Proves that entering LT_TRAINERROR without a successful sideband exchange
+  // (e.g. SBINIT timeout) enforces the residency timer before allowing recovery.
+  // 1. Recovery attempts while linkerror_dwell_satisfied == 0 are blocked.
+  // 2. Unsolicited TE_RSP while held is rejected and does not satisfy dwell.
+  // 3. Expiry of le_tmr satisfies dwell and allows direct transition to RESET.
+  task test_linkerror_dwell;
+    int errs;
+    begin
+      errs = 0;
+      $display("--- Scenario 10: LinkError Minimum Residency Dwell Gate ---");
+
+      // Reset DUT and initialize signals
+      rdi_linkreset_req   = 1'b0;
+      rdi_disabled_req    = 1'b0;
+      framing_fault_event = 1'b0;
+      start_link_train    = 1'b0;
+      adapter_active_req  = 1'b0;
+      lreset_n = 1'b0;
+      repeat (5) @(posedge lclk);
+      lreset_n = 1'b1;
+      repeat (5) @(posedge lclk);
+      while (!rst_tmr_expired) @(posedge lclk);
+
+      // Start link training into SBINIT
+      @(negedge lclk);
+      start_link_train = 1'b1;
+      @(posedge lclk);
+      @(negedge lclk);
+      start_link_train = 1'b0;
+      wait_state_bounded(LT_SBINIT, C_DEADLINE);
+
+      // Allow SBINIT residency timer (8 ms) to expire.
+      // This enters LT_TRAINERROR directly without sideband exchange.
+      @(posedge tmr_expired);
+      @(posedge lclk);
+      #0.1;
+      if (ltsm_state != LT_TRAINERROR || !train_error) begin
+        $display("FAIL dwell: SBINIT timeout did not enter TRAINERROR");
+        errs = errs + 1;
+      end
+
+      // (a) Attempt recovery before le_tmr expiry (must hold TRAINERROR)
+      @(negedge lclk);
+      start_link_train   = 1'b1;
+      adapter_active_req = 1'b1;
+      repeat (10) @(posedge lclk);
+      #0.1;
+      if (ltsm_state != LT_TRAINERROR || !train_error) begin
+        $display("FAIL dwell: exited TRAINERROR before le_tmr expiry");
+        errs = errs + 1;
+      end else begin
+        $display("  PASS: recovery blocked while linkerror_dwell_satisfied == 0");
+      end
+
+      // (b) Unsolicited LinkError response must not satisfy dwell while held
+      @(negedge lclk);
+      drive_nodata(MC_TE_RSP, 8'h00);
+      repeat (5) @(posedge lclk);
+      #0.1;
+      if (ltsm_state != LT_TRAINERROR || !train_error || u_dut.sb_linkerror_ack_q) begin
+        $display("FAIL dwell: unsolicited TE_RSP satisfied dwell or triggered exit");
+        errs = errs + 1;
+      end else begin
+        $display("  PASS: unsolicited TE_RSP rejected and does not satisfy dwell");
+      end
+
+      // (c) Wait for le_tmr_expired
+      @(posedge le_tmr_expired);
+      @(posedge lclk);
+      #0.1;
+
+      // Now recovery trigger must transition directly to RESET
+      @(negedge lclk);
+      start_link_train   = 1'b1;
+      @(posedge lclk);
+      @(negedge lclk);
+      start_link_train   = 1'b0;
+      adapter_active_req = 1'b0;
+      wait_state_bounded(LT_RESET, C_DEADLINE);
+      if (ltsm_state != LT_RESET || train_error) begin
+        $display("FAIL dwell: recovery did not enter RESET after le_tmr expiry");
+        errs = errs + 1;
+      end else begin
+        $display("  PASS: le_tmr expiry satisfied dwell and triggered direct exit to RESET");
+      end
+
+      total_errors = total_errors + errs;
+      if (errs == 0)
+        $display("  PASS: LinkError residency dwell gating verified");
+    end
+  endtask
+
+  // =========================================================================
   // Main test sequence
   // =========================================================================
   initial begin
@@ -1480,6 +1573,7 @@ module ut_ltsm_policy;
     test_linkspeed_outcomes();
     test_recovery_policy();
     test_framing_fault();
+    test_linkerror_dwell();
 
     // Phase F: export unit evidence JSON upon clean zero-error completion.
     // Spec ref: UCIe 1.0 Section 4.5.3, Section 4.5.3.8, Table 56, and

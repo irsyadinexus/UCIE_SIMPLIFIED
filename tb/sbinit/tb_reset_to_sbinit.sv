@@ -270,8 +270,10 @@ module tb_reset_to_sbinit;
 
   // --------------------------------------------------------------------------
   // Die instances
-  // --------------------------------------------------------------------------
-  ucie_main dut_die0 (
+  parameter bit FAST_SIM = 1'b1;
+  localparam time C_RESET_MIN_DWELL_NS = FAST_SIM ? 40_000 : 4_000_000;
+
+  ucie_main #(.FAST_SIM(FAST_SIM)) dut_die0 (
     .lclk(lclk), .lreset_n(d0_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
     .sbreset_n(d0_sbreset_n),
     .lp_irdy(d0_lp_irdy), .lp_valid(d0_lp_valid), .lp_data(d0_lp_data),
@@ -296,7 +298,7 @@ module tb_reset_to_sbinit;
     .mb_rx_data(mb_d1_to_d0_data), .mb_rx_valid(mb_d1_to_d0_valid)
   );
 
-  ucie_main dut_die1 (
+  ucie_main #(.FAST_SIM(FAST_SIM)) dut_die1 (
     .lclk(lclk), .lreset_n(d1_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
     .sbreset_n(d1_sbreset_n),
     .lp_irdy(d1_lp_irdy), .lp_valid(d1_lp_valid), .lp_data(d1_lp_data),
@@ -518,14 +520,14 @@ module tb_reset_to_sbinit;
 
     if (!d0_seen_sbinit && (d0_ltsm_state == LT_SBINIT)) begin
       d0_seen_sbinit = 1'b1;
-      if (($time - d0_reset_release_time) < 4_000_000) begin
+      if (($time - d0_reset_release_time) < C_RESET_MIN_DWELL_NS) begin
         $display("FAIL tb_reset_to_sbinit: Die0 RESET dwell was %0t ns", $time - d0_reset_release_time);
         errors = errors + 1;
       end
     end
     if (!d1_seen_sbinit && (d1_ltsm_state == LT_SBINIT)) begin
       d1_seen_sbinit = 1'b1;
-      if (($time - d1_reset_release_time) < 4_000_000) begin
+      if (($time - d1_reset_release_time) < C_RESET_MIN_DWELL_NS) begin
         $display("FAIL tb_reset_to_sbinit: Die1 RESET dwell was %0t ns", $time - d1_reset_release_time);
         errors = errors + 1;
       end

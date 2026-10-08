@@ -140,6 +140,8 @@ module rdi_state_machine (
   input  logic        phy_active_entry_done, // LTSM completed Active Entry
   input  logic        phy_link_reset,        // physical RESET event
   input  logic        phy_retrain_req,       // PHYRETRAIN requested by adapter
+  input  logic        phy_linkreset_req = 1'b0, // LinkReset exchange in progress
+  input  logic        phy_disabled_req  = 1'b0, // Disabled exchange in progress
   input  logic        phy_train_error,       // unrecoverable training failure
   input  logic        phy_inband_pres,       // LTSM training complete
   input  logic        cerror,                // correctable error
@@ -220,23 +222,27 @@ module rdi_state_machine (
       reset_req_sampled_d = 1'b1;
     end
 
-    if (phy_train_error) begin
-      state_d = RDI_STS_LINKERROR;
-    end else if (phy_link_reset) begin
+    if (phy_link_reset) begin
       state_d = RDI_STS_RESET;
-    end else if ((state_q == RDI_STS_LINKERROR) &&
-                 (rdi_lp_state_req == RDI_REQ_LINKRESET)) begin
+    end else if (state_q == RDI_STS_LINKRESET && phy_linkreset_req) begin
       state_d = RDI_STS_LINKRESET;
+    end else if (phy_train_error) begin
+      state_d = RDI_STS_LINKERROR;
     end else if (rdi_lp_linkerror && (state_q != RDI_STS_LINKRESET)) begin
       state_d = RDI_STS_LINKERROR;
     end else begin
       case (state_q)
         RDI_STS_RESET: begin
+          // Remote sideband LinkReset/Disabled takes effect immediately in RESET (spec 8.3.2.1)
+          if (phy_linkreset_req)
+            state_d = RDI_STS_LINKRESET;
+          else if (phy_disabled_req)
+            state_d = RDI_STS_DISABLED;
           // Adapter must drive a stable request to leave RESET after sampling NOP,
           // and the logical PHY must have completed Active Entry.
-          if (reset_req_sampled_q &&
-              rdi_lp_state_req == RDI_REQ_ACTIVE &&
-              active_entry_complete)
+          else if (reset_req_sampled_q &&
+                   rdi_lp_state_req == RDI_REQ_ACTIVE &&
+                   active_entry_complete)
             state_d = RDI_STS_ACTIVE;
           else if (reset_req_sampled_q &&
                    rdi_lp_state_req == RDI_REQ_DISABLED)
@@ -250,27 +256,35 @@ module rdi_state_machine (
           // L1 and L2 are not supported: the request is answered with PMNAK
           // and the LTSM is not touched. LinkReset and Disabled wait for the
           // integrated four-phase stall handshake to complete.
-          case (rdi_lp_state_req)
-            RDI_REQ_L1,
-            RDI_REQ_L2:        state_d = RDI_STS_PMNAK;
-            RDI_REQ_LINKRESET: if (stall_complete) state_d = RDI_STS_LINKRESET;
-            RDI_REQ_DISABLED:  if (stall_complete) state_d = RDI_STS_DISABLED;
-            default:           state_d = RDI_STS_ACTIVE;
-          endcase
+          if ((rdi_lp_state_req == RDI_REQ_LINKRESET || phy_linkreset_req) && stall_complete) begin
+            state_d = RDI_STS_LINKRESET;
+          end else if ((rdi_lp_state_req == RDI_REQ_DISABLED || phy_disabled_req) && stall_complete) begin
+            state_d = RDI_STS_DISABLED;
+          end else begin
+            case (rdi_lp_state_req)
+              RDI_REQ_L1,
+              RDI_REQ_L2:        state_d = RDI_STS_PMNAK;
+              default:           state_d = RDI_STS_ACTIVE;
+            endcase
+          end
         end
 
         RDI_STS_PMNAK: begin
           // The LTSM never left ACTIVE for L1 or L2, so the adapter can
           // return to ACTIVE as soon as it withdraws the low-power request
           // and the completed Active Entry result still holds.
-          if (rdi_lp_state_req == RDI_REQ_ACTIVE && active_entry_complete)
+          if ((rdi_lp_state_req == RDI_REQ_LINKRESET || phy_linkreset_req) && stall_complete)
+            state_d = RDI_STS_LINKRESET;
+          else if ((rdi_lp_state_req == RDI_REQ_DISABLED || phy_disabled_req) && stall_complete)
+            state_d = RDI_STS_DISABLED;
+          else if (rdi_lp_state_req == RDI_REQ_ACTIVE && active_entry_complete)
             state_d = RDI_STS_ACTIVE;
         end
 
         RDI_STS_LINKERROR: begin
-          // The adapter must request LINKRESET to recover.
-          if (rdi_lp_state_req == RDI_REQ_LINKRESET)
-            state_d = RDI_STS_LINKRESET;
+          // Per Figure 111 and Section 8.3.2.7: LinkError exits directly to Reset.
+          // LinkReset cannot be entered from LinkError. State remains in LINKERROR
+          // until phy_link_reset (LTSM RESET entry) transitions state_d to RDI_STS_RESET.
         end
 
         // LINKRESET and DISABLED stay visible until the LTSM reports RESET.

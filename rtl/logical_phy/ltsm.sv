@@ -319,6 +319,9 @@ module ltsm #(
   input  logic        rdi_active_req,       // current local Active request
   input  logic        rdi_linkreset_req,    // current local LinkReset request
   input  logic        rdi_disabled_req,     // current local Disabled request
+  input  logic        rdi_linkreset_published = 1'b1, // RDI has published LINKRESET (or TRAINERROR)
+  input  logic        rdi_disabled_published  = 1'b1, // RDI has published DISABLED
+  input  logic        rdi_lp_linkerror        = 1'b0, // RDI lp_linkerror input from Adapter/Protocol
   output logic        active_entry_done,    // completed Active Entry result
   output logic        transition_active,    // private transition in progress
   output logic        clear_start_link_train, // one-cycle Start-copy clear
@@ -326,6 +329,8 @@ module ltsm #(
   output logic        phy_training_done,    // physical training reached LINKINIT
   output logic        train_error,          // unrecoverable failure
   output logic        link_reset_out,       // drives RDI RESET indication
+  output logic        phy_linkreset_req,    // LinkReset exchange in progress (local or remote)
+  output logic        phy_disabled_req,     // Disabled exchange in progress (local or remote)
   output logic        phy_retrain_done,     // fixed profile never retrains
   output logic [7:0]  ltsm_state,           // Error Log 0 "State N"
   output logic        lnk_is_x8,            // negotiated x8 degrade
@@ -382,7 +387,9 @@ module ltsm #(
   output logic        tmr_run,
   output logic        rst_tmr_start,
   input  logic        tmr_expired,
-  input  logic        rst_tmr_expired
+  input  logic        rst_tmr_expired,
+  output logic        le_tmr_start,
+  input  logic        le_tmr_expired = 1'b0
 );
 
   // =========================================================================
@@ -468,6 +475,9 @@ module ltsm #(
   logic trainerror_req_accepted_q, trainerror_req_accepted_d;
   logic trainerror_rsp_received_q, trainerror_rsp_received_d;
   logic trainerror_peer_rsp_pending_q, trainerror_peer_rsp_pending_d;
+  logic sb_linkerror_ack_q, sb_linkerror_ack_d;
+  logic linkerror_min_done_q, linkerror_min_done_d;
+  logic trainerror_exchange_timeout_q, trainerror_exchange_timeout_d;
 
   // -------------------------------------------------------------------------
   // State and policy register bank
@@ -522,6 +532,9 @@ module ltsm #(
       trainerror_req_accepted_q       <= 1'b0;
       trainerror_rsp_received_q       <= 1'b0;
       trainerror_peer_rsp_pending_q   <= 1'b0;
+      sb_linkerror_ack_q              <= 1'b0;
+      linkerror_min_done_q            <= 1'b0;
+      trainerror_exchange_timeout_q   <= 1'b0;
     end else begin
       state_q                         <= state_d;
       sbinit_phase_q                  <= sbinit_phase_d;
@@ -565,6 +578,9 @@ module ltsm #(
       trainerror_req_accepted_q       <= trainerror_req_accepted_d;
       trainerror_rsp_received_q       <= trainerror_rsp_received_d;
       trainerror_peer_rsp_pending_q   <= trainerror_peer_rsp_pending_d;
+      sb_linkerror_ack_q              <= sb_linkerror_ack_d;
+      linkerror_min_done_q            <= linkerror_min_done_d;
+      trainerror_exchange_timeout_q   <= trainerror_exchange_timeout_d;
     end
   end
 
@@ -1044,6 +1060,25 @@ module ltsm #(
   wire fatal_trigger_event = local_packet_fatal || rx_linkerror_req ||
                              framing_fault_event;
 
+  // Validated peer LinkError request (TRAINERROR Entry req or LinkMgmt LinkError req)
+  wire peer_linkerror_req_valid = sideband_policy_active &&
+                                  (rx_trainerror_req || rx_linkerror_req);
+  // Valid matching response to our accepted local request
+  wire local_linkerror_rsp_valid = trainerror_rsp_expected && !local_packet_fatal;
+
+  // Dwell satisfaction per Section 8.3.2.7:
+  // Dwell is satisfied if peer acknowledged/requested LinkError, or if
+  // LinkError residency timer expired, or if 8 ms elapsed in PC_TRAINERROR.
+  wire linkerror_dwell_satisfied = sb_linkerror_ack_q ||
+                                   linkerror_min_done_q ||
+                                   le_tmr_expired ||
+                                   trainerror_exchange_timeout_q;
+
+  // Legal recovery triggers per Section 8.3.2.7 and Figure 126
+  wire linkerror_recovery_trigger = (!rdi_lp_linkerror && rdi_active_req) ||
+                                    software_start_event ||
+                                    rdi_linkreset_req;
+
   // =========================================================================
   // Phase C transition triggers and 8 ms timeout classes
   // =========================================================================
@@ -1098,6 +1133,7 @@ module ltsm #(
                                  (phase_c_mode_q != PC_DISABLED) &&
                                  (phase_c_mode_q != PC_TRAINERROR);
   wire linkreset_request_event = sideband_policy_active &&
+                                 (state_q != LT_TRAINERROR) &&
                                  (rdi_linkreset_req ||
                                   (rx_linkreset_req && !rx_linkerror_req &&
                                    !rx_disabled_req));
@@ -1244,6 +1280,7 @@ module ltsm #(
   // UCIe 1.0 Section 8.3.2.8 requires fresh training after recovery.
   // PLAN.md Sections 15.4 and 15.9 Phase C preserve both requirements.
   assign rst_tmr_start = (state_d == LT_RESET) && (state_q != LT_RESET);
+  assign le_tmr_start  = (state_d == LT_TRAINERROR) && (state_q != LT_TRAINERROR);
 
   // The registered running level spans each public residency or private
   // exchange. Completion and terminal timeout clear it without a gap.
@@ -1306,6 +1343,9 @@ module ltsm #(
     trainerror_req_accepted_d        = trainerror_req_accepted_q;
     trainerror_rsp_received_d        = trainerror_rsp_received_q;
     trainerror_peer_rsp_pending_d    = trainerror_peer_rsp_pending_q;
+    sb_linkerror_ack_d               = sb_linkerror_ack_q;
+    linkerror_min_done_d             = linkerror_min_done_q;
+    trainerror_exchange_timeout_d    = trainerror_exchange_timeout_q;
     phase_b_state_complete           = 1'b0;
 
     // Every public state owns fresh state-scoped transaction data. A RESET
@@ -1342,6 +1382,9 @@ module ltsm #(
 
       if (state_q == LT_RESET) begin
         reset_min_done_d             = 1'b0;
+        linkerror_min_done_d         = 1'b0;
+        sb_linkerror_ack_d           = 1'b0;
+        trainerror_exchange_timeout_d = 1'b0;
         recovery_reset_d             = 1'b1;
         sbinit_phase_d               = SBI_PATTERN_ACTIVE;
         sbinit_match_streak_d        = 2'd0;
@@ -1435,6 +1478,13 @@ module ltsm #(
       linkreset_rsp_received_d = 1'b1;
     if (trainerror_rsp_expected && !local_packet_fatal)
       trainerror_rsp_received_d = 1'b1;
+
+    if (peer_linkerror_req_valid || local_linkerror_rsp_valid)
+      sb_linkerror_ack_d = 1'b1;
+    if (le_tmr_expired)
+      linkerror_min_done_d = 1'b1;
+    if (trainerror_exchange_timeout)
+      trainerror_exchange_timeout_d = 1'b1;
 
     // Phase B retains a current peer response or one exact duplicate replay
     // even while Phase C blocks normal transaction advancement.
@@ -1716,7 +1766,13 @@ module ltsm #(
 
       // TRAINERROR holds until a LinkReset request starts and completes the
       // supported recovery exchange. Start and Active events cannot exit it.
-      LT_TRAINERROR: state_d = state_q;
+      LT_TRAINERROR: begin
+        if (linkerror_dwell_satisfied && linkerror_recovery_trigger &&
+            !trainerror_peer_rsp_pending_d && !sb_tx_busy && !sb_tx_load)
+          state_d = LT_RESET;
+        else
+          state_d = state_q;
+      end
 
       default: state_d = LT_RESET;
     endcase
@@ -1747,7 +1803,9 @@ module ltsm #(
                      !linkreset_peer_rsp_pending_d &&
                      !disabled_peer_rsp_pending_d &&
                      !trainerror_peer_rsp_pending_d &&
-                     !phase_c_response_accept) begin
+                     !phase_c_response_accept &&
+                     !sb_tx_busy && !sb_tx_load &&
+                     rdi_linkreset_published) begin
           state_d        = LT_RESET;
           phase_c_mode_d = PC_NONE;
           timer_start_d  = 1'b0;
@@ -1763,7 +1821,9 @@ module ltsm #(
             !linkreset_peer_rsp_pending_d &&
             !disabled_peer_rsp_pending_d &&
             !trainerror_peer_rsp_pending_d &&
-            !phase_c_response_accept) begin
+            !phase_c_response_accept &&
+            !sb_tx_busy && !sb_tx_load &&
+            rdi_disabled_published) begin
           state_d        = LT_RESET;
           phase_c_mode_d = PC_NONE;
           timer_start_d  = 1'b0;
@@ -1784,7 +1844,8 @@ module ltsm #(
                      !linkreset_peer_rsp_pending_d &&
                      !disabled_peer_rsp_pending_d &&
                      !trainerror_peer_rsp_pending_d &&
-                     !phase_c_response_accept) begin
+                     !phase_c_response_accept &&
+                     !sb_tx_busy && !sb_tx_load) begin
           state_d        = LT_TRAINERROR;
           phase_c_mode_d = PC_NONE;
           timer_start_d  = 1'b0;
@@ -1795,7 +1856,8 @@ module ltsm #(
                      !linkreset_peer_rsp_pending_d &&
                      !disabled_peer_rsp_pending_d &&
                      !trainerror_peer_rsp_pending_d &&
-                     !phase_c_response_accept) begin
+                     !phase_c_response_accept &&
+                     !sb_tx_busy && !sb_tx_load) begin
           state_d        = LT_TRAINERROR;
           phase_c_mode_d = PC_NONE;
           timer_start_d  = 1'b0;
@@ -2055,15 +2117,15 @@ module ltsm #(
   // UCIe 1.0 Section 4.5.3.8 defines TRAINERROR behavior.
   // UCIe 1.0 Section 8.3.2.7 defines LinkError recovery constraints.
   // PLAN.md Sections 15.4 and 15.9 require LinkReset-only recovery.
-  assign train_error = (state_q == LT_TRAINERROR);
+  assign train_error = (state_q == LT_TRAINERROR) || (phase_c_mode_q == PC_TRAINERROR);
 
   // link_reset_out identifies the public RESET state after transition work.
   // LinkReset and Disabled private exchanges do not assert it prematurely.
   // UCIe 1.0 Section 4.5.3.1 defines the RESET state and dwell.
   // UCIe 1.0 Section 8.3.2.8 defines transition handshake completion.
-  // PLAN.md Section 15.9 Phase C requires RESET after exchange completion.
-  assign link_reset_out = (state_q == LT_RESET);
-
+  assign link_reset_out     = (state_q == LT_RESET);
+  assign phy_linkreset_req  = (phase_c_mode_q == PC_LINKRESET);
+  assign phy_disabled_req   = (phase_c_mode_q == PC_DISABLED);
   // Runtime PHYRETRAIN is outside the fixed profile and never completes.
   // The retained public compatibility output therefore remains inactive.
   // UCIe 1.0 Section 4.5.3.7 defines PHYRETRAIN.

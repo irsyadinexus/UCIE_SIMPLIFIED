@@ -21,8 +21,7 @@
 //   The primary state-walk sequence is:
 //
 //       RESET -> ACTIVE -> PMNAK -> RESET -> ACTIVE -> LINKRESET -> RESET ->
-//       LINKERROR -> LINKRESET -> RESET -> ACTIVE -> DISABLED -> RESET
-//
+//       LINKERROR -> RESET -> ACTIVE -> DISABLED -> RESET
 //   In addition to the state walk, the test verifies:
 //
 //     1. Four-way Active-entry handshake (spec 8.2.6):
@@ -414,7 +413,6 @@ module ut_fdi_sm;
       errors = errors + 1;
     end
     rdi_trainerror = 1'b0;
-    step_to("linkreset2", RDI_STS_LINKRESET, 4'h9);
     step_to("reset2", RDI_STS_RESET, 4'h0);
 
     // Retrain is unsupported: the FDI holds Active and keeps forwarding the
@@ -436,6 +434,7 @@ module ut_fdi_sm;
 
     // DISABLED only leaves through Reset or LinkReset.
     step_to("disabled", RDI_STS_DISABLED, 4'hC);
+    step_to("disabled to linkerror", RDI_STS_LINKERROR, 4'hA);
     step_to("reset3", RDI_STS_RESET, 4'h0);
 
     // Re-enter Active: in-band presence is sticky until a state clears it.

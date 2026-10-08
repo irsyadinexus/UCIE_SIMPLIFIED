@@ -1,6 +1,7 @@
 # Icarus Verilog build output (regenerable: make -C sim all)
 sim/out/
 sim/logs/
+sim/bin/
 
 # Editor and OS noise
 *.swp

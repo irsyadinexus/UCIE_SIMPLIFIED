@@ -211,8 +211,9 @@ import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module logical_phy #(
-  parameter int unsigned NBYTES = ucie_pkg::NBYTES,
-  parameter int unsigned NLANES = NLANES_MAX
+  parameter int unsigned NBYTES   = ucie_pkg::NBYTES,
+  parameter int unsigned NLANES   = NLANES_MAX,
+  parameter bit          FAST_SIM = 1'b1
 ) (
   input  logic        lclk,
   input  logic        lreset_n,
@@ -465,6 +466,8 @@ module logical_phy #(
   logic        tmr_expired;
   logic        rst_tmr_start;
   logic        rst_tmr_expired;
+  logic        le_tmr_start;
+  logic        le_tmr_expired;
   // ------------------------------------------------- LTSM <-> Start / RDI
   logic        csr_start_link_train;
   logic        ltsm_software_start_q;
@@ -477,6 +480,8 @@ module logical_phy #(
   logic        train_error;
   logic        link_reset_out;
   logic        phy_retrain_done;
+  logic        ltsm_phy_linkreset_req;
+  logic        ltsm_phy_disabled_req;
   logic [7:0]  ltsm_state;
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
@@ -1005,6 +1010,10 @@ module logical_phy #(
     .rdi_active_req  (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE),
     .rdi_linkreset_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_LINKRESET),
     .rdi_disabled_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_DISABLED),
+    .rdi_linkreset_published((rdi_pl_state_sts == ucie_pkg::RDI_STS_LINKRESET) ||
+                             (ltsm_state == ucie_pkg::LT_TRAINERROR)),
+    .rdi_disabled_published ((rdi_pl_state_sts == ucie_pkg::RDI_STS_DISABLED)),
+    .rdi_lp_linkerror(rdi_lp_linkerror),
     .framing_fault_event(ltsm_framing_fault_event),
     .transition_active(ltsm_transition_active),
     .active_entry_done(ltsm_active_entry_done),
@@ -1013,6 +1022,8 @@ module logical_phy #(
     .phy_training_done(phy_training_done),
     .train_error     (train_error),
     .link_reset_out  (link_reset_out),
+    .phy_linkreset_req(ltsm_phy_linkreset_req),
+    .phy_disabled_req(ltsm_phy_disabled_req),
     .phy_retrain_done(phy_retrain_done),
     .ltsm_state      (ltsm_state),
     .lnk_is_x8       (lnk_is_x8),
@@ -1059,7 +1070,9 @@ module logical_phy #(
     .tmr_run         (tmr_run),
     .rst_tmr_start   (rst_tmr_start),
     .tmr_expired     (tmr_expired),
-    .rst_tmr_expired (rst_tmr_expired)
+    .rst_tmr_expired (rst_tmr_expired),
+    .le_tmr_start    (le_tmr_start),
+    .le_tmr_expired  (le_tmr_expired)
   );
   // ---------------------------------------------------------------------------
   // 8 ms Residency Timer Instantiation  (u_resid_timer)
@@ -1087,11 +1100,19 @@ module logical_phy #(
   // Spec reference : 4.5.3.1 – Physical Layer must stay in RESET for a
   //                  minimum of 4 ms upon every entry to RESET. The separate
   //                  rst_tmr_start pulse prevents later state entries from
-  //                  restarting this RESET-epoch timer.
-  // ucie_timer is parameterised with C_RESET_MIN = 2_000_000 lclk cycles
-  // (4 ms at 500 MHz).
   // ---------------------------------------------------------------------------
-  ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN)) u_reset_timer (
+  // 4 ms RESET Minimum Timer Instantiation (u_reset_timer)
+  // ---------------------------------------------------------------------------
+  // Spec reference : 4.5.3.1 – Physical Layer must stay in RESET for a
+  //                  minimum of 4 ms upon every entry to RESET.
+  // When FAST_SIM=1 (default for simulation), dwell is reduced to 40 us
+  // (20,000 lclk cycles at 500 MHz) for fast simulation turnaround.
+  // When FAST_SIM=0, runs true to spec (4 ms = 2,000,000 lclk cycles).
+  // All other timers (Residency, SB Message, Stall) remain strictly true to spec.
+  // ---------------------------------------------------------------------------
+  localparam int unsigned C_RESET_MIN_VAL = FAST_SIM ? C_RESET_MIN_FAST : C_RESET_MIN;
+
+  ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN_VAL)) u_reset_timer (
     .clk      (lclk),
     .reset_n  (lreset_n),
     .start    (rst_tmr_start),
@@ -1099,6 +1120,19 @@ module logical_phy #(
     .expired  (rst_tmr_expired)
   );
 
+  // ---------------------------------------------------------------------------
+  // LinkError Minimum Residency Timer (UCIe 1.0 Section 8.3.2.7)
+  // ---------------------------------------------------------------------------
+  // Strict 8 ms residency timer (C_RESIDENCY = 4,000,000 lclk cycles at 500 MHz),
+  // enforcing the dead-sideband fallback dwell time.
+  // ---------------------------------------------------------------------------
+  ucie_timer #(.LIMIT_CYCLES(C_RESIDENCY)) u_linkerror_timer (
+    .clk      (lclk),
+    .reset_n  (lreset_n),
+    .start    (le_tmr_start),
+    .running  (ltsm_state == ucie_pkg::LT_TRAINERROR),
+    .expired  (le_tmr_expired)
+  );
   // ---------------------------------------------------------------------------
   // RDI Link State Machine Instantiation  (u_rdi_sm)
   // ---------------------------------------------------------------------------
@@ -1139,6 +1173,8 @@ module logical_phy #(
     .phy_active_entry_done(ltsm_active_entry_done),
     .phy_link_reset  (link_reset_out),
     .phy_retrain_req (rdi_lp_state_req == ucie_pkg::RDI_REQ_RETRAIN),
+    .phy_linkreset_req(ltsm_phy_linkreset_req),
+    .phy_disabled_req(ltsm_phy_disabled_req),
     .phy_train_error (train_error),
     .phy_inband_pres (phy_training_done),
     .cerror          (1'b0),
@@ -1278,9 +1314,11 @@ module logical_phy #(
   // -------------------------------------------------------------------------
   always_comb begin
     rdi_stall_req_d = rdi_stall_req_q;
-    if ((rdi_pl_state_sts != RDI_STS_ACTIVE) ||
+    if (((rdi_pl_state_sts != RDI_STS_ACTIVE) && (rdi_pl_state_sts != RDI_STS_PMNAK)) ||
         ((rdi_lp_state_req != RDI_REQ_LINKRESET) &&
-         (rdi_lp_state_req != RDI_REQ_DISABLED))) begin
+         (rdi_lp_state_req != RDI_REQ_DISABLED) &&
+         !ltsm_phy_linkreset_req &&
+         !ltsm_phy_disabled_req)) begin
       rdi_stall_req_d = 1'b0;
     end else if (rdi_lp_stallack || rdi_stall_ack) begin
       rdi_stall_req_d = 1'b0;
@@ -1638,20 +1676,26 @@ module logical_phy #(
   end
 
   // ---------------------------------------------------------------------------
-  // assign: Private LTSM framing-fault event
+  // assign: Private LTSM fatal / framing-fault event
   //
   // An edge reaches the existing fatal policy immediately when armed. A
   // retained edge produces one pulse on the first armed epoch cycle. The
   // event remains private and one-cycle shaped, so fatal recovery keeps its
   // existing TRAINERROR Entry and LinkReset policy.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
+  // Spec ref: UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2;
   //           PLAN.md Sections 15.6 and 15.9 Phase E.
   // ---------------------------------------------------------------------------
-  assign ltsm_framing_fault_event = ((rx_framing_fault_rise || codec_rx_overflow_rise) &&
+  logic rdi_lp_linkerror_q;
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) rdi_lp_linkerror_q <= 1'b0;
+    else           rdi_lp_linkerror_q <= rdi_lp_linkerror;
+  end
+  wire rdi_lp_linkerror_rise = rdi_lp_linkerror && !rdi_lp_linkerror_q;
+
+  assign ltsm_framing_fault_event = ((rx_framing_fault_rise || codec_rx_overflow_rise || rdi_lp_linkerror_rise) &&
                                      ltsm_fatal_policy_armed) ||
                                     rx_framing_fault_pending_q;
-
   // ---------------------------------------------------------------------------
   // Main-Band 4 GT/s DDR Gearboxes (spec 4.1.1 and 5.2)
   // ---------------------------------------------------------------------------

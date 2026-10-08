@@ -206,6 +206,7 @@ module ut_ltsm;
   logic        sbinit_tx_iter_done, sbinit_tx_idle;
   logic        pat_enable, pat_lfsr_reset, pat_lfsr_enable, pat_done;
   logic        tmr_start, tmr_run, rst_tmr_start, tmr_expired;
+  logic        le_tmr_start, le_tmr_expired_tb;
   int          errors;
 
   // LTSM <-> local codec
@@ -353,7 +354,7 @@ module ut_ltsm;
     .pat_lfsr_enable(pat_lfsr_enable), .pat_done(pat_done),
     .tmr_start(tmr_start), .tmr_run(tmr_run),
     .rst_tmr_start(rst_tmr_start), .tmr_expired(tmr_expired),
-    .rst_tmr_expired(rst_tmr_expired)
+    .rst_tmr_expired(rst_tmr_expired), .le_tmr_start(le_tmr_start), .le_tmr_expired(le_tmr_expired_tb)
   );
 // ---------------------------------------------------------------------------
 // LTSM-to-codec CDC and Local Sideband Codec
@@ -816,6 +817,7 @@ module ut_ltsm;
     inject_rx_cp_err     = 1'b0;
     inject_rx_dp_err     = 1'b0;
     par_enable_resp      = 1'b0;
+    le_tmr_expired_tb    = 1'b0;
     #5;
     lreset_n           = 1'b1;
     sbreset_n          = 1'b1;
@@ -1089,6 +1091,68 @@ module ut_ltsm;
       errors = errors + 1;
     end else begin
       $display("PASS ut_ltsm: sideband timeout strictly verified for full 8 ms (cycle-exact %0d)", C_RESIDENCY);
+    end
+    // -------------------------------------------------------------------------
+    // UCIe 1.0 Section 8.3.2.7: LinkError Minimum Residency & Recovery
+    // -------------------------------------------------------------------------
+    // Following SBINIT timeout, LTSM is in LT_TRAINERROR with linkerror_dwell_satisfied = 0.
+    // Spec mandates 8 ms residency when sideband is non-functional.
+
+    // (a) Attempt recovery before le_tmr expiry (must hold TRAINERROR)
+    @(negedge lclk);
+    start_link_train   = 1'b1;
+    adapter_active_req = 1'b1;
+    repeat (10) @(posedge lclk);
+    #0.1;
+    if (ltsm_state !== LT_TRAINERROR || !train_error) begin
+      $display("FAIL ut_ltsm: prematurely exited TRAINERROR before le_tmr expiry (state %02h)", ltsm_state);
+      errors = errors + 1;
+    end else begin
+      $display("PASS ut_ltsm: recovery strictly blocked while linkerror_dwell_satisfied == 0");
+    end
+
+    // (b) Unsolicited LinkError response must not satisfy dwell while held
+    @(negedge lclk);
+    inject_rx_opcode     = SB_OP_MSG_NODATA;
+    inject_rx_srcid      = 3'b110;
+    inject_rx_dstid      = 3'b010;
+    inject_rx_msginfo    = 16'h0000;
+    inject_rx_msgcode    = MC_TE_RSP;
+    inject_rx_msgsubcode = 8'h00;
+    inject_rx_cp_err     = 1'b0;
+    inject_rx_dp_err     = 1'b0;
+    inject_rx_pkt_vld    = 1'b1;
+    @(posedge lclk);
+    #0.1;
+    @(negedge lclk);
+    inject_rx_pkt_vld    = 1'b0;
+    repeat (5) @(posedge lclk);
+    #0.1;
+    if (ltsm_state !== LT_TRAINERROR || !train_error || u_dut.sb_linkerror_ack_q !== 1'b0) begin
+      $display("FAIL ut_ltsm: unsolicited TE_RSP satisfied dwell or triggered exit (state %02h, ack %b)",
+               ltsm_state, u_dut.sb_linkerror_ack_q);
+      errors = errors + 1;
+    end else begin
+      $display("PASS ut_ltsm: unsolicited TE_RSP rejected and does not satisfy dwell");
+    end
+
+    // (c) After le_tmr expiry, recovery trigger must transition directly to RESET
+    @(negedge lclk);
+    le_tmr_expired_tb  = 1'b1;
+    @(posedge lclk);
+    #0.1;
+    @(negedge lclk);
+    le_tmr_expired_tb  = 1'b0;
+    start_link_train   = 1'b0;
+    adapter_active_req = 1'b0;
+    @(posedge lclk);
+    #0.1;
+    if (ltsm_state !== LT_RESET || train_error !== 1'b0) begin
+      $display("FAIL ut_ltsm: did not transition directly to RESET upon le_tmr expiry (state %02h, te %b)",
+               ltsm_state, train_error);
+      errors = errors + 1;
+    end else begin
+      $display("PASS ut_ltsm: le_tmr expiry satisfied dwell and triggered direct exit to RESET");
     end
     if (errors == 0) $display("TEST PASSED ut_ltsm");
     else             $display("FAIL ut_ltsm: %0d errors", errors);

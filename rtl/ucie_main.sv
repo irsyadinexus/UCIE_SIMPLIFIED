@@ -237,6 +237,7 @@
 //                                           Link DVSEC - Error Notification
 //                                           Control. The configuration
 //                                           sideband signals are now cited to
+//                                           Table 115 and Section 5.13.
 //   v0.0.6    2026-09-25    Phase C: wire the private LTSM Active-entry Start
 //                           clear from logical_phy to the
 //                           Adapter register copy.

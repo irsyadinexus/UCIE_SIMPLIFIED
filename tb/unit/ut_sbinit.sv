@@ -69,10 +69,17 @@ module ut_sbinit;
   integer rx_event_count;
   logic   rx_event_match [0:3];
 
-  // The logical_phy module is instantiated with scalar physical sideband pins
-  // (sb_tx_clk/data, sb_rx_clk/data) and adapter sideband ports. Hierarchical force
-  // is limited to the two private LTSM control levels so this unit can exercise
-  // the embedded raw primitive without waiting for the 4 ms RESET policy.
+  // -------------------------------------------------------------------------
+  // Module instantiation: logical_phy u_dut (device under test)
+  //
+  // Instantiated with the scalar physical sideband pins (sb_tx_clk/data and
+  // sb_rx_clk/data) plus the private adapter sideband ports. The hierarchical
+  // force is limited to the two private LTSM control levels, pattern_run_enable
+  // and sbinit_raw_mode, so this unit drives the embedded raw primitive directly
+  // instead of waiting out the full 4 ms RESET policy.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // -------------------------------------------------------------------------
   logical_phy #(
     .NBYTES(NBYTES),
     .NLANES(NLANES_MAX)

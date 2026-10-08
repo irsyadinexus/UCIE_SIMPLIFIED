@@ -209,6 +209,16 @@ module pattern_gen #(
   genvar l;
   generate
     for (l = 0; l < NLANES; l = l + 1) begin : g_lane_scram
+      // ---------------------------------------------------------------------
+      // Module instantiation: Per-Lane Training Pattern Scrambler
+      //
+      // One scrambler per lane. LANE_ID = l seeds the LFSR from that lane's
+      // specification value, so the trained pattern sequence on each lane is
+      // unique and never correlated with its neighbours.
+      //
+      // Spec ref: UCIe 1.0 Specification, Section 4.4.1 - Scrambling and
+      //           training pattern generation.
+      // ---------------------------------------------------------------------
       scrambler #(.LANE_ID(l)) u_scram (
         .lclk        (lclk),
         .lreset_n    (lreset_n),

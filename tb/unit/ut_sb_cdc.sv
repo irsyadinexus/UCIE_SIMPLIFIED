@@ -68,6 +68,15 @@ module ut_sb_cdc;
   int           s2l_valid_count;
   int           errors;
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_cdc_mailbox u_l2s (lclk -> sbclk)
+  //
+  // Link-to-sideband direction. The test pulses l2s_send once and checks that
+  // the 16-bit payload appears in the sbclk domain with exactly one dst_valid
+  // pulse, proving no send event is lost or duplicated.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission.
+  // -------------------------------------------------------------------------
   sb_cdc_mailbox #(.WIDTH(16)) u_l2s (
     .src_clk(lclk), .src_reset_n(lreset_n), .src_data(l2s_data),
     .src_send(l2s_send), .src_busy(l2s_busy),
@@ -75,6 +84,15 @@ module ut_sb_cdc;
     .dst_valid(l2s_valid)
   );
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_cdc_mailbox u_s2l (sbclk -> lclk)
+  //
+  // Sideband-to-link direction. Carries the 101-bit flat receive bundle
+  // (packet fields plus CP and DP results) and must deliver it as one coherent
+  // event in the lclk domain.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data integrity.
+  // -------------------------------------------------------------------------
   sb_cdc_mailbox #(.WIDTH(101)) u_s2l (
     .src_clk(sbclk), .src_reset_n(sbreset_n), .src_data(s2l_data),
     .src_send(s2l_send), .src_busy(s2l_busy),

@@ -669,6 +669,11 @@ module tb_loopback_top;
   // -------------------------------------------------------------------------
   assign d1_link_active_obs = (d1_pl_state_sts == FDI_STS_ACTIVE);
 
+  // -------------------------------------------------------------------------
+  parameter bit FAST_SIM = 1'b1;
+  localparam time C_RESET_MIN_DWELL_NS  = FAST_SIM ? 40_000 : 4_000_000;
+  localparam time C_RESET_CHECK_WAIT_NS = FAST_SIM ? 41_000 : 4_100_000;
+
   // ------------------------------------------------------- DUTs
   // -------------------------------------------------------------------------
   // Instantiation: ucie_main dut_a  (Die 0)
@@ -684,10 +689,6 @@ module tb_loopback_top;
   //
   // Spec ref: UCIe 1.0, Section 8.0 - Interface Definitions.
   // -------------------------------------------------------------------------
-  parameter bit FAST_SIM = 1'b1;
-  localparam time C_RESET_MIN_DWELL_NS  = FAST_SIM ? 40_000 : 4_000_000;
-  localparam time C_RESET_CHECK_WAIT_NS = FAST_SIM ? 41_000 : 4_100_000;
-
   ucie_main #(.FAST_SIM(FAST_SIM)) dut_a (
     .lclk            (lclk),
     .lreset_n        (d0_lreset_n),

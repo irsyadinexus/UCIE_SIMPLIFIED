@@ -525,6 +525,15 @@ module ut_ltsm;
   // -------------------------------------------------------------------------
   assign loc_rx_data = loc_rx_packet.data;
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_codec u_loc (local sideband codec)
+  //
+  // Local endpoint codec. It serializes LTSM transmissions and deserializes
+  // the partner reply stream, bridging the LTSM lclk policy logic to the
+  // scalar sbclk pins through the two CDC mailboxes.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission.
+  // -------------------------------------------------------------------------
   sb_codec u_loc (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
     .tx_valid(loc_tx_load), .tx_ready(loc_tx_ready), .tx_packet(loc_tx_packet),
@@ -536,6 +545,15 @@ module ut_ltsm;
     .rx_dp_error(loc_rx_dp_err), .rx_overflow()
   );
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_cdc_mailbox u_rx_cdc (sbclk -> lclk)
+  //
+  // Returns each decoded receive packet from the local codec into the lclk
+  // LTSM domain as one coherent bundle: packet fields plus the CP and DP
+  // error flags of that same transaction.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.3 - Data integrity.
+  // -------------------------------------------------------------------------
   sb_cdc_mailbox #(.WIDTH(SB_RX_W)) u_rx_cdc (
     .src_clk(sbclk), .src_reset_n(sbreset_n),
     .src_data({loc_rx_opcode, loc_rx_srcid, loc_rx_dstid, loc_rx_msginfo,
@@ -662,6 +680,15 @@ module ut_ltsm;
   // -------------------------------------------------------------------------
   assign par_rx_msgsubcode = par_rx_packet.msg_subcode;
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_codec u_par (partner sideband codec)
+  //
+  // Remote-die stand-in codec. It deserializes the local stream and serializes
+  // the responder reply back to u_loc, closing the sideband loop without a
+  // second LTSM instance.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission.
+  // -------------------------------------------------------------------------
   sb_codec u_par (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
     .tx_valid(par_tx_load), .tx_ready(par_tx_ready), .tx_packet(par_tx_packet),

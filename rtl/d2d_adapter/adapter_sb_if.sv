@@ -120,7 +120,8 @@
 //                           rem_table arbiter (Sections 6.1, 7.5).
 //   v0.1.1  2026-10-08  Documentation compliance pass: add detailed
 //                        construct comment blocks (5-30 lines) with UCIe 1.0
-//                        spec citations across all always/assign blocks.
+//                        spec citations across all always/assign/instantiation
+//                        blocks.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================

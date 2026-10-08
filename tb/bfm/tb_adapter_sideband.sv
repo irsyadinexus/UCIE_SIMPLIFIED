@@ -108,6 +108,15 @@ module tb_adapter_sideband;
   logic sb_msg_timeout;
   integer errors;
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: adapter_sb_if u_dut (device under test)
+  //
+  // Device under test. The testbench drives lp_cfg with FDI header and payload
+  // phases, observes the serialized completion stream on pl_cfg, and monitors
+  // the typed private Adapter client signals together with the CSR channel.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.2.3 - FDI Sideband Interface.
+  // -------------------------------------------------------------------------
   adapter_sb_if u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
     .lp_cfg(lp_cfg), .lp_cfg_vld(lp_cfg_vld), .lp_cfg_crd(lp_cfg_crd),

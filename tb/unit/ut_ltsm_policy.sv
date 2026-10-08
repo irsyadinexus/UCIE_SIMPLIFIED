@@ -285,7 +285,13 @@ module ut_ltsm_policy;
   logic le_tmr_expired;
 
   // =========================================================================
-  // DUT Instantiation
+  // Module instantiation: ltsm u_dut (device under test)
+  // =========================================================================
+  // Device under test. The testbench drives the private policy interface, the
+  // local sideband transmit handshake, and the private RDI request events, then
+  // checks the published state, the Active Entry result, and reset recovery.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training State Machine.
   // =========================================================================
   ltsm #(.NLANES(NLANES_MAX)) u_dut (
     .lclk(lclk), .lreset_n(lreset_n),
@@ -364,8 +370,12 @@ module ut_ltsm_policy;
   end
 
   // =========================================================================
-  // RESET Minimum Timer
-  // Short limit: the policy test does not re-verify the 4 ms minimum.
+  // Module instantiation: RESET Minimum Residency Timer
+  //
+  // u_rst_tmr measures the LT_RESET residency. This policy test uses the short
+  // C_RESET_FAST limit because the full 4 ms minimum is verified in ut_ltsm.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 - RESET State.
   // =========================================================================
   ucie_timer #(.LIMIT_CYCLES(C_RESET_FAST)) u_rst_tmr (
     .clk(lclk), .reset_n(lreset_n), .start(rst_tmr_start),
@@ -383,8 +393,17 @@ module ut_ltsm_policy;
     .running(tmr_run), .expired(tmr_expired)
   );
 
-  // Short limit for policy test: does not re-verify the full 8 ms countdown (verified in ut_ltsm.sv)
   localparam int unsigned C_LE_FAST = 40;
+
+  // =========================================================================
+  // Module instantiation: LinkError Minimum Residency Timer
+  //
+  // u_le_tmr enforces the Section 8.3.2.7 LinkError minimum residency. This
+  // policy test uses the short C_LE_FAST limit; ut_ltsm covers the full 8 ms
+  // countdown.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.3.2.7 - LinkError Recovery.
+  // =========================================================================
   ucie_timer #(.LIMIT_CYCLES(C_LE_FAST)) u_le_tmr (
     .clk(lclk), .reset_n(lreset_n), .start(le_tmr_start),
     .running(ltsm_state == ucie_pkg::LT_TRAINERROR), .expired(le_tmr_expired)

@@ -243,7 +243,15 @@ module tb_link_init_wave;
   logic                  d1_pl_cfg_crd;
 
   // ==========================================================================
-  // DUT Instantiations (Die 0 and Die 1)
+  // Module instantiation: ucie_main dut_die0 (Die 0)
+  // ==========================================================================
+  // First of the two crossed endpoints. All of its RDI and FDI signals carry
+  // the d0_ prefix and the BFM drives them. Its scalar sideband pins and
+  // mainband pins are wired to dut_die1, so the pair forms one full link:
+  //   - d0 sb_tx -> d1 sb_rx, and d0 sb_rx <- d1 sb_tx
+  //   - d0 mb_tx -> d1 mb_rx, and d0 mb_rx <- d1 mb_tx
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.0 - Interface Definitions.
   // ==========================================================================
   ucie_main #(
     .NBYTES(NBYTES),
@@ -303,6 +311,16 @@ module tb_link_init_wave;
     .mb_rx_valid           (mb_d1_to_d0_valid)
   );
 
+  // ==========================================================================
+  // Module instantiation: ucie_main dut_die1 (Die 1)
+  // ==========================================================================
+  // Second endpoint of the crossed pair. Every port mirrors dut_die0 with the
+  // d1_ prefix, and its sideband and mainband pins are the far ends of the
+  // wires driven by dut_die0. Driving both dies from one BFM lets a single
+  // run exercise the complete training handshake and the Raw Mode data path.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.0 - Interface Definitions.
+  // ==========================================================================
   ucie_main #(
     .NBYTES(NBYTES),
     .NLANES(NLANES_MAX),

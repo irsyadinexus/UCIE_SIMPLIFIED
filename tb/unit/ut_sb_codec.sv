@@ -96,6 +96,15 @@ module ut_sb_codec;
   // -------------------------------------------------------------------------
   assign sb_rx_data = corrupt_en ? ~sb_tx_data : sb_tx_data;
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_codec u_tx (transmit serializer)
+  //
+  // Serializing half of the loopback pair. It drives the scalar sb_tx_clk and
+  // sb_tx_data pins that feed u_rx, so a pass proves the transmit framing and
+  // the 32-UI inter-packet gap are produced exactly as specified.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet formats.
+  // -------------------------------------------------------------------------
   sb_codec u_tx (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
     .tx_valid(tx_valid), .tx_ready(tx_ready), .tx_packet(tx_packet),
@@ -106,6 +115,15 @@ module ut_sb_codec;
     .rx_format_error(), .rx_cp_error(), .rx_dp_error(), .rx_overflow()
   );
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_codec u_rx (receive deserializer)
+  //
+  // Deserializing half of the loopback pair. It samples the scalar receive
+  // pins on the falling strobe edge and reports the decoded packet together
+  // with the format, CP, and DP error flags.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband signaling.
+  // -------------------------------------------------------------------------
   sb_codec u_rx (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
     .tx_valid(1'b0), .tx_ready(), .tx_packet('0), .tx_busy(),

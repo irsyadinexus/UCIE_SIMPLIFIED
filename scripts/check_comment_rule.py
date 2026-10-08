@@ -5,13 +5,38 @@ Rule:
   1. File header comment: 50-500 lines (including the blank-line tail).
   2. Revision history log present in the header.
   3. At least 5 comment lines directly above every always/always_comb/
-     always_ff/always_latch and every assign.
+     always_ff/always_latch, every assign, and every module instantiation.
 
 Usage: python scripts/check_comment_rule.py
 """
 import re
 import glob
 import sys
+
+# Module instantiation: "<type> [#( ... )] <instance> (" on one line.
+RE_INST = re.compile(
+    r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*'      # module type
+    r'(?:#\s*\(.*?\)\s*)?'                  # optional parameter override
+    r'([A-Za-z_][A-Za-z0-9_]*)\s*\($'       # instance name then open paren
+)
+# Head of a multi-line parameter override: "<type> #(" ending the line.
+RE_INST_HDR = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*#\s*\(\s*$')
+# Closing line of a multi-line override: ") <instance> (".
+RE_INST_CLOSE = re.compile(r'^\s*\)\s*[A-Za-z_][A-Za-z0-9_]*\s*\(\s*$')
+# Keywords and statement forms that must never be read as an instantiation.
+KW = {
+    'if', 'else', 'begin', 'end', 'case', 'casex', 'casez', 'endcase',
+    'for', 'while', 'repeat', 'forever', 'initial', 'final',
+    'always', 'always_comb', 'always_ff', 'always_latch', 'assign',
+    'module', 'endmodule', 'generate', 'endgenerate', 'function',
+    'endfunction', 'task', 'endtask', 'input', 'output', 'inout',
+    'logic', 'wire', 'reg', 'integer', 'int', 'bit', 'byte', 'shortint',
+    'return', 'import', 'export', 'defparam', 'parameter', 'localparam',
+    'typedef', 'enum', 'struct', 'union', 'package', 'endpackage',
+    'assert', 'assume', 'cover', 'property', 'endproperty', 'sequence',
+    'real', 'time', 'string', 'signed', 'unsigned', 'void', 'class',
+    'rand', 'const', 'static', 'automatic', 'unique', 'priority',
+}
 
 
 def header_len(lines):
@@ -44,6 +69,29 @@ def count_comments_above(lines, idx):
     return c
 
 
+def find_instance_heads(lines):
+    """Indices of module-instantiation head lines, including multi-line #(...).
+
+    For a multi-line parameter override the head is the '<type> #(' line, so
+    the comment block must sit directly above that line.
+    """
+    heads = {}
+    for i, line in enumerate(lines):
+        m = RE_INST.match(line)
+        if m and m.group(1) not in KW:
+            heads[i] = m.group(2)
+            continue
+        m2 = RE_INST_HDR.match(line)
+        if m2 and m2.group(1) not in KW:
+            for j in range(i + 1, min(len(lines), i + 80)):
+                if RE_INST_CLOSE.match(lines[j]):
+                    heads[i] = m2.group(1)
+                    break
+                if lines[j].strip() and not lines[j].lstrip().startswith(('.', '//', '#')):
+                    break
+    return heads
+
+
 def check_file(fp):
     with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
@@ -59,6 +107,8 @@ def check_file(fp):
     if not re.search(r'revision history', content, re.IGNORECASE):
         issues.append('no revision history section')
 
+    inst_heads = find_instance_heads(lines)
+
     for i, line in enumerate(lines):
         s = line.strip()
         if re.match(r'^(always|always_comb|always_ff|always_latch)\b', s):
@@ -69,6 +119,12 @@ def check_file(fp):
             cnt = count_comments_above(lines, i)
             if cnt < 5:
                 issues.append(f'line {i+1}: assign has {cnt} comment lines (< 5)')
+        elif i in inst_heads:
+            cnt = count_comments_above(lines, i)
+            if cnt < 5:
+                issues.append(
+                    f'line {i+1}: instance of {inst_heads[i]} '
+                    f'has {cnt} comment lines (< 5)')
     return issues
 
 

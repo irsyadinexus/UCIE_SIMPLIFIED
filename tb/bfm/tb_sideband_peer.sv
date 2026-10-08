@@ -73,6 +73,15 @@ module tb_sideband_peer;
   sb_packet_t rx_packet;
   int errors;
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: sb_codec u_rx (device under test)
+  //
+  // Receive-only codec instance. The transmit port is tied off and the scalar
+  // receive pins are driven by the literal golden vectors, so a pass proves
+  // that the deserializer alone decodes the expected packet and error flags.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 6.1.2 - Packet formats.
+  // -------------------------------------------------------------------------
   sb_codec u_rx (
     .sbclk(sbclk), .sbreset_n(sbreset_n),
     .tx_valid(1'b0), .tx_ready(), .tx_packet('0), .tx_busy(),

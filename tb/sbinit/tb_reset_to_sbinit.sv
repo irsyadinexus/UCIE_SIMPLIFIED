@@ -333,10 +333,18 @@ module tb_reset_to_sbinit;
                     (d1_ltsm_state == LT_ACTIVE);
 
   // --------------------------------------------------------------------------
-  // Die instances
   parameter bit FAST_SIM = 1'b1;
   localparam time C_RESET_MIN_DWELL_NS = FAST_SIM ? 40_000 : 4_000_000;
 
+  // --------------------------------------------------------------------------
+  // Module instantiation: ucie_main dut_die0 (Die 0 initiator)
+  //
+  // Die 0 is the SBINIT initiator. After its 4 ms RESET dwell and a software
+  // Start pulse it begins raw pattern transmission. Its sideband and mainband
+  // pins are cross-wired to dut_die1, so the pair forms one complete link.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 and Section 4.5.3.2.
+  // --------------------------------------------------------------------------
   ucie_main #(.FAST_SIM(FAST_SIM)) dut_die0 (
     .lclk(lclk), .lreset_n(d0_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
     .sbreset_n(d0_sbreset_n),
@@ -362,6 +370,15 @@ module tb_reset_to_sbinit;
     .mb_rx_data(mb_d1_to_d0_data), .mb_rx_valid(mb_d1_to_d0_valid)
   );
 
+  // --------------------------------------------------------------------------
+  // Module instantiation: ucie_main dut_die1 (Die 1 endpoint)
+  //
+  // Die 1 is the responder. It receives no local Start pulse and leaves RESET
+  // only after detecting Die 0's raw SBINIT pattern, which exercises the
+  // remote-wake path of Section 4.5.3.2.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
+  // --------------------------------------------------------------------------
   ucie_main #(.FAST_SIM(FAST_SIM)) dut_die1 (
     .lclk(lclk), .lreset_n(d1_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
     .sbreset_n(d1_sbreset_n),

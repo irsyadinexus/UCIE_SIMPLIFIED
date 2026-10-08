@@ -263,6 +263,15 @@ module ut_gearbox;
   // -------------------------------------------------------------------------
   assign mb_rx_val_wire = inj_en ? inj_pat[3 - int'(u_rx.cyc_q)] : mb_tx_val_wire;
 
+  // -------------------------------------------------------------------------
+  // Module instantiation: tx_gearbox u_tx (transmit serializer)
+  //
+  // Loads one 128-bit word on an accepted lclk transfer and serializes it onto
+  // the 16 lane pins across four mbclk cycles using both clock edges, so one
+  // lclk cycle carries eight UIs per lane at the 4 GT/s line rate.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping.
+  // -------------------------------------------------------------------------
   tx_gearbox u_tx (
     .lclk(lclk), .lreset_n(lreset_n), .mbclk(mbclk),
     .tx_word(tx_word), .tx_valid(tx_valid), .tx_load(tx_load),

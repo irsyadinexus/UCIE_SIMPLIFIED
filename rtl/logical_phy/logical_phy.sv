@@ -210,7 +210,8 @@
   //                        fatal edge detection, aggregation, and timer blocks.
   // v0.0.28 2026-10-08  Documentation compliance pass: add detailed
   //                        construct comments (5-30 lines) with UCIe 1.0
-  //                        spec citations across all always/assign blocks.
+  //                        spec citations across all always/assign/instantiation
+  //                        blocks.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -831,9 +832,15 @@ module logical_phy #(
   assign adapter_sb_tx_ready = adapter_grant && !sb_tx_busy;
 
   // ===========================================================================
-  // Transmit CDC Mailbox (lclk to sbclk)
+  // Module instantiation: Transmit CDC Mailbox (lclk -> sbclk)
   // ===========================================================================
-  // Carries complete typed sb_packet_t transactions to sbclk.
+  // u_sb_tx_cdc carries one complete typed sb_packet_t transaction across the
+  // 500 MHz lclk to 800 MHz sbclk boundary. The lclk side pulses src_send once
+  // per arbitrated packet and holds src_busy until the sbclk side has captured
+  // the payload and raised a one-cycle dst_valid pulse.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission.
+  // ===========================================================================
   sb_cdc_mailbox #(.WIDTH(SB_PKT_W)) u_sb_tx_cdc (
     .src_clk    (lclk),
     .src_reset_n(lreset_n),
@@ -1016,9 +1023,15 @@ module logical_phy #(
   assign codec_rx_overflow_rise = codec_rx_overflow_sync_q && !codec_rx_overflow_prev_q;
 
   // ===========================================================================
-  // Receive CDC Mailbox (sbclk to lclk)
+  // Module instantiation: Receive CDC Mailbox (sbclk -> lclk)
   // ===========================================================================
-  // Carries complete typed sb_packet_t plus aligned CP/DP/format error bits.
+  // u_sb_rx_cdc carries one complete typed sb_packet_t plus its aligned CP,
+  // DP, and format-error flags across the 800 MHz sbclk to 500 MHz lclk
+  // boundary. The bundled flags stay bit-aligned with the packet, so the LTSM
+  // and the Adapter decode exactly the errors of the delivered transaction.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband transmission.
+  // ===========================================================================
   sb_cdc_mailbox #(.WIDTH(SB_RX_MAILBOX_W)) u_sb_rx_cdc (
     .src_clk    (sbclk),
     .src_reset_n(sbreset_n),
@@ -1379,6 +1392,15 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   localparam int unsigned C_RESET_MIN_VAL = FAST_SIM ? C_RESET_MIN_FAST : C_RESET_MIN;
 
+  // ---------------------------------------------------------------------------
+  // Module instantiation: Physical Layer RESET Minimum Residency Timer
+  //
+  // u_reset_timer measures the LT_RESET minimum dwell. It starts on
+  // rst_tmr_start and expires after C_RESET_MIN_VAL lclk cycles, which is 4 ms
+  // at 500 MHz in the real configuration and a shortened value under FAST_SIM.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 - RESET State.
+  // ---------------------------------------------------------------------------
   ucie_timer #(.LIMIT_CYCLES(C_RESET_MIN_VAL)) u_reset_timer (
     .clk      (lclk),
     .reset_n  (lreset_n),
@@ -1947,6 +1969,16 @@ module logical_phy #(
   genvar b;
   generate
     for (b = 0; b < NBYTES; b = b + 1) begin : g_tx_scramble
+      // ---------------------------------------------------------------------
+      // Module instantiation: Transmit Byte Scrambler
+      //
+      // One scrambler per byte lane. LANE_ID = b selects byte b's seed, so each
+      // lane runs an independent sequence. The LFSR reseeds on the Active Entry
+      // pulse, advances only on an accepted transfer, and drives bits
+      // [8*b +: 8] of the 128-bit transmit word toward the TX gearbox.
+      //
+      // Spec ref: UCIe 1.0 Specification, Section 4.4.1 - Scrambling.
+      // ---------------------------------------------------------------------
       scrambler #(.LANE_ID(b)) u_tx_scrambler (
         .lclk      (lclk),
         .lreset_n  (lreset_n),
@@ -1958,6 +1990,16 @@ module logical_phy #(
       );
     end
     for (b = 0; b < NBYTES; b = b + 1) begin : g_rx_descramble
+      // ---------------------------------------------------------------------
+      // Module instantiation: Receive Byte Descrambler
+      //
+      // One scrambler per byte lane, wired in the receive direction. It is
+      // self-inverting, so the same topology that scrambles the transmit word
+      // descrambles the gearbox output. LANE_ID = b selects byte b's seed and
+      // bits [8*b +: 8] of the received word.
+      //
+      // Spec ref: UCIe 1.0 Specification, Section 4.4.1 - Descrambling.
+      // ---------------------------------------------------------------------
       scrambler #(.LANE_ID(b)) u_rx_scrambler (
         .lclk      (lclk),
         .lreset_n  (lreset_n),

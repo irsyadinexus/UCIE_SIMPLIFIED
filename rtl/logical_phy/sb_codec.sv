@@ -62,7 +62,8 @@
 //                                 upper 32-bit payload validation, and sticky overflow.
 //   0.0.6 2026-10-08  -           Documentation compliance pass: add detailed
 //                                 construct comments (5-30 lines) with UCIe 1.0
-//                                 spec citations across all always/assign blocks.
+//                                 spec citations across all always/assign/
+//                                 instantiation blocks.
 // ============================================================================
 `ifndef SbCodec_SV
 `define SbCodec_SV

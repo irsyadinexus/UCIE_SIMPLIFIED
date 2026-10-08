@@ -237,14 +237,6 @@
 //                                           Link DVSEC - Error Notification
 //                                           Control. The configuration
 //                                           sideband signals are now cited to
-  // v0.0.5    2026-09-23    Documentation: replace the
-  //                                        fabricated "Table 68 - Sideband
-  //                                        and Configuration signal list"
-  //                                        citation. Table 68 is the UCIe
-  //                                        Link DVSEC - Error Notification
-  //                                        Control. The configuration
-  //                                        sideband signals are now cited to
-  //                                        Table 115 and Section 5.13.
   // v0.0.6    2026-09-25    Phase C: wire the private LTSM Active-entry Start
   //                                        clear from logical_phy to the
   //                                        Adapter register copy.
@@ -266,6 +258,9 @@
 //                           sideband LinkError handshake dwell bypass, and direct
 //                           transition to RESET without LinkReset per Figures 111,
 //                           119, and 126.
+//   v0.0.11   2026-10-08    Documentation compliance pass: expand the header and the
+//                           per-construct comment blocks, including every module
+//                           instantiation.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"

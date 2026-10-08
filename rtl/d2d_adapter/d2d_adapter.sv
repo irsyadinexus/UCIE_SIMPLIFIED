@@ -164,9 +164,9 @@
 //                          private rdi_lp_linkerror output (Sections 8.1, 8.2).
 //                        - Add public FDI Stage 3 clock/wake/protocol ports and configuration
 //                          sideband (lp_cfg / pl_cfg) (Sections 6.1, 8.2).
-//   v0.0.9    2026-10-08  Documentation compliance pass: expand construct comment
-//                          blocks for Stage 3 status assigns, protocol registers,
-//                          and lint suppression blocks with spec subsection references.
+//   v0.0.11 2026-10-08  Documentation compliance pass: expand construct comment
+//                        blocks for Stage 3 status assigns, protocol registers,
+//                        and lint suppression blocks with spec references.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================

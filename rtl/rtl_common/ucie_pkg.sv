@@ -117,6 +117,8 @@
 //                                 error checking.
 //   0.0.7 2026-10-08  -           Add Section 8.3.2.7 LinkError minimum residency
 //                                 dwell constants (8 ms, C_RESIDENCY) and documentation.
+//   0.0.8 2026-10-08  -           Documentation compliance pass: expand the header and the
+//                                 constant-group comment blocks with UCIe 1.0 citations.
 // ============================================================================
 `ifndef UciePkg_SV
 `define UciePkg_SV

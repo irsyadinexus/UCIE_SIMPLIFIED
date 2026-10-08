@@ -134,6 +134,9 @@
 //                        8.1.5 (Figure 111) and Section 8.3.2.7: LinkError exits
 //                        directly to Reset (never LinkReset). Add comprehensive
 //                        comments for stall completion logic.
+//   v0.0.9  2026-10-08  Documentation compliance pass: expand the state-diagram
+//                        header and the per-construct comment blocks with UCIe
+//                        1.0 citations.
 // ============================================================================
 `ifndef RdiStateMachine_SV
 `define RdiStateMachine_SV

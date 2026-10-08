@@ -60,6 +60,8 @@
 //   v0.0.3  2026-10-07  Add Figure 125 LinkReset entry and exit flow.
 //   v0.0.4  2026-10-08  Implement UCIe 1.0 Section 8.3.3.2 Figure 126 LinkError
 //                       entry, direct exit to RESET, and recovery bring-up.
+//   v0.0.5  2026-10-08  Documentation compliance pass: add spec-cited comment
+//                       blocks above dut_die0 and dut_die1.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;

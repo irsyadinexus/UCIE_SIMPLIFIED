@@ -257,6 +257,9 @@
 //                        Support FAST_SIM parameterization for reset dwell.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
+//   v0.0.18 2026-10-08  Documentation compliance pass: expand the per-construct
+//                        comment blocks and move the module-scope declarations
+//                        above the DUT comment so no declaration interrupts it.
 // ============================================================================
 `ifndef TbLoopbackTop_SV
 `define TbLoopbackTop_SV

@@ -134,6 +134,8 @@
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
+//   v0.0.9  2026-10-08  Documentation compliance pass: expand the header and the
+//                       per-construct comment blocks with UCIe 1.0 citations.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;

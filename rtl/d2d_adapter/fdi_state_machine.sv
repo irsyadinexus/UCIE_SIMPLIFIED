@@ -152,6 +152,9 @@
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
+//   v0.0.8  2026-10-08  Documentation compliance pass: expand the state-diagram
+//                        header and the per-construct comment blocks with UCIe
+//                        1.0 citations.
 // ============================================================================
 `ifndef FdiStateMachine_SV
 `define FdiStateMachine_SV

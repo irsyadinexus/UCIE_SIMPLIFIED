@@ -167,6 +167,14 @@
 //   v0.0.5  2026-09-23  Req.3: run sbclk at 800 MHz with a phase offset from
 //                        lclk. The test now exercises the LTSM CDC boundary.
 //   v0.0.6  2026-09-23  Req.3: remove the obsolete single-clock-domain
+//                        description from the test header.
+//   v0.0.7  2026-09-24  Verify pattern-triggered RESET exit, mismatch streak
+//                        reset, four tail events, explicit SBINIT Done order,
+//                        invalid packets, and the true 8 ms timeout.
+//   v0.0.8  2026-09-24  Phase B: add sb_tx_accepted and sb_rx_payload
+//                        private ports. Transport complete DATA64 RX
+//                        packets through the CDC. Model a valid DATA64
+//                        PARAM peer request in the responder.
 //   v0.0.9  2026-09-25  Phase B final contract: the partner responder now
 //                        answers every request with its matching response
 //                        using the exact current sequence subcode, so each
@@ -177,25 +185,20 @@
 //                        from the expected walk because the fixed profile
 //                        never visits it, and LINKSPEED now exits only after
 //                        the 15h start and 19h done transactions.
-//                        description from the test header.
-//   v0.0.7  2026-09-24  Verify pattern-triggered RESET exit, mismatch streak
-//                        reset, four tail events, explicit SBINIT Done order,
-//                        invalid packets, and the true 8 ms timeout.
-//   v0.0.8  2026-09-24  Phase B: add sb_tx_accepted and sb_rx_payload
-//                        private ports. Transport complete DATA64 RX
-//                        packets through the CDC. Model a valid DATA64
-//                        PARAM peer request in the responder.
-//   v0.0.9  2026-09-25  Phase C: verify TRAINERROR timeout and LinkError
+//   v0.0.10 2026-09-25  Phase C: verify TRAINERROR timeout and LinkError
 //                        hold, LinkReset recovery, RESET dwell, and fresh
 //                        Start-trigger behavior.
-//   v0.0.10 2026-09-25  Phase E: tie the new private framing_fault_event
+//   v0.0.11 2026-09-25  Phase E: tie the new private framing_fault_event
 //                        input low. The nominal walk never injects the
 //                        mainband framing fault; the fatal-cause check for
 //                        that event lives in ut_ltsm_policy.sv.
-//   v0.0.11 2026-10-08  Verify UCIe 1.0 Section 8.3.2.7 LinkError minimum residency
+//   v0.0.12 2026-10-08  Verify UCIe 1.0 Section 8.3.2.7 LinkError minimum residency
 //                        dwell gating after 8 ms SBINIT timeout (recovery blocked
 //                        before le_tmr expiry, unsolicited TE_RSP rejection, and
 //                        direct transition to RESET on le_tmr expiry).
+//   v0.0.13 2026-10-08  Documentation compliance pass: repair the out-of-order
+//                        duplicate v0.0.9 history entry and add spec-cited comment
+//                        blocks above u_loc, u_rx_cdc, and u_par.
 //
 // ============================================================================
 `include "ucie_pkg.sv"

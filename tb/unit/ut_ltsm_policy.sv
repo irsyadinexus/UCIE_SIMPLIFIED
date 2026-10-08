@@ -166,6 +166,8 @@
 //                        expiry, unsolicited TE_RSP rejection, and timer release).
 //                        Update Scenarios 8 and 9 to verify direct exit to RESET
 //                        per Figure 126.
+//   v0.0.9  2026-10-08  Documentation compliance pass: add spec-cited comment
+//                        blocks above u_dut, u_rst_tmr, and u_le_tmr.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;

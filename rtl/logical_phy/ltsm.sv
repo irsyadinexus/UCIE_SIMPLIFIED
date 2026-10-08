@@ -311,9 +311,9 @@
 //                        111, 119, 126), response draining prior to reset,
 //                        and exclusion of LinkReset exchange from LinkError.
 //   v0.0.18 2026-10-08  Documentation compliance pass: add spec-cited comment
-//                        blocks above the module instantiations u_sb_tx_cdc,
-//                        u_sb_rx_cdc, u_reset_timer, u_tx_scrambler, and
-//                        u_rx_scrambler.
+//                        blocks (5-20 lines) above state-tracking always_ff
+//                        registers and all continuous assign drivers
+//                        (transition_active, le_tmr_start, pat_*, phy_*).
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV

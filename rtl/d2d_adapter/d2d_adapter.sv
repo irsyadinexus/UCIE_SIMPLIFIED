@@ -138,12 +138,12 @@
 //                        (Flit-Aware Die-to-Die Interface). Width degrade is
 //                        Section 4.3.7, not 4.3.4. The CSR and link control
 //                        references now cite Section 7.5 with Table 65.
-  // v0.0.5  2026-09-23  Documentation: correct the Section 8.3.1 title and
-  //                      replace the false Section 4.5.x packet reference with
-  //                      the applicable sideband references. Normalize the
-  //                      Table 115 citation for lp_linkerror.
-  // v0.0.6  2026-09-25  Phase C: pass the private completed-Active clear to the
-  //                      Adapter Start copy. The public interface is unchanged.
+//   v0.0.5  2026-09-23  Documentation: correct the Section 8.3.1 title and
+//                        replace the false Section 4.5.x packet reference with
+//                        the applicable sideband references. Normalize the
+//                        Table 115 citation for lp_linkerror.
+//   v0.0.6  2026-09-25  Phase C: pass the private completed-Active clear to the
+//                        Adapter Start copy. The public interface is unchanged.
 //   v0.0.7  2026-09-25  Phase D: route the Adapter Start copy as a private
 //                        training event, remove peer-Active transport policy,
 //                        and retain a registered four-phase stall path.

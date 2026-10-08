@@ -237,11 +237,11 @@
 //                                           Link DVSEC - Error Notification
 //                                           Control. The configuration
 //                                           sideband signals are now cited to
-  // v0.0.6    2026-09-25    Phase C: wire the private LTSM Active-entry Start
-  //                                        clear from logical_phy to the
-  //                                        Adapter register copy.
-  // v0.0.7    2026-09-25    Phase D: route Adapter Start as a private event
-  //                                        and remove stale peer-Active feedback.
+//   v0.0.6    2026-09-25    Phase C: wire the private LTSM Active-entry Start
+//                           clear from logical_phy to the
+//                           Adapter register copy.
+//   v0.0.7    2026-09-25    Phase D: route Adapter Start as a private event
+//                           and remove stale peer-Active feedback.
 //   v0.0.8    2026-09-25    Preserve the public adapter_active_req input
 //                           with a low policy-inert tie-off.
 //   v0.0.9    2026-09-28    Sideband protocol remediation:

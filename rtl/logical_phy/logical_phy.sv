@@ -151,67 +151,67 @@
 //   v0.0.12 2026-09-24  Phase A: force low mainband data and framing through
 //                        every immediate-success MBINIT and MBTRAIN state.
 //   v0.0.13 2026-09-24  Clarify the private Phase A DATA64 payload boundary.
-  // v0.0.14 2026-09-24  Phase B: expose private mailbox source acceptance and
-  //                        the retained DATA64 payload to the LTSM.
-  // v0.0.15 2026-09-25  Phase C: route private RDI request, fresh-event,
-  //                        Active-entry result, and Start-copy-clear signals.
-  // v0.0.16 2026-09-25  Phase D: route the Adapter Start copy as an internal
-  //                        edge-triggered event, gate RDI Active on completed
-  //                        LTSM Active Entry, and remove peer-Active feedback.
-  // v0.0.17 2026-09-25  Complete Phase D construct documentation for SBINIT
-  //                        ownership, sideband codec mapping, and LTSM wiring.
-  // v0.0.18 2026-09-25  Correct Phase D construct header and specification
-  //                        subsection references.
-  // v0.0.19 2026-09-25  Phase E: gate user data on completed Active Entry,
-  //                        RDI Active, a settled LTSM ACTIVE level, and an
-  //                        inactive stall acknowledgement. Add independent
-  //                        per-byte TX/RX scrambler arrays seeded at Active
-  //                        Entry, scramble before the TX gearbox, descramble
-  //                        after the RX gearbox, and route the private RX
-  //                        framing fault into the LTSM fatal policy. Restore
-  //                        the RDI state-status driver and the lint use of the
-  //                        preserved adapter_active_req input.
-  // v0.0.20 2026-09-25  Phase E correctness: close the Active-data gate at
-  //                        private transition start, drain accepted registered
-  //                        words without masking their valid, flush the RX
-  //                        epoch at the first quiet transfer gap, and retain
-  //                        an unarmed framing-fault edge until LTSM policy
-  //                        can consume it.
-  // v0.0.21 2026-09-25  Phase E fault containment: clear pending TX/RX valid
-  //                        qualifiers when the Active-data gate closes and
-  //                        qualify both output valid signals with that gate.
-  //                        This prevents a registered word from leaking after
-  //                        a private framing fault or transition.
-  // v0.0.22 2026-09-25  Clarify the valid-register block comment for the
-  //                        synchronous gate-close flush.
-  // v0.0.23 2026-09-25  Include the current private framing-fault event in
-  //                        the Active-data gate while preserving recovery after
-  //                        the gearbox sticky history remains set.
-  // v0.0.24 2026-09-28  Migrate sideband physical pins to scalar sb_tx_clk /
-  //                        sb_tx_data and sb_rx_clk / sb_rx_data per UCIe 1.0
-  //                        Sections 4.1.5 and 5.13. Adopt typed sb_packet_t
-  //                        channels for TX and RX CDC mailboxes. Connect new
-  //                        sb_codec handshake (tx_valid/ready, rx_valid/ready)
-  //                        and route sticky codec overflow into the LTSM fatal
-  //                        event policy. Add private Adapter packet client ports
-  //                        (adapter_sb_tx_* / adapter_sb_rx_*) with a non-starving
-  //                        arbiter featuring mandatory LTSM/response priority and
-  //                        alternating request selection (Sections 4.1.5, 5.13, 6.1).
-  //                        Convert between LTSM flat sideband fields and typed
-  //                        sb_packet_t at the LTSM policy boundary.
-  // v0.0.25 2026-09-28  Connect separate PHY CSR channel (phy_csr_*) to u_phy_csr
-  //                        with byte enables (Sections 6.1, 7.5). Add private
-  //                        rdi_lp_linkerror input (Section 8.1).
-  // v0.0.26 2026-10-02  Drive RDI pl_inband_pres from LTSM training
-  //                        completion instead of packet reception during SBINIT.
-  // v0.0.27 2026-10-08  Integrate LinkError minimum residency timer (u_linkerror_timer)
-  //                        per UCIe 1.0 Section 8.3.2.7 running strictly unscaled
-  //                        8 ms (C_RESIDENCY). Add comprehensive comments for
-  //                        fatal edge detection, aggregation, and timer blocks.
-  // v0.0.28 2026-10-08  Documentation compliance pass: add detailed
-  //                        construct comments (5-30 lines) with UCIe 1.0
-  //                        spec citations across all always/assign/instantiation
-  //                        blocks.
+//   v0.0.14 2026-09-24  Phase B: expose private mailbox source acceptance and
+//                        the retained DATA64 payload to the LTSM.
+//   v0.0.15 2026-09-25  Phase C: route private RDI request, fresh-event,
+//                        Active-entry result, and Start-copy-clear signals.
+//   v0.0.16 2026-09-25  Phase D: route the Adapter Start copy as an internal
+//                        edge-triggered event, gate RDI Active on completed
+//                        LTSM Active Entry, and remove peer-Active feedback.
+//   v0.0.17 2026-09-25  Complete Phase D construct documentation for SBINIT
+//                        ownership, sideband codec mapping, and LTSM wiring.
+//   v0.0.18 2026-09-25  Correct Phase D construct header and specification
+//                        subsection references.
+//   v0.0.19 2026-09-25  Phase E: gate user data on completed Active Entry,
+//                        RDI Active, a settled LTSM ACTIVE level, and an
+//                        inactive stall acknowledgement. Add independent
+//                        per-byte TX/RX scrambler arrays seeded at Active
+//                        Entry, scramble before the TX gearbox, descramble
+//                        after the RX gearbox, and route the private RX
+//                        framing fault into the LTSM fatal policy. Restore
+//                        the RDI state-status driver and the lint use of the
+//                        preserved adapter_active_req input.
+//   v0.0.20 2026-09-25  Phase E correctness: close the Active-data gate at
+//                        private transition start, drain accepted registered
+//                        words without masking their valid, flush the RX
+//                        epoch at the first quiet transfer gap, and retain
+//                        an unarmed framing-fault edge until LTSM policy
+//                        can consume it.
+//   v0.0.21 2026-09-25  Phase E fault containment: clear pending TX/RX valid
+//                        qualifiers when the Active-data gate closes and
+//                        qualify both output valid signals with that gate.
+//                        This prevents a registered word from leaking after
+//                        a private framing fault or transition.
+//   v0.0.22 2026-09-25  Clarify the valid-register block comment for the
+//                        synchronous gate-close flush.
+//   v0.0.23 2026-09-25  Include the current private framing-fault event in
+//                        the Active-data gate while preserving recovery after
+//                        the gearbox sticky history remains set.
+//   v0.0.24 2026-09-28  Migrate sideband physical pins to scalar sb_tx_clk /
+//                        sb_tx_data and sb_rx_clk / sb_rx_data per UCIe 1.0
+//                        Sections 4.1.5 and 5.13. Adopt typed sb_packet_t
+//                        channels for TX and RX CDC mailboxes. Connect new
+//                        sb_codec handshake (tx_valid/ready, rx_valid/ready)
+//                        and route sticky codec overflow into the LTSM fatal
+//                        event policy. Add private Adapter packet client ports
+//                        (adapter_sb_tx_* / adapter_sb_rx_*) with a non-starving
+//                        arbiter featuring mandatory LTSM/response priority and
+//                        alternating request selection (Sections 4.1.5, 5.13, 6.1).
+//                        Convert between LTSM flat sideband fields and typed
+//                        sb_packet_t at the LTSM policy boundary.
+//   v0.0.25 2026-09-28  Connect separate PHY CSR channel (phy_csr_*) to u_phy_csr
+//                        with byte enables (Sections 6.1, 7.5). Add private
+//                        rdi_lp_linkerror input (Section 8.1).
+//   v0.0.26 2026-10-02  Drive RDI pl_inband_pres from LTSM training
+//                        completion instead of packet reception during SBINIT.
+//   v0.0.27 2026-10-08  Integrate LinkError minimum residency timer (u_linkerror_timer)
+//                        per UCIe 1.0 Section 8.3.2.7 running strictly unscaled
+//                        8 ms (C_RESIDENCY). Add comprehensive comments for
+//                        fatal edge detection, aggregation, and timer blocks.
+//   v0.0.28 2026-10-08  Documentation compliance pass: add detailed
+//                        construct comments (5-30 lines) with UCIe 1.0
+//                        spec citations across all always/assign/instantiation
+//                        blocks.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"

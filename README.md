@@ -9,7 +9,7 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 
 ## Implementation Scope
 - **Raw Mode**: Supported.
-- **Streaming Protocol**: Supported (Raw Mode Format 1 direct pass-through without flit headers or sequencing, verified with 512B bidirectional streaming data transfer).
+- **Streaming Protocol**: Supported (Raw Mode Format 1 direct pass-through without flit headers or sequencing, verified with 512B, 1024B, and 2048B bidirectional streaming transfers carrying incrementing, decrementing, and all-ones payloads).
 - **Standard Package**: Supported (x16 single-module).
 - **Advanced Package**: Not supported.
 - **Module**: Only 1 module supported.
@@ -97,8 +97,11 @@ tb/bfm/           Protocol layer BFM (protocol_layer_bfm.sv), independent scalar
 tb/loopback/      Dual-die top-level testbench (tb_loopback_top.sv): two real ucie_main instances
                   with crossed sideband and mainband pins, testing end-to-end training,
                   bidirectional Raw Mode streaming, and fault injection recovery.
-tb/waveform/      RESET-to-ACTIVE waveform testbench (tb_link_init_wave.sv) with 512B bidirectional
-                  random data streaming, Figure 125 LinkReset, and Figure 126 LinkError flows.
+tb/waveform/      RESET-to-ACTIVE waveform testbench (tb_link_init_wave.sv): 512B random,
+                  512B incrementing (after LinkReset), 1024B decrementing (after LinkError),
+                  and 2048B all-ones (after Disabled) bidirectional streams, plus Figure 125
+                  LinkReset, Figure 126 LinkError, and Section 8.3.2.6/8.3.2.8 Disabled flows
+                  (Die 0 via lp_state_req, Die 1 via sideband, Die 1 never requests DISABLED).
 tb/sbinit/        RESET-to-SBINIT waveform testbench (tb_reset_to_sbinit.sv).
 tb/monitors/      Coverage monitor (cov_monitor.sv) exporting LTSM/RDI states and Phase F events as JSON.
 sim/              Makefile test driver and multi-source coverage aggregator (cov_report.py).
@@ -137,7 +140,7 @@ make -C sim unit            # Run all 12 directed unit testbenches
 make -C sim sideband-unit   # Run focused sideband codec and SBINIT tests
 make -C sim sideband-peer   # Run independent golden-vector peer test
 make -C sim loopback        # Run two-die loopback bring-up and streaming test
-make -C sim link-init-wave  # Generate full RESET-to-ACTIVE waveform with 512B streaming
+make -C sim link-init-wave  # Generate full RESET-to-ACTIVE waveform with 512B/1024B/2048B streaming + LinkReset/LinkError/Disabled flows
 make -C sim sbinit-wave     # Generate RESET-to-SBINIT waveform
 
 # Run documentation compliance audit:

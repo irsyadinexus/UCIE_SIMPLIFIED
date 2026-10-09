@@ -12,7 +12,9 @@
 //   UCIe 1.0 Specification, Section 8.2     - Flit-Aware Die-to-Die Interface (FDI, Table 115)
 //   UCIe 1.0 Specification, Section 8.2.5   - FDI State Machine (Figure 119)
 //   UCIe 1.0 Specification, Section 8.3.2.1 - Link Down Event & Request Withdrawal
+//   UCIe 1.0 Specification, Section 8.3.2.6 - Disabled State rules
 //   UCIe 1.0 Specification, Section 8.3.2.7 - LinkError State & Residency Dwell
+//   UCIe 1.0 Specification, Section 8.3.2.8 - Common State rules
 //   UCIe 1.0 Specification, Section 8.3.3.1 - LinkReset Flow (Figure 125)
 //   UCIe 1.0 Specification, Section 8.3.3.2 - LinkError Flow & Recovery (Figure 126)
 //
@@ -44,15 +46,27 @@
 //   4. Full link training progresses: SBINIT -> MBINIT (CAL, REPAIR, REV) ->
 //      MBTRAIN (VREF, CLK, VTCENTER, LINKSPEED) -> LINKINIT -> ACTIVE.
 //   5. LTSM, RDI SM, and FDI SM enter ACTIVE on both dies; link Active broadcasted.
-//   6. 512-Byte bidirectional streaming verification in Format 1 Raw Mode.
+//   6. 512-Byte bidirectional streaming verification in Format 1 Raw Mode
+//      (initial bring-up stream).
 //   7. STEP 1 (Figure 125): Die 0 requests LinkReset; Die 1 receives sideband
 //      request and observes Link Down Event; both transition to RESET; 40 us
 //      RESET dwell; link restarts and successfully trains back to ACTIVE.
-//   8. STEP 2 (Figure 126): Die 0 asserts lp_linkerror; Die 1 receives sideband
+//   8. 512-Byte bidirectional streaming with an INCREMENTING payload after the
+//      LinkReset recovery (Die 0 -> Die 1 and Die 1 -> Die 0).
+//   9. STEP 2 (Figure 126): Die 0 asserts lp_linkerror; Die 1 receives sideband
 //      LinkError request; both observe Link Down Event and withdraw to NOP;
 //      both enter TRAINERROR (LinkError); sideband handshake bypasses dwell;
 //      both transition directly to RESET without LinkReset per Figure 111/119/126;
 //      40 us RESET dwell; fresh Start restarts training back to ACTIVE.
+//   10. 1024-Byte bidirectional streaming with a DECREMENTING payload after the
+//       LinkError recovery (Die 0 -> Die 1 and Die 1 -> Die 0).
+//   11. STEP 3 (Sections 8.3.2.6 / 8.3.2.8, Figures 111, 119): Die 0 Protocol
+//       Layer requests entry to DISABLED via lp_state_req; Die 1 detects the
+//       sideband Disabled request and enters DISABLED without its own Protocol
+//       Layer request; both transition to RESET; 40 us RESET dwell; fresh Start
+//       restarts training back to ACTIVE.
+//   12. 2048-Byte bidirectional streaming with an ALL-ONES payload after the
+//       Disabled recovery, then 1 us settle before end of simulation.
 //
 // REVISION HISTORY:
 //   v0.0.1  2026-09-22  Initial link initialization waveform testbench.
@@ -62,6 +76,12 @@
 //                       entry, direct exit to RESET, and recovery bring-up.
 //   v0.0.5  2026-10-08  Documentation compliance pass: add spec-cited comment
 //                       blocks above dut_die0 and dut_die1.
+//   v0.0.6  2026-10-09  Add deterministic bidirectional streaming (512B
+//                       incrementing after LinkReset, 1024B decrementing after
+//                       LinkError, 2048B all-ones after Disabled) and the
+//                       Section 8.3.2.6/8.3.2.8 Disabled flow: Die 0 requests
+//                       DISABLED via lp_state_req, Die 1 enters via the remote
+//                       sideband request, both recover to ACTIVE.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -700,6 +720,122 @@ module tb_link_init_wave;
   integer d0_rx_count;
   integer d1_rx_count;
   integer stream_errors;
+  integer bidir_err;
+  localparam int BYTES_PER_BEAT   = DATA_W / 8;            // 16 bytes per 128-bit beat
+  localparam int MAX_STREAM_BEATS = 2048 / BYTES_PER_BEAT; // 128 beats (2048 bytes)
+
+  // --------------------------------------------------------------------------
+  // task: bidir_stream - Deterministic Bidirectional Streaming Transfer
+  //
+  // Transfers nbeats 128-bit beats in BOTH directions and verifies the
+  // received data against the deterministic payload pattern. Die 0 -> Die 1
+  // and Die 1 -> Die 0 carry the identical pattern, so a single expected-word
+  // array is used for both receive checks.
+  //
+  // pattern:
+  //   0 = incrementing byte sequence (byte n = n mod 256)
+  //   1 = decrementing byte sequence (byte n = 255 - (n mod 256))
+  //   2 = all-ones payload (every byte = 0xFF)
+  //
+  // err_count: number of received beats that did not match the expected pattern.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 - Raw Die-to-Die Interface
+  //           (Table 114); Section 8.3.2.8 - Common State rules (Active data
+  //           transfer). Raw Mode Format 1 is a direct pass-through with no
+  //           flit headers or sequencing.
+  // --------------------------------------------------------------------------
+  task automatic bidir_stream(input int unsigned nbeats,
+                              input int unsigned pattern,
+                              output int unsigned err_count);
+    logic [DATA_W-1:0] words [0:MAX_STREAM_BEATS-1];
+    begin
+      // Generate the deterministic payload pattern
+      for (int i = 0; i < MAX_STREAM_BEATS; i = i + 1) begin
+        for (int b = 0; b < BYTES_PER_BEAT; b = b + 1) begin
+          case (pattern)
+            2:       words[i][b*8 +: 8] = 8'hFF;
+            1:       words[i][b*8 +: 8] = 8'hFF - ((i*BYTES_PER_BEAT + b) & 8'hFF);
+            default: words[i][b*8 +: 8] = ((i*BYTES_PER_BEAT + b) & 8'hFF);
+          endcase
+        end
+      end
+
+      err_count = 0;
+
+      // Both dies stream in Raw mode using STREAM_ID_S0_STREAMING
+      d0_lp_stream = STREAM_ID_S0_STREAMING;
+      d1_lp_stream = STREAM_ID_S0_STREAMING;
+
+      // Fork concurrent bidirectional transmission and reception
+      fork
+        // Die 0 TX: Stream nbeats beats to Die 1
+        begin : bs_d0_tx
+          for (int i = 0; i < nbeats; i = i + 1) begin
+            @(negedge lclk);
+            while (!d0_pl_trdy) @(negedge lclk);
+            d0_lp_data  = words[i];
+            d0_lp_valid = 1'b1;
+            d0_lp_irdy  = 1'b1;
+          end
+          @(negedge lclk);
+          d0_lp_valid = 1'b0;
+          d0_lp_irdy  = 1'b0;
+          d0_lp_data  = '0;
+        end
+
+        // Die 1 TX: Stream nbeats beats to Die 0
+        begin : bs_d1_tx
+          for (int i = 0; i < nbeats; i = i + 1) begin
+            @(negedge lclk);
+            while (!d1_pl_trdy) @(negedge lclk);
+            d1_lp_data  = words[i];
+            d1_lp_valid = 1'b1;
+            d1_lp_irdy  = 1'b1;
+          end
+          @(negedge lclk);
+          d1_lp_valid = 1'b0;
+          d1_lp_irdy  = 1'b0;
+          d1_lp_data  = '0;
+        end
+
+        // Die 0 RX: Receive and verify nbeats beats from Die 1
+        begin : bs_d0_rx
+          int rcv;
+          rcv = 0;
+          while (rcv < nbeats) begin
+            @(posedge lclk);
+            #0.1;
+            if (d0_pl_valid) begin
+              if (d0_pl_data !== words[rcv]) begin
+                $display("FAIL [Die0 RX Beat %0d]: got %032h, expected %032h",
+                         rcv, d0_pl_data, words[rcv]);
+                err_count = err_count + 1;
+              end
+              rcv = rcv + 1;
+            end
+          end
+        end
+
+        // Die 1 RX: Receive and verify nbeats beats from Die 0
+        begin : bs_d1_rx
+          int rcv;
+          rcv = 0;
+          while (rcv < nbeats) begin
+            @(posedge lclk);
+            #0.1;
+            if (d1_pl_valid) begin
+              if (d1_pl_data !== words[rcv]) begin
+                $display("FAIL [Die1 RX Beat %0d]: got %032h, expected %032h",
+                         rcv, d1_pl_data, words[rcv]);
+                err_count = err_count + 1;
+              end
+              rcv = rcv + 1;
+            end
+          end
+        end
+      join
+    end
+  endtask
 
   // ==========================================================================
   // Termination and Success Checker
@@ -879,6 +1015,22 @@ module tb_link_init_wave;
     repeat (16) @(posedge lclk);
 
     // ==========================================================================
+    // 1b. 512-Byte Bidirectional INCREMENTING Stream after LinkReset recovery
+    //     (User item 1: 512 bytes, incrementing payload, both directions)
+    // ==========================================================================
+    $display("\n==========================================================================");
+    $display("[%0t ns] 512-Byte Bidirectional INCREMENTING Stream after LinkReset recovery", $time);
+    $display("==========================================================================");
+    bidir_stream(STREAM_BYTES / BYTES_PER_BEAT, 0, bidir_err);
+    if (bidir_err == 0) begin
+      $display("SUCCESS: 512 bytes transferred bidirectionally with incrementing payload (0 errors)");
+    end else begin
+      $fatal(1, "TEST FAILED tb_link_init_wave: %0d errors in post-LinkReset incrementing stream", bidir_err);
+    end
+    // Let link run in stable ACTIVE for 16 cycles before the LinkError step
+    repeat (16) @(posedge lclk);
+
+    // ==========================================================================
     // 2. LinkError Flow (Specification Section 8.3.3.2, Figure 126)
     // ==========================================================================
     $display("\n==========================================================================");
@@ -941,20 +1093,121 @@ module tb_link_init_wave;
     wait (d0_ltsm_state == LT_ACTIVE && d1_ltsm_state == LT_ACTIVE);
     wait (d0_pl_state_sts == FDI_STS_ACTIVE && d1_pl_state_sts == FDI_STS_ACTIVE);
     $display("[%0t ns] SUCCESS: Both dies returned to ACTIVE state after LinkError (Figure 126 confirmed)!\n", $time);
+    // Let link run in stable ACTIVE for 16 cycles before next step
+    repeat (16) @(posedge lclk);
+
+    // ==========================================================================
+    // 2b. 1024-Byte Bidirectional DECREMENTING Stream after LinkError recovery
+    //     (User item 2: 1024 bytes, decrementing payload, both directions)
+    // ==========================================================================
+    $display("\n==========================================================================");
+    $display("[%0t ns] 1024-Byte Bidirectional DECREMENTING Stream after LinkError recovery", $time);
+    $display("==========================================================================");
+    bidir_stream(1024 / BYTES_PER_BEAT, 1, bidir_err);
+    if (bidir_err == 0) begin
+      $display("SUCCESS: 1024 bytes transferred bidirectionally with decrementing payload (0 errors)");
+    end else begin
+      $fatal(1, "TEST FAILED tb_link_init_wave: %0d errors in post-LinkError decrementing stream", bidir_err);
+    end
+    // Let link run in stable ACTIVE for 16 cycles before the Disabled step
+    repeat (16) @(posedge lclk);
+
+    // ==========================================================================
+    // STEP 3: Disabled Flow (Spec Sections 8.3.2.6 / 8.3.2.8, Figures 111, 119)
+    // ==========================================================================
+    $display("\n==========================================================================");
+    $display("[%0t ns] STEP 3: Disabled Entry and Exit Flow (Spec Sections 8.3.2.6 / 8.3.2.8, Figures 111, 119)", $time);
+    $display("==========================================================================");
+
+    // Wait for 1us after the post-LinkError data transfer completed
+    #1000;
+    $display("[%0t ns] 1us delay complete. Die 0 Protocol Layer requesting entry to DISABLED (lp_state_req=DISABLED)...", $time);
+
+    // Die 0 protocol layer requests entry to DISABLED via the FDI state request
+    // (Section 8.3.2.6: "Protocol Layer requests entry to Disabled state";
+    //  Section 8.3.2.8 item 2: "[Active...]->Disabled on lp_state_req == Disabled")
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_DISABLED;
+
+    // Die 0 Physical Layer transmits sideband message LinkMgmt.RDI.Req.Disabled
+    // (MsgCode 01h, Subcode 0Ch) to Die 1. Die 1 receives it on the sideband.
+    @(posedge lclk);
+    while (!(d1_sb_rx_pkt_vld && (d1_sb_rx_msgcode == 8'h01) && (d1_sb_rx_msgsubcode == 8'h0C))) @(posedge lclk);
+    $display("[%0t ns] Die 1 received sideband message requesting Disabled entry from Die 0 (MsgCode 01h, Subcode 0Ch)", $time);
+
+    // Both dies enter DISABLED (Die 0 via local request, Die 1 via remote sideband)
+    wait (d0_pl_state_sts == FDI_STS_DISABLED && d1_pl_state_sts == FDI_STS_DISABLED);
+    $display("[%0t ns] Both dies entered DISABLED (pl_state_sts=DISABLED) per Sections 8.3.2.6 / 8.3.2.8", $time);
+
+    // Per Figures 111/119 and Section 8.3.2.8: Die 1 Protocol Layer does NOT
+    // request entry to DISABLED. It observes the Link Down Event and withdraws
+    // its request to NOP (Section 8.3.2.1).
+    @(negedge lclk);
+    d1_lp_state_req = FDI_REQ_NOP;
+    $display("[%0t ns] Die 1 Protocol Layer observed Link Down Event (d1_lp_state_req set to NOP; Die 1 does NOT request DISABLED)", $time);
+
+    // Both dies transition to RESET following the completed Disabled exchange
+    wait (d0_ltsm_state == LT_RESET && d1_ltsm_state == LT_RESET);
+    wait (d0_pl_state_sts == FDI_STS_RESET && d1_pl_state_sts == FDI_STS_RESET);
+    $display("[%0t ns] Both dies successfully entered RESET following the Disabled exchange", $time);
+
+    // Die 0 clears its request to NOP
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_NOP;
+    // With FAST_SIM=1, physical layers dwell in RESET for 40 us
+    $display("[%0t ns] Waiting 40 us physical layer RESET dwell...", $time);
+    #40_100;
+    $display("[%0t ns] 40 us RESET dwell complete. Restarting link training...", $time);
+    // Die 0 software issues Start Link Training via FDI Link Control CSR write
+    fdi_cfg_write_link_control(0);
+    @(negedge lclk);
+    d0_lp_state_req = FDI_REQ_ACTIVE;
+    d1_lp_state_req = FDI_REQ_ACTIVE;
+
+    // Wait until both dies walk back through training to ACTIVE state
+    wait (d0_ltsm_state == LT_ACTIVE && d1_ltsm_state == LT_ACTIVE);
+    wait (d0_pl_state_sts == FDI_STS_ACTIVE && d1_pl_state_sts == FDI_STS_ACTIVE);
+    $display("[%0t ns] SUCCESS: Both dies returned to ACTIVE state after Disabled (Sections 8.3.2.6 / 8.3.2.8, Figures 111/119 confirmed)!\n", $time);
+
+    // Let link run in stable ACTIVE for 16 cycles before the final stream
+    repeat (16) @(posedge lclk);
+
+    // ==========================================================================
+    // 3b. 2048-Byte Bidirectional ALL-ONES Stream after Disabled recovery
+    //     (User item 4: 2048 bytes, all-1 value payload, both directions)
+    // ==========================================================================
+    $display("\n==========================================================================");
+    $display("[%0t ns] 2048-Byte Bidirectional ALL-ONES Stream after Disabled recovery", $time);
+    $display("==========================================================================");
+    bidir_stream(2048 / BYTES_PER_BEAT, 2, bidir_err);
+    if (bidir_err == 0) begin
+      $display("SUCCESS: 2048 bytes transferred bidirectionally with all-ones payload (0 errors)");
+    end else begin
+      $fatal(1, "TEST FAILED tb_link_init_wave: %0d errors in post-Disabled all-ones stream", bidir_err);
+    end
+
+    // Wait for 1us before ending the simulation
+    $display("[%0t ns] Waiting 1us before ending the simulation...", $time);
+    #1000;
 
     // Final success summary
     $display("==========================================================================");
-    $display("TEST PASSED tb_link_init_wave: all bringup, streaming, LinkReset, and LinkError verified");
+    $display("TEST PASSED tb_link_init_wave: bringup, streaming, LinkReset, LinkError, and Disabled verified");
     $display("  1. Link bringup and 512B bidirectional data streaming verified");
     $display("  2. Section 8.3.3.1 Figure 125 LinkReset entry/exit confirmed (Die 1 never sends LinkReset)");
-    $display("  3. Section 8.3.3.2 Figure 126 LinkError entry/exit confirmed");
+    $display("  3. 512B bidirectional INCREMENTING stream after LinkReset verified");
+    $display("  4. Section 8.3.3.2 Figure 126 LinkError entry/exit confirmed");
+    $display("  5. 1024B bidirectional DECREMENTING stream after LinkError verified");
+    $display("  6. Section 8.3.2.6/8.3.2.8 Figures 111/119 Disabled entry/exit confirmed");
+    $display("     (Die 0 via lp_state_req, Die 1 via sideband, Die 1 does NOT request DISABLED)");
+    $display("  7. 2048B bidirectional ALL-ONES stream after Disabled verified");
     $display("==========================================================================");
     $finish;
   end
 
   // Watchdog timeout
   initial begin
-    #2_000_000; // 2 ms watchdog for bringup + LinkReset + LinkError flows
+    #4_000_000; // 4 ms watchdog for bringup + streaming + LinkReset + LinkError + Disabled flows
     $fatal(1, "TEST FAILED tb_link_init_wave: Watchdog timeout at %0t ns", $time);
   end
 

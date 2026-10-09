@@ -171,6 +171,16 @@
 //   v0.0.10 2026-10-09  Cleanup pass: remove obsolete implementation-phase
 //                        references outside revision history, add task/function
 //                        argument comments, and split multi-signal declarations.
+//   v0.0.11 2026-10-09  Clock and source contract policy verification: wire
+//                        mb_source_ready, mb_clock_running, mb_clock_enable,
+//                        mb_clock_run. Add Scenario 11 for RXCLKCAL directional
+//                        clock start/done governance, physical clock running
+//                        acknowledgement waiting, full clock stop before final
+//                        response, duplicate replay, and bidirectional state skew
+//                        tolerance (both late and early peer arrival). Add
+//                        Scenario 12 for clock source readiness gating without
+//                        lost start and OE disabling across training states.
+//                        Add PARAM strobe mode rejection check.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -210,6 +220,12 @@ module ut_ltsm_policy;
   logic        rst_tmr_start;
   logic        tmr_expired;
   logic        rst_tmr_expired;
+
+  // ---- private physical clock and source control contract
+  logic        mb_source_ready;
+  logic        mb_clock_running;
+  logic        mb_clock_enable;
+  logic        mb_clock_run;
 
   // ---- sideband TX from LTSM
   logic        sb_tx_load;
@@ -362,7 +378,11 @@ module ut_ltsm_policy;
     .pat_lfsr_enable(pat_lfsr_enable), .pat_done(pat_done),
     .tmr_start(tmr_start), .tmr_run(tmr_run),
     .rst_tmr_start(rst_tmr_start), .tmr_expired(tmr_expired),
-    .rst_tmr_expired(rst_tmr_expired), .le_tmr_start(le_tmr_start), .le_tmr_expired(le_tmr_expired)
+    .rst_tmr_expired(rst_tmr_expired), .le_tmr_start(le_tmr_start), .le_tmr_expired(le_tmr_expired),
+    .mb_source_ready(mb_source_ready),
+    .mb_clock_running(mb_clock_running),
+    .mb_clock_enable(mb_clock_enable),
+    .mb_clock_run(mb_clock_run)
   );
 
   // -------------------------------------------------------------------------
@@ -605,6 +625,8 @@ module ut_ltsm_policy;
       rdi_linkreset_req    = 1'b0;
       rdi_disabled_req     = 1'b0;
       framing_fault_event  = 1'b0;
+      mb_source_ready      = 1'b1;
+      mb_clock_running     = 1'b0;
       sb_rx_pkt_vld        = 1'b0;
       sbinit_rx_iter_vld   = 1'b0;
       sbinit_rx_iter_match = 1'b0;
@@ -700,6 +722,38 @@ module ut_ltsm_policy;
           cycles   = C_DEADLINE;
         end
       end
+    end
+  endtask
+
+  task await_tx_packet;
+    input logic [7:0] expected_code;
+    input logic [7:0] expected_subcode;
+    int version;
+    logic done;
+    begin
+      version  = tx_version;
+      cap_code = 8'hFF;
+      done     = 1'b0;
+      fork
+        begin
+          while (!done) begin
+            wait (tx_version != version);
+            @(negedge lclk);
+            version = tx_version;
+            if ((tx_code_q == expected_code) && (tx_sub_q == expected_subcode)) begin
+              cap_op   = tx_op_q;
+              cap_code = tx_code_q;
+              cap_sub  = tx_sub_q;
+              cap_data = tx_data_q;
+              done     = 1'b1;
+            end
+          end
+        end
+        begin
+          repeat (C_DEADLINE) @(posedge lclk);
+        end
+      join_any
+      disable fork;
     end
   endtask
 
@@ -1244,6 +1298,24 @@ module ut_ltsm_policy;
         errs = errs + 1;
       end
 
+      // --- Sub-test 6e: strobe mode negotiation in response or request is fatal ---
+      // UCIe 1.0 Section 4.5.3.3.1: Profile operates in differential continuous clock mode only.
+      // A peer attempting strobe mode (clock mode bit 9 = 0) must be rejected.
+      run_to_mbinit_param(1'b1);
+      drive_data64(MC_MBINIT_RSP, MS_PARAM_CFG, PARAM_RSP_DATA & ~PARAM_MASK_CLOCK_MODE);
+      expect_fatal();
+      if (ltsm_state != LT_TRAINERROR) begin
+        $display("FAIL param_compat: strobe mode response not rejected (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+      run_to_mbinit_param(1'b1);
+      drive_data64(MC_MBINIT_REQ, MS_PARAM_CFG, PARAM_REQ_DATA & ~PARAM_MASK_CLOCK_MODE);
+      expect_fatal();
+      if (ltsm_state != LT_TRAINERROR) begin
+        $display("FAIL param_compat: strobe mode request not rejected (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+
       total_errors = total_errors + errs;
       if (errs == 0)
         $display("  PASS: PARAM DATA64 compatibility verified");
@@ -1474,6 +1546,8 @@ module ut_ltsm_policy;
       sbinit_tx_iter_done = 1'b0;
       sbinit_tx_idle      = 1'b1;
       framing_fault_event = 1'b0;
+      mb_source_ready     = 1'b1;
+      mb_clock_running    = 1'b0;
       lreset_n = 1'b0;
       repeat (5) @(posedge lclk);
       lreset_n = 1'b1;
@@ -1582,6 +1656,8 @@ module ut_ltsm_policy;
       framing_fault_event = 1'b0;
       start_link_train    = 1'b0;
       adapter_active_req  = 1'b0;
+      mb_source_ready     = 1'b1;
+      mb_clock_running    = 1'b0;
       lreset_n = 1'b0;
       repeat (5) @(posedge lclk);
       lreset_n = 1'b1;
@@ -1658,6 +1734,395 @@ module ut_ltsm_policy;
   endtask
 
   // =========================================================================
+  // Scenario 11: RXCLKCAL Directional Clock Governance & Skew Tolerance
+  // =========================================================================
+  // Verifies UCIe 1.0 Section 4.5.3.4.5 & contract:
+  //   - Received peer START request asserts mb_clock_run and schedules response.
+  //   - Response is held until physical clock running acknowledgement (mb_clock_running == 1).
+  //   - Duplicate peer START request replays idempotently with acknowledgement.
+  //   - Received peer DONE request deasserts mb_clock_run and schedules response.
+  //   - Final response is held until full clock stop (mb_clock_running == 0).
+  //   - Duplicate peer DONE request replays idempotently with full stop acknowledgement.
+  //   - Late peer arrival skew: local completes first, peer arrives later.
+  //   - Early peer arrival skew: peer START arrives while local is still in TXSELFCAL.
+  //   - LTSM transitions to VTCENTER only when both local and peer are complete and clock stopped.
+  // =========================================================================
+  task test_rxclkcal_policy;
+    int errs;
+    int check_cycles;
+    begin
+      errs = 0;
+      $display("--- Scenario 11: RXCLKCAL Directional Clock Governance & Skew ---");
+
+      // --- Sub-test 11a: Peer START request, wait mb_clock_running ---
+      run_to_mbinit_param(1'b1);
+      while (ltsm_state != LT_MB_RXCLKCAL) advance_one_state();
+
+      // LTSM presents local START request (06h)
+      await_request();
+      if ((cap_code != MC_MBTRAIN_REQ) || (cap_sub != MS_RXCLKCAL_START)) begin
+        $display("FAIL rxclkcal: expected local START request 06h, saw %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // Peer sends START request (06h) while mb_clock_running is 0
+      mb_clock_running = 1'b0;
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_START);
+      repeat (2) @(posedge lclk);
+      #0.1;
+
+      // DUT must assert mb_clock_run
+      if (mb_clock_run !== 1'b1) begin
+        $display("FAIL rxclkcal: mb_clock_run did not assert on peer START request");
+        errs = errs + 1;
+      end
+
+      // DUT must NOT emit START response while mb_clock_running == 0
+      for (check_cycles = 0; check_cycles < 8; check_cycles = check_cycles + 1) begin
+        @(posedge lclk);
+        #0.1;
+        if (sb_tx_load && (sb_tx_msgcode == MC_MBTRAIN_RSP)) begin
+          $display("FAIL rxclkcal: response emitted before mb_clock_running acknowledged");
+          errs = errs + 1;
+        end
+      end
+
+      // Now assert mb_clock_running = 1
+      @(negedge lclk);
+      mb_clock_running = 1'b1;
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_START);
+      if ((cap_code != MC_MBTRAIN_RSP) || (cap_sub != MS_RXCLKCAL_START)) begin
+        $display("FAIL rxclkcal: expected START response 06h, saw %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // --- Sub-test 11b: Duplicate peer START request replay ---
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_START);
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_START);
+      if ((cap_code != MC_MBTRAIN_RSP) || (cap_sub != MS_RXCLKCAL_START)) begin
+        $display("FAIL rxclkcal: duplicate START did not replay 06h, saw %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // --- Sub-test 11c: Peer DONE request, wait full clock stop (mb_clock_running == 0) ---
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_DONE);
+      repeat (2) @(posedge lclk);
+      #0.1;
+
+      // DUT must deassert mb_clock_run
+      if (mb_clock_run !== 1'b0) begin
+        $display("FAIL rxclkcal: mb_clock_run did not deassert on peer DONE request");
+        errs = errs + 1;
+      end
+
+      // DUT must NOT emit DONE response while mb_clock_running is still 1
+      for (check_cycles = 0; check_cycles < 8; check_cycles = check_cycles + 1) begin
+        @(posedge lclk);
+        #0.1;
+        if (sb_tx_load && (sb_tx_msgcode == MC_MBTRAIN_RSP)) begin
+          $display("FAIL rxclkcal: DONE response emitted before clock fully stopped");
+          errs = errs + 1;
+        end
+      end
+
+      // Now assert mb_clock_running = 0
+      @(negedge lclk);
+      mb_clock_running = 1'b0;
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_DONE);
+      if ((cap_code != MC_MBTRAIN_RSP) || (cap_sub != MS_RXCLKCAL_DONE)) begin
+        $display("FAIL rxclkcal: expected DONE response 07h, saw %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // --- Sub-test 11d: Duplicate peer DONE request replay ---
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_DONE);
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_DONE);
+      if ((cap_code != MC_MBTRAIN_RSP) || (cap_sub != MS_RXCLKCAL_DONE)) begin
+        $display("FAIL rxclkcal: duplicate DONE did not replay 07h, saw %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // Service local requests to finish state
+      drive_nodata(MC_MBTRAIN_RSP, MS_RXCLKCAL_START);
+      await_tx_packet(MC_MBTRAIN_REQ, MS_RXCLKCAL_DONE);
+      if ((cap_code != MC_MBTRAIN_REQ) || (cap_sub != MS_RXCLKCAL_DONE)) begin
+        $display("FAIL rxclkcal: expected local DONE request 07h, saw %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+      drive_nodata(MC_MBTRAIN_RSP, MS_RXCLKCAL_DONE);
+      wait_state_bounded(LT_MB_VTCENTER, C_DEADLINE);
+      if (ltsm_state != LT_MB_VTCENTER) begin
+        $display("FAIL rxclkcal: did not advance to VTCENTER (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+
+      // --- Sub-test 11e: Late peer arrival skew: peer START and DONE arrive after local enters VTCENTER ---
+      run_to_mbinit_param(1'b1);
+      while (ltsm_state != LT_MB_RXCLKCAL) advance_one_state();
+
+      // Service local step 0
+      await_request();
+      reply_matching();
+      wait_txn_done(LT_MB_RXCLKCAL, tx_version);
+      repeat (2) @(posedge lclk);
+
+      // Service local step 1
+      await_request();
+      reply_matching();
+      wait_state_bounded(LT_MB_VTCENTER, C_DEADLINE);
+      if (ltsm_state != LT_MB_VTCENTER) begin
+        $display("FAIL rxclkcal: local steps complete did not enter VTCENTER (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+
+      // Late peer START arrives during VTCENTER
+      mb_clock_running = 1'b0;
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_START);
+      repeat (2) @(posedge lclk);
+      if (mb_clock_run !== 1'b1) begin
+        $display("FAIL rxclkcal: late peer START during VTCENTER did not assert mb_clock_run");
+        errs = errs + 1;
+      end
+      @(negedge lclk);
+      mb_clock_running = 1'b1;
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_START);
+      if ((cap_code != MC_MBTRAIN_RSP) || (cap_sub != MS_RXCLKCAL_START)) begin
+        $display("FAIL rxclkcal: late peer START response wrong code/subcode: %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // Late peer DONE arrives during VTCENTER
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_DONE);
+      repeat (2) @(posedge lclk);
+      if (mb_clock_run !== 1'b0) begin
+        $display("FAIL rxclkcal: late peer DONE during VTCENTER did not deassert mb_clock_run");
+        errs = errs + 1;
+      end
+      @(negedge lclk);
+      mb_clock_running = 1'b0;
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_DONE);
+      if ((cap_code != MC_MBTRAIN_RSP) || (cap_sub != MS_RXCLKCAL_DONE)) begin
+        $display("FAIL rxclkcal: late peer DONE response wrong code/subcode: %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // --- Sub-test 11f: Early peer arrival skew: peer START arrives while in TXSELFCAL ---
+      run_to_mbinit_param(1'b1);
+      while (ltsm_state != LT_MB_TXSELFCAL) advance_one_state();
+
+      // LTSM has entered TXSELFCAL and presented local request 05h
+      await_request();
+      if ((cap_code != MC_MBTRAIN_REQ) || (cap_sub != MS_TXSELFCAL_DONE)) begin
+        $display("FAIL rxclkcal: expected TXSELFCAL request 05h, saw %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // Early peer START arrives during TXSELFCAL
+      mb_clock_running = 1'b0;
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_START);
+      repeat (2) @(posedge lclk);
+      if (mb_clock_run !== 1'b1) begin
+        $display("FAIL rxclkcal: early peer START during TXSELFCAL did not assert mb_clock_run");
+        errs = errs + 1;
+      end
+      @(negedge lclk);
+      mb_clock_running = 1'b1;
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_START);
+      if ((cap_code != MC_MBTRAIN_RSP) || (cap_sub != MS_RXCLKCAL_START)) begin
+        $display("FAIL rxclkcal: early peer START response wrong code/subcode: %02h/%02h", cap_code, cap_sub);
+        errs = errs + 1;
+      end
+
+      // Now answer local TXSELFCAL request 05h
+      drive_nodata(MC_MBTRAIN_RSP, MS_TXSELFCAL_DONE);
+      wait_state_bounded(LT_MB_RXCLKCAL, C_DEADLINE);
+      if (ltsm_state != LT_MB_RXCLKCAL) begin
+        $display("FAIL rxclkcal: did not enter RXCLKCAL after TXSELFCAL (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+
+      // Forwarded clock must remain active because peer START is running
+      if (mb_clock_run !== 1'b1) begin
+        $display("FAIL rxclkcal: mb_clock_run dropped on entry to RXCLKCAL");
+        errs = errs + 1;
+      end
+
+      // Local runs its own START (06h) and DONE (07h) transactions
+      await_tx_packet(MC_MBTRAIN_REQ, MS_RXCLKCAL_START);
+      drive_nodata(MC_MBTRAIN_RSP, MS_RXCLKCAL_START);
+      await_tx_packet(MC_MBTRAIN_REQ, MS_RXCLKCAL_DONE);
+      drive_nodata(MC_MBTRAIN_RSP, MS_RXCLKCAL_DONE);
+
+      // Now peer sends DONE request (07h)
+      drive_nodata(MC_MBTRAIN_REQ, MS_RXCLKCAL_DONE);
+      repeat (2) @(posedge lclk);
+      if (mb_clock_run !== 1'b0) begin
+        $display("FAIL rxclkcal: peer DONE did not deassert mb_clock_run");
+        errs = errs + 1;
+      end
+      @(negedge lclk);
+      mb_clock_running = 1'b0;
+      await_tx_packet(MC_MBTRAIN_RSP, MS_RXCLKCAL_DONE);
+
+      // Both complete -> advance to VTCENTER
+      wait_state_bounded(LT_MB_VTCENTER, C_DEADLINE);
+      if (ltsm_state != LT_MB_VTCENTER) begin
+        $display("FAIL rxclkcal: did not enter VTCENTER after early peer completion (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+
+      total_errors = total_errors + errs;
+      if (errs == 0)
+        $display("  PASS: RXCLKCAL directional governance & skew tolerance verified");
+    end
+  endtask
+
+  // =========================================================================
+  // Scenario 12: Clock Source Readiness and OE Classification Policy
+  // =========================================================================
+  task test_source_ready_and_oe_policy;
+    int errs;
+    begin
+      errs = 0;
+      $display("--- Scenario 12: Source Readiness & OE Classification ---");
+
+      // Reset with mb_source_ready = 0
+      sb_tx_busy           = 1'b0;
+      tx_grant             = 1'b1;
+      start_link_train     = 1'b0;
+      adapter_active_req   = 1'b0;
+      rdi_linkreset_req    = 1'b0;
+      rdi_disabled_req     = 1'b0;
+      framing_fault_event  = 1'b0;
+      sb_rx_pkt_vld        = 1'b0;
+      sbinit_rx_iter_vld   = 1'b0;
+      sbinit_rx_iter_match = 1'b0;
+      sbinit_tx_iter_done  = 1'b0;
+      sbinit_tx_idle       = 1'b1;
+      mb_source_ready      = 1'b0;
+      mb_clock_running     = 1'b0;
+      lreset_n = 1'b0;
+      repeat (5) @(posedge lclk);
+      lreset_n = 1'b1;
+      adapter_active_req = 1'b1;
+      repeat (10) @(posedge lclk);
+
+      // Wait for RESET minimum timer
+      @(posedge rst_tmr_expired);
+      #0.1;
+
+      // Pulse two iteration matches
+      pulse_iter(1'b1);
+      pulse_iter(1'b1);
+      repeat (5) @(posedge lclk);
+      #0.1;
+
+      // LTSM must remain in RESET while mb_source_ready == 0
+      if (ltsm_state != LT_RESET) begin
+        $display("FAIL source_oe: RESET exited while mb_source_ready == 0 (state %02h)", ltsm_state);
+        errs = errs + 1;
+      end
+      if (u_dut.pattern_trigger_pending_q !== 1'b1) begin
+        $display("FAIL source_oe: start trigger lost while waiting for mb_source_ready");
+        errs = errs + 1;
+      end
+      if (mb_clock_enable !== 1'b0) begin
+        $display("FAIL source_oe: mb_clock_enable != 0 in RESET");
+        errs = errs + 1;
+      end
+
+      // Assert mb_source_ready: LTSM immediately enters SBINIT without losing trigger
+      @(negedge lclk);
+      mb_source_ready = 1'b1;
+      wait_state_bounded(LT_SBINIT, C_DEADLINE);
+      if (ltsm_state != LT_SBINIT) begin
+        $display("FAIL source_oe: did not enter SBINIT upon mb_source_ready assertion");
+        errs = errs + 1;
+      end
+      if (mb_clock_enable !== 1'b0) begin
+        $display("FAIL source_oe: mb_clock_enable != 0 in SBINIT");
+        errs = errs + 1;
+      end
+
+      // Advance through SBINIT to PARAM
+      repeat (4) pulse_tx_done();
+      wait (u_dut.sbinit_phase_q == 2'd2);
+      inject_sbinit(MC_SB_OOB_RESET, MS_SB_OOB_RESET, SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+      wait (u_dut.sbinit_phase_q == 2'd3);
+      inject_sbinit(MC_SB_DONE_REQ, MS_SB_DONE, SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+      inject_sbinit(MC_SB_OOB_RESET, MS_SB_OOB_RESET, SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+      inject_sbinit(MC_SB_DONE_RSP, MS_SB_DONE, SRCID_PHY, DSTID_REMOTE_PHY, 1'b0);
+      wait_state_bounded(LT_MBINIT_PARAM, C_DEADLINE);
+      if (mb_clock_enable !== 1'b0) begin
+        $display("FAIL source_oe: mb_clock_enable != 0 in PARAM");
+        errs = errs + 1;
+      end
+
+      // Advance to CAL
+      advance_one_state();
+      if (ltsm_state != LT_MBINIT_CAL) begin
+        $display("FAIL source_oe: did not reach CAL");
+        errs = errs + 1;
+      end
+      if (mb_clock_enable !== 1'b0) begin
+        $display("FAIL source_oe: mb_clock_enable != 0 in CAL");
+        errs = errs + 1;
+      end
+
+      // Advance to RPCLK (electrical idle begins)
+      advance_one_state();
+      if (ltsm_state != LT_MBINIT_RPCLK) begin
+        $display("FAIL source_oe: did not reach RPCLK");
+        errs = errs + 1;
+      end
+      if (mb_clock_enable !== 1'b1) begin
+        $display("FAIL source_oe: mb_clock_enable != 1 in RPCLK (electrical idle)");
+        errs = errs + 1;
+      end
+      if (mb_clock_run !== 1'b0) begin
+        $display("FAIL source_oe: mb_clock_run != 0 in RPCLK");
+        errs = errs + 1;
+      end
+
+      // Walk states through to LINKSPEED
+      while (ltsm_state != LT_MB_LINKSPEED) advance_one_state();
+      if (mb_clock_enable !== 1'b1 || mb_clock_run !== 1'b1) begin
+        $display("FAIL source_oe: continuous clock not enabled/running in LINKSPEED");
+        errs = errs + 1;
+      end
+
+      // Complete LINKSPEED
+      advance_one_state(); // step 0
+      advance_one_state(); // step 1 -> enters LINKINIT
+      if (ltsm_state != LT_LINKINIT) begin
+        $display("FAIL source_oe: did not reach LINKINIT");
+        errs = errs + 1;
+      end
+      if (mb_clock_enable !== 1'b1 || mb_clock_run !== 1'b1) begin
+        $display("FAIL source_oe: continuous clock not enabled/running in LINKINIT");
+        errs = errs + 1;
+      end
+
+      // Complete LINKINIT -> ACTIVE
+      await_request();
+      drive_nodata(MC_LM_RDI_RSP, MS_LM_ACTIVE);
+      wait_state_bounded(LT_ACTIVE, C_DEADLINE);
+      if (ltsm_state != LT_ACTIVE) begin
+        $display("FAIL source_oe: did not reach ACTIVE");
+        errs = errs + 1;
+      end
+      if (mb_clock_enable !== 1'b1 || mb_clock_run !== 1'b1) begin
+        $display("FAIL source_oe: continuous clock not enabled/running in ACTIVE");
+        errs = errs + 1;
+      end
+
+      total_errors = total_errors + errs;
+      if (errs == 0)
+        $display("  PASS: Source readiness and OE classification verified");
+    end
+  endtask
+
+  // =========================================================================
   // Main test sequence
   // =========================================================================
   initial begin
@@ -1676,6 +2141,8 @@ module ut_ltsm_policy;
     test_recovery_policy();
     test_framing_fault();
     test_linkerror_dwell();
+    test_rxclkcal_policy();
+    test_source_ready_and_oe_policy();
 
     // Export unit evidence JSON upon clean zero-error completion.
     // Spec ref: UCIe 1.0 Section 4.5.3, Section 4.5.3.8, Table 56, and

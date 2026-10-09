@@ -202,6 +202,14 @@
 //   v0.0.14 2026-10-09  Cleanup pass: remove obsolete implementation-phase
 //                        references outside revision history, add task/function
 //                        argument comments, and split multi-signal declarations.
+//   v0.0.15 2026-10-09  Physical clock and source contract validation: wire
+//                        mb_source_ready, mb_clock_running, mb_clock_enable,
+//                        mb_clock_run. Model forwarded clock run pipeline.
+//                        Verify delayed mb_source_ready in both initial and
+//                        recovery RESET exits without lost start triggers.
+//                        Check clock policy with the directional acknowledgment harness.
+//   v0.0.16 2026-10-09  Hold test mailbox busy until codec acceptance completes.
+//                        Remove incidental state-exit output assertions.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -242,6 +250,10 @@ module ut_ltsm;
   logic        tmr_expired;
   logic        le_tmr_start;
   logic        le_tmr_expired_tb;
+  logic        mb_source_ready;
+  logic        mb_clock_running;
+  logic        mb_clock_enable;
+  logic        mb_clock_run;
   int          errors;
 
   // LTSM <-> local codec
@@ -423,8 +435,32 @@ module ut_ltsm;
     .pat_lfsr_enable(pat_lfsr_enable), .pat_done(pat_done),
     .tmr_start(tmr_start), .tmr_run(tmr_run),
     .rst_tmr_start(rst_tmr_start), .tmr_expired(tmr_expired),
-    .rst_tmr_expired(rst_tmr_expired), .le_tmr_start(le_tmr_start), .le_tmr_expired(le_tmr_expired_tb)
+    .rst_tmr_expired(rst_tmr_expired), .le_tmr_start(le_tmr_start), .le_tmr_expired(le_tmr_expired_tb),
+    .mb_source_ready(mb_source_ready),
+    .mb_clock_running(mb_clock_running),
+    .mb_clock_enable(mb_clock_enable),
+    .mb_clock_run(mb_clock_run)
   );
+
+  // Model physical forwarded clock response: mb_clock_running tracks mb_clock_run with 2 lclk cycles delay
+  logic [1:0] mb_clk_run_pipe; // Delayed abstract physical acknowledgment
+  logic loc_tx_inflight_q;     // Accepted mailbox transaction awaiting codec completion
+  logic loc_tx_busy_seen_q;    // Codec activity observed for this transaction
+  // Delay the abstract clock acknowledgment independently of sideband traffic.
+  // This LTSM harness models the private controller response.
+  // Separate controller tests inspect actual forwarded pulses and pad enables.
+  // The sequencer must wait for acknowledgment before its peer response.
+  // Spec ref: UCIe 1.0 Section 4.5.3.4 RXCLKCAL.
+  always @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      mb_clk_run_pipe  <= 2'b00;
+      mb_clock_running <= 1'b0;
+    end else begin
+      mb_clk_run_pipe[0] <= mb_clock_run;
+      mb_clk_run_pipe[1] <= mb_clk_run_pipe[0];
+      mb_clock_running   <= mb_clk_run_pipe[1];
+    end
+  end
 // ---------------------------------------------------------------------------
 // LTSM-to-codec CDC and Local Sideband Codec
 // ---------------------------------------------------------------------------
@@ -478,7 +514,7 @@ module ut_ltsm;
   //
   // Spec ref: UCIe 1.0 Specification, Section 4.1.5 - Sideband Transmission.
   // -------------------------------------------------------------------------
-  assign sb_tx_busy = tx_cdc_busy | loc_tx_busy_sync_q;
+  assign sb_tx_busy = tx_cdc_busy | loc_tx_busy_sync_q | loc_tx_inflight_q;
 
   // -------------------------------------------------------------------------
   // assign: sb_tx_accepted - LTSM Transmit Handshake Acceptance Flag
@@ -487,7 +523,28 @@ module ut_ltsm;
   //
   // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
   // -------------------------------------------------------------------------
-  assign sb_tx_accepted = sb_tx_load && !tx_cdc_busy;
+  assign sb_tx_accepted = sb_tx_load && !sb_tx_busy;
+
+  // Retain the accepted transaction until the real codec has been busy.
+  // Mailbox acknowledgment alone does not prove codec acceptance or completion.
+  // This harness uses the same in-flight rule as the existing logical PHY.
+  // It prevents a second packet pulse during the crossing-to-codec latency.
+  // Spec ref: UCIe 1.0 Sections 4.1.5 and 6.1.3.
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      loc_tx_inflight_q <= 1'b0;
+      loc_tx_busy_seen_q <= 1'b0;
+    end else if (sb_tx_accepted) begin
+      loc_tx_inflight_q <= 1'b1;
+      loc_tx_busy_seen_q <= 1'b0;
+    end else if (loc_tx_inflight_q) begin
+      if (loc_tx_busy_sync_q) loc_tx_busy_seen_q <= 1'b1;
+      if (loc_tx_busy_seen_q && !loc_tx_busy_sync_q && !tx_cdc_busy) begin
+        loc_tx_inflight_q <= 1'b0;
+        loc_tx_busy_seen_q <= 1'b0;
+      end
+    end
+  end
 
   // -------------------------------------------------------------------------
   // always_comb: Local Transmit Packet Structure Assembler
@@ -1107,6 +1164,7 @@ module ut_ltsm;
     inject_rx_dp_err     = 1'b0;
     par_enable_resp      = 1'b0;
     le_tmr_expired_tb    = 1'b0;
+    mb_source_ready      = 1'b0;
     #5;
     lreset_n           = 1'b1;
     sbreset_n          = 1'b1;
@@ -1140,9 +1198,28 @@ module ut_ltsm;
       errors = errors + 1;
     end
     pulse_rx_iteration(1'b1);
+    #0.1;
+    // With mb_source_ready == 1'b0, LTSM must hold in RESET and preserve start trigger
+    if (ltsm_state !== LT_RESET) begin
+      $display("FAIL ut_ltsm: RESET exited while mb_source_ready is low");
+      errors = errors + 1;
+    end
+    if (u_dut.pattern_trigger_pending_q !== 1'b1) begin
+      $display("FAIL ut_ltsm: pattern trigger was not retained while waiting for mb_source_ready");
+      errors = errors + 1;
+    end
+    if (mb_clock_enable !== 1'b0) begin
+      $display("FAIL ut_ltsm: mb_clock_enable != 0 in RESET");
+      errors = errors + 1;
+    end
+    // Now assert mb_source_ready: LTSM immediately enters SBINIT without losing trigger!
+    @(negedge lclk);
+    mb_source_ready = 1'b1;
+    @(posedge lclk);
+    #0.1;
     if ((ltsm_state !== LT_SBINIT) ||
         (u_dut.pattern_trigger_pending_q !== 1'b1)) begin
-      $display("FAIL ut_ltsm: two matches did not trigger SBINIT after 4 ms");
+      $display("FAIL ut_ltsm: two matches did not trigger SBINIT after mb_source_ready asserted");
       errors = errors + 1;
     end
 
@@ -1251,8 +1328,16 @@ module ut_ltsm;
     expect_state(LT_MB_RXDESKEW);
     expect_state(LT_MB_DTCENTER2);
     expect_state(LT_MB_LINKSPEED);
+    if (mb_clock_enable !== 1'b1 || mb_clock_run !== 1'b1) begin
+      $display("FAIL ut_ltsm: continuous clock not enabled/running in LINKSPEED");
+      errors = errors + 1;
+    end
     wait (ltsm_state == LT_LINKINIT);
     repeat (2) @(posedge lclk);
+    if (mb_clock_enable !== 1'b1 || mb_clock_run !== 1'b1) begin
+      $display("FAIL ut_ltsm: continuous clock not enabled/running in LINKINIT");
+      errors = errors + 1;
+    end
     // MBTRAIN.REPAIR is unsupported by the fixed profile and is never
     // visited. LINKSPEED enters LINKINIT after its 15h and 19h exchanges.
     // A remote Active request requires the local LinkMgmt.RDI.Rsp.Active
@@ -1274,6 +1359,11 @@ module ut_ltsm;
       $display("FAIL ut_ltsm: did not reach ACTIVE, state %s",
                "%02h", ltsm_state);
       errors = errors + 1;
+    end else begin
+      if (mb_clock_enable !== 1'b1 || mb_clock_run !== 1'b1) begin
+        $display("FAIL ut_ltsm: continuous clock not enabled/running in ACTIVE");
+        errors = errors + 1;
+      end
     end
     // Let the state recorder observe ACTIVE before the walk check.
     repeat (4) @(posedge lclk);
@@ -1443,6 +1533,37 @@ module ut_ltsm;
     end else begin
       $display("PASS ut_ltsm: le_tmr expiry satisfied dwell and triggered direct exit to RESET");
     end
+
+    // Verify recovery RESET exit is also gated by mb_source_ready
+    mb_source_ready = 1'b0;
+    @(posedge rst_tmr_expired);
+    @(negedge lclk);
+    start_link_train = 1'b1;
+    @(posedge lclk);
+    #0.1;
+    @(negedge lclk);
+    start_link_train = 1'b0;
+    repeat (10) @(posedge lclk);
+    #0.1;
+    if (ltsm_state !== LT_RESET) begin
+      $display("FAIL ut_ltsm: recovery RESET exited while mb_source_ready == 0");
+      errors = errors + 1;
+    end
+    if (u_dut.reset_trigger_pending_q !== 1'b1) begin
+      $display("FAIL ut_ltsm: recovery start trigger lost while waiting for mb_source_ready");
+      errors = errors + 1;
+    end
+    @(negedge lclk);
+    mb_source_ready = 1'b1;
+    @(posedge lclk);
+    #0.1;
+    if (ltsm_state !== LT_SBINIT) begin
+      $display("FAIL ut_ltsm: recovery RESET did not exit to SBINIT after mb_source_ready asserted");
+      errors = errors + 1;
+    end else begin
+      $display("PASS ut_ltsm: recovery RESET exit gated by mb_source_ready without lost start");
+    end
+
     if (errors == 0) $display("TEST PASSED ut_ltsm");
     else             $display("FAIL ut_ltsm: %0d errors", errors);
     $finish;

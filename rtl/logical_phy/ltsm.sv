@@ -317,6 +317,15 @@
 //   v0.0.19 2026-10-09  Documentation compliance pass: remove obsolete implementation-phase
 //                        references outside revision history, add per-port inline
 //                        comments, and split multi-signal declarations.
+//   v0.0.20 2026-10-09  Contract extension: add private mb_source_ready and
+//                        mb_clock_running inputs and mb_clock_enable and
+//                        mb_clock_run outputs. Gate RESET exit on mb_source_ready
+//                        without lost start events. Disable OEs in RESET,
+//                        SBINIT, PARAM, CAL; enable in electrical idle states.
+//                        Run clock continuously in LINKSPEED, LINKINIT, ACTIVE.
+//                        Govern RXCLKCAL local TX clock by received peer
+//                        start/done requests and wait for physical clock running
+//                        acknowledgement before emitting matching responses.
 // ============================================================================
 `ifndef Ltsm_SV
 `define Ltsm_SV
@@ -406,7 +415,13 @@ module ltsm #(
   input  logic        tmr_expired,            // Sub-state residency timer expired indicator
   input  logic        rst_tmr_expired,        // RESET minimum timer expired indicator
   output logic        le_tmr_start,           // LinkError residency timer start trigger
-  input  logic        le_tmr_expired = 1'b0   // LinkError residency timer expired indicator
+  input  logic        le_tmr_expired = 1'b0,  // LinkError residency timer expired indicator
+
+  // ---- private physical clock and source control contract
+  input  logic        mb_source_ready,        // Internal domain reset / source release acknowledgement
+  input  logic        mb_clock_running,       // Physical clock running acknowledgement
+  output logic        mb_clock_enable,        // Mainband clock output buffer enable (OE)
+  output logic        mb_clock_run            // Mainband forwarded clock active run request
 );
 
   // =========================================================================
@@ -541,6 +556,18 @@ module ltsm #(
   logic trainerror_exchange_timeout_q;
   logic trainerror_exchange_timeout_d;
 
+  // ---- RXCLKCAL directional peer clock governance
+  logic rxclkcal_tx_clk_run_q;
+  logic rxclkcal_tx_clk_run_d;
+  logic [7:0] rxclkcal_peer_rsp_subcode_q;
+  logic [7:0] rxclkcal_peer_rsp_subcode_d;
+  logic rxclkcal_peer_start_done_q;
+  logic rxclkcal_peer_start_done_d;
+  logic rxclkcal_peer_finish_done_q;
+  logic rxclkcal_peer_finish_done_d;
+  logic rxclkcal_local_done_q;
+  logic rxclkcal_local_done_d;
+
   // -------------------------------------------------------------------------
   // State and policy register bank
   // -------------------------------------------------------------------------
@@ -597,6 +624,11 @@ module ltsm #(
       sb_linkerror_ack_q              <= 1'b0;
       linkerror_min_done_q            <= 1'b0;
       trainerror_exchange_timeout_q   <= 1'b0;
+      rxclkcal_tx_clk_run_q           <= 1'b0;
+      rxclkcal_peer_rsp_subcode_q     <= 8'h00;
+      rxclkcal_peer_start_done_q      <= 1'b0;
+      rxclkcal_peer_finish_done_q     <= 1'b0;
+      rxclkcal_local_done_q           <= 1'b0;
     end else begin
       state_q                         <= state_d;
       sbinit_phase_q                  <= sbinit_phase_d;
@@ -643,6 +675,11 @@ module ltsm #(
       sb_linkerror_ack_q              <= sb_linkerror_ack_d;
       linkerror_min_done_q            <= linkerror_min_done_d;
       trainerror_exchange_timeout_q   <= trainerror_exchange_timeout_d;
+      rxclkcal_tx_clk_run_q           <= rxclkcal_tx_clk_run_d;
+      rxclkcal_peer_rsp_subcode_q     <= rxclkcal_peer_rsp_subcode_d;
+      rxclkcal_peer_start_done_q      <= rxclkcal_peer_start_done_d;
+      rxclkcal_peer_finish_done_q     <= rxclkcal_peer_finish_done_d;
+      rxclkcal_local_done_q           <= rxclkcal_local_done_d;
     end
   end
 
@@ -686,6 +723,51 @@ module ltsm #(
 
   wire state_entry = (state_q != state_q_prev);
   wire reset_entry = state_entry && (state_q == LT_RESET);
+
+  // =========================================================================
+  // Mainband Output Enable (OE) State Classification
+  // =========================================================================
+  // Per UCIe 1.0 Section 5.12 and architectural contract:
+  // - OEs disabled (mb_clock_enable = 0) in RESET, SBINIT, PARAM, CAL.
+  // - OEs enabled (mb_clock_enable = 1) in electrical-idle states and active states.
+  // =========================================================================
+  function automatic logic state_oe_disabled(input ltsm_state_t s);
+    case (s)
+      LT_RESET,
+      LT_SBINIT,
+      LT_MBINIT_PARAM,
+      LT_MBINIT_CAL: state_oe_disabled = 1'b1;
+      default:       state_oe_disabled = 1'b0;
+    endcase
+  endfunction
+
+  // -------------------------------------------------------------------------
+  // assign: mb_clock_enable - Mainband Output Enable Driver
+  //
+  // Controls pin-level driver enable for mainband lanes and forwarded clock.
+  // Held disabled (high-Z/off) in RESET, SBINIT, PARAM, and CAL. Enabled
+  // in all electrical-idle and active states.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 and Section 5.12.
+  // -------------------------------------------------------------------------
+  assign mb_clock_enable = !state_oe_disabled(state_q) &&
+                           (phase_c_mode_q == PC_NONE) &&
+                           (state_q != LT_TRAINERROR);
+
+  // -------------------------------------------------------------------------
+  // assign: mb_clock_run - Mainband Forwarded Clock Run Request Driver
+  //
+  // Asserts active forwarded clock running request during continuous-clock
+  // operational states (LINKSPEED, LINKINIT, ACTIVE) and during RXCLKCAL
+  // when actively governed by received peer clock start/done requests.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.4.5, 4.5.3.4.12, and 5.12.
+  // -------------------------------------------------------------------------
+  assign mb_clock_run = (phase_c_mode_q == PC_NONE) &&
+                        ((state_q == LT_MB_LINKSPEED) ||
+                         (state_q == LT_LINKINIT)     ||
+                         (state_q == LT_ACTIVE)       ||
+                         rxclkcal_tx_clk_run_q);
 
   // =========================================================================
   // Fixed-profile sideband training message and sequence lookup
@@ -1006,9 +1088,27 @@ module ltsm #(
   wire phase_b_rsp_payload_valid =
     (state_q != LT_MBINIT_PARAM) || param_rsp_valid;
 
+  wire rxclkcal_skew_subcode =
+    (sb_rx_msgcode == MC_MBTRAIN_REQ) &&
+    ((sb_rx_msgsubcode == MS_RXCLKCAL_START) ||
+     (sb_rx_msgsubcode == MS_RXCLKCAL_DONE));
+
+  wire rxclkcal_skew_state =
+    (state_q == LT_MB_TXSELFCAL) ||
+    (state_q == LT_MB_RXCLKCAL)  ||
+    (state_q == LT_MB_VTCENTER);
+
+  wire peer_subcode_match =
+    (rxclkcal_skew_state && rxclkcal_skew_subcode)
+      ? 1'b1
+      : (state_q == LT_MB_RXCLKCAL)
+        ? ((sb_rx_msgsubcode == MS_RXCLKCAL_START) ||
+           (sb_rx_msgsubcode == MS_RXCLKCAL_DONE))
+        : (sb_rx_msgsubcode == current_req_subcode);
+
   wire phase_b_peer_req = phase_b_common_valid &&
                           (sb_rx_msgcode == current_req_code) &&
-                          (sb_rx_msgsubcode == current_req_subcode) &&
+                          peer_subcode_match &&
                           phase_b_req_payload_valid &&
                           !(phase_b_rsp_expected && !local_resp_rcvd_q &&
                             (current_req_code == current_rsp_code) &&
@@ -1032,12 +1132,20 @@ module ltsm #(
   };
   wire peer_req_identity_match =
     (rx_peer_req_identity == peer_req_identity_q);
+  wire [7:0] peer_req_saved_subcode = peer_req_identity_q[71:64];
 
   wire phase_b_early_rsp = phase_b_peer_rsp &&
                            (state_entry || !local_req_accepted_q);
+
+  wire rxclkcal_subsequent_req = (sb_rx_msgcode == MC_MBTRAIN_REQ) &&
+                                 (sb_rx_msgsubcode == MS_RXCLKCAL_DONE) &&
+                                 (peer_req_saved_subcode == MS_RXCLKCAL_START) &&
+                                 !peer_resp_pending_q;
+
   wire phase_b_peer_req_conflict = phase_b_peer_req && !state_entry &&
                                    peer_req_valid_q &&
-                                   !peer_req_identity_match;
+                                   !peer_req_identity_match &&
+                                   !rxclkcal_subsequent_req;
 
   // =========================================================================
   // LinkMgmt.RDI no-data packet decoding
@@ -1285,10 +1393,21 @@ module ltsm #(
                             trainerror_peer_rsp_pending_q && !sb_tx_busy &&
                             !tx_disabled_resp && !tx_linkreset_resp;
 
+  wire rxclkcal_resp_ack_satisfied =
+    (rxclkcal_peer_rsp_subcode_q == MS_RXCLKCAL_START) ? (mb_clock_running == 1'b1) :
+    (rxclkcal_peer_rsp_subcode_q == MS_RXCLKCAL_DONE)  ? (mb_clock_running == 1'b0) :
+    1'b1;
+
+  wire rxclkcal_replay_ack_satisfied =
+    (peer_req_saved_subcode == MS_RXCLKCAL_START) ? (mb_clock_running == 1'b1) :
+    (peer_req_saved_subcode == MS_RXCLKCAL_DONE)  ? (mb_clock_running == 1'b0) :
+    1'b1;
+
   wire tx_peer_resp = phase_b_active && peer_resp_pending_q && !sb_tx_busy &&
+                      rxclkcal_resp_ack_satisfied &&
                       !tx_disabled_resp && !tx_linkreset_resp &&
                       !tx_trainerror_resp;
-  wire tx_active_peer_resp = (state_q == LT_LINKINIT) &&
+  wire tx_active_peer_resp = (state_q == LT_LINKINIT) && active_ready_q &&
                              active_peer_rsp_pending_q && !sb_tx_busy &&
                              !tx_disabled_resp && !tx_linkreset_resp &&
                              !tx_trainerror_resp && !tx_peer_resp;
@@ -1297,7 +1416,7 @@ module ltsm #(
                                    tx_linkreset_resp || tx_trainerror_resp;
   wire current_peer_response_tx = tx_peer_resp || tx_active_peer_resp;
   wire higher_response_tx = high_priority_response_tx ||
-                            current_peer_response_tx;
+                            current_peer_response_tx || peer_resp_pending_q;
   wire tx_trainerror_req = (phase_c_mode_q == PC_TRAINERROR) &&
                            trainerror_local_needed_q &&
                            !trainerror_req_accepted_q && !sb_tx_busy &&
@@ -1323,6 +1442,7 @@ module ltsm #(
                       !local_req_accepted_q && !sb_tx_busy &&
                       !higher_response_tx && !phase_c_local_tx;
   wire tx_dup_peer = phase_b_active && peer_replay_pending_q && !sb_tx_busy &&
+                     rxclkcal_replay_ack_satisfied &&
                      !high_priority_response_tx && !tx_peer_resp &&
                      !tx_active_peer_resp && !phase_c_local_tx &&
                      !tx_local_req;
@@ -1440,6 +1560,11 @@ module ltsm #(
     sb_linkerror_ack_d               = sb_linkerror_ack_q;
     linkerror_min_done_d             = linkerror_min_done_q;
     trainerror_exchange_timeout_d    = trainerror_exchange_timeout_q;
+    rxclkcal_tx_clk_run_d            = rxclkcal_tx_clk_run_q;
+    rxclkcal_peer_rsp_subcode_d      = rxclkcal_peer_rsp_subcode_q;
+    rxclkcal_peer_start_done_d       = rxclkcal_peer_start_done_q;
+    rxclkcal_peer_finish_done_d      = rxclkcal_peer_finish_done_q;
+    rxclkcal_local_done_d            = rxclkcal_local_done_q;
     phase_b_state_complete           = 1'b0;
 
     // Every public state owns fresh state-scoped transaction data. A RESET
@@ -1472,6 +1597,15 @@ module ltsm #(
       trainerror_req_accepted_d      = 1'b0;
       trainerror_rsp_received_d      = 1'b0;
       trainerror_peer_rsp_pending_d  = 1'b0;
+      if ((state_q != LT_MB_TXSELFCAL) &&
+          (state_q != LT_MB_RXCLKCAL)  &&
+          (state_q != LT_MB_VTCENTER)) begin
+        rxclkcal_tx_clk_run_d          = 1'b0;
+        rxclkcal_peer_rsp_subcode_d    = 8'h00;
+        rxclkcal_peer_start_done_d     = 1'b0;
+        rxclkcal_peer_finish_done_d    = 1'b0;
+        rxclkcal_local_done_d          = 1'b0;
+      end
       timer_start_d                  = normal_timed_state;
 
       if (state_q == LT_RESET) begin
@@ -1527,8 +1661,16 @@ module ltsm #(
         linkreset_peer_rsp_pending_d = 1'b0;
       if (tx_trainerror_resp)
         trainerror_peer_rsp_pending_d = 1'b0;
-      if (tx_peer_resp)
+      if (tx_peer_resp) begin
         peer_resp_pending_d = 1'b0;
+        if (rxclkcal_peer_rsp_subcode_q == MS_RXCLKCAL_START) begin
+          rxclkcal_peer_start_done_d  = 1'b1;
+          rxclkcal_peer_rsp_subcode_d = 8'h00;
+        end else if (rxclkcal_peer_rsp_subcode_q == MS_RXCLKCAL_DONE) begin
+          rxclkcal_peer_finish_done_d = 1'b1;
+          rxclkcal_peer_rsp_subcode_d = 8'h00;
+        end
+      end
       if (tx_active_peer_resp) begin
         active_peer_rsp_pending_d  = 1'b0;
         active_peer_rsp_accepted_d = 1'b1;
@@ -1584,10 +1726,19 @@ module ltsm #(
     // even while LinkMgmt.RDI blocks normal transaction advancement.
     if (phase_b_peer_req && !phase_b_peer_req_conflict &&
         !local_packet_fatal) begin
-      if (state_entry || !peer_req_valid_q) begin
+      if (state_entry || !peer_req_valid_q || rxclkcal_subsequent_req) begin
         peer_req_valid_d      = 1'b1;
         peer_resp_pending_d   = 1'b1;
         peer_req_identity_d   = rx_peer_req_identity;
+        if (rxclkcal_skew_subcode) begin
+          if (sb_rx_msgsubcode == MS_RXCLKCAL_START) begin
+            rxclkcal_tx_clk_run_d       = 1'b1;
+            rxclkcal_peer_rsp_subcode_d = MS_RXCLKCAL_START;
+          end else if (sb_rx_msgsubcode == MS_RXCLKCAL_DONE) begin
+            rxclkcal_tx_clk_run_d       = 1'b0;
+            rxclkcal_peer_rsp_subcode_d = MS_RXCLKCAL_DONE;
+          end
+        end
       end else if (peer_req_identity_match) begin
         if (!peer_resp_pending_d && !peer_replay_pending_d &&
             !(sb_tx_accepted && tx_dup_peer))
@@ -1655,15 +1806,19 @@ module ltsm #(
         !phase_c_response_accept) begin
       local_req_accepted_d  = 1'b0;
       local_resp_rcvd_d     = 1'b0;
-      peer_req_valid_d      = 1'b0;
-      peer_resp_pending_d   = 1'b0;
-      peer_replay_pending_d = 1'b0;
-      peer_req_identity_d   = 99'd0;
+      if (state_q != LT_MB_RXCLKCAL) begin
+        peer_req_valid_d      = 1'b0;
+        peer_resp_pending_d   = 1'b0;
+        peer_replay_pending_d = 1'b0;
+        peer_req_identity_d   = 99'd0;
+      end
 
       if (active_txn_step == sequence_last_step(state_q)) begin
         txn_step_d             = 3'd0;
         phase_b_state_complete = 1'b1;
         timer_start_d          = 1'b0;
+        if (state_q == LT_MB_RXCLKCAL)
+          rxclkcal_local_done_d = 1'b1;
       end else begin
         txn_step_d = active_txn_step + 1'b1;
       end
@@ -1698,6 +1853,7 @@ module ltsm #(
         if (rst_tmr_expired)
           reset_min_done_d = 1'b1;
         if (!reset_entry && (rst_tmr_expired || reset_min_done_q) &&
+            mb_source_ready &&
             (reset_trigger_pending_d ||
              (!recovery_reset_q && pattern_trigger_pending_d)))
           state_d = LT_SBINIT;
@@ -1820,8 +1976,15 @@ module ltsm #(
         if (phase_b_state_complete) state_d = LT_MB_TXSELFCAL;
       LT_MB_TXSELFCAL:
         if (phase_b_state_complete) state_d = LT_MB_RXCLKCAL;
-      LT_MB_RXCLKCAL:
-        if (phase_b_state_complete) state_d = LT_MB_VTCENTER;
+      LT_MB_RXCLKCAL: begin
+        if ((phase_b_state_complete || rxclkcal_local_done_q || rxclkcal_local_done_d) &&
+            (!rxclkcal_peer_start_done_q || rxclkcal_peer_finish_done_q) &&
+            !rxclkcal_tx_clk_run_q && (mb_clock_running == 1'b0) &&
+            !peer_resp_pending_d && !peer_replay_pending_d) begin
+          state_d       = LT_MB_VTCENTER;
+          timer_start_d = 1'b0;
+        end
+      end
       LT_MB_VTCENTER:
         if (phase_b_state_complete) state_d = LT_MB_DTVREF1;
       LT_MB_DTVREF1:
@@ -2067,7 +2230,11 @@ module ltsm #(
                             (tx_trainerror_resp || tx_trainerror_req)
                               ? MS_TE_ENTRY :
                             (tx_peer_resp || tx_dup_peer)
-                              ? current_rsp_subcode : current_req_subcode;
+                              ? (((tx_peer_resp && (rxclkcal_peer_rsp_subcode_q == MS_RXCLKCAL_START || rxclkcal_peer_rsp_subcode_q == MS_RXCLKCAL_DONE)) ||
+                                  (tx_dup_peer && (peer_req_saved_subcode == MS_RXCLKCAL_START || peer_req_saved_subcode == MS_RXCLKCAL_DONE)))
+                                  ? (tx_peer_resp ? rxclkcal_peer_rsp_subcode_q : peer_req_saved_subcode)
+                                  : current_rsp_subcode)
+                              : current_req_subcode;
 
   // Message packets in this profile do not use byte enables.
   // PARAM carries a fixed full DATA64 payload through its message format.
@@ -2329,7 +2496,8 @@ module ltsm #(
   // The transaction terms retain visibility for simple single-pass lint tools.
   assign unused_match = phase_b_packet_valid | phase_b_early_rsp |
                         peer_req_identity_match | pat_done |
-                        sb_tx_busy | sb_rx_payload[0];
+                        sb_tx_busy | sb_rx_payload[0] |
+                        mb_source_ready | mb_clock_running;
 
 endmodule
 

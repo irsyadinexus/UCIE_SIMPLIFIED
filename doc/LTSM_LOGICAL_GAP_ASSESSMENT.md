@@ -18,10 +18,14 @@ Electrical PHY omissions are acceptable in this profile:
 - Analog Vref, termination, AFE, PLL, and phase-control circuits.
 - Eye scans, point tests, margin checks, and analog pass/fail thresholds.
 - Electrical lane repair and redundant-lane switching.
-- Pin-level tri-state, electrical idle, and clock-gating behavior.
+- Analog pad impedance and true electrical high-impedance behavior.
 - Advanced Package repair.
 - Mainband CRC, replay, retry, and sequence-number logic.
 - x8 degradation, because the project profile is fixed x16.
+
+The digital mainband model now has directional clocks, scalar pad enables, and enabled electrical idle.
+It implements continuous clock control and RXCLKCAL request-driven start and stop acknowledgments.
+It does not claim analog pad or full training-waveform compliance.
 
 Sources:
 
@@ -228,7 +232,7 @@ The Standard Package SBINIT and post-SBINIT training sequences are implemented a
 - All 21 reachable LTSM states (00h-11h, 14h, 15h, 16h) are fully traversed; `TRAINERROR` (16h) is reachable and verified via timeout, sideband parity error escalation, and mainband framing faults.
 - The documented unreachable states (`MBTRAIN.REPAIR` 12h, `PHYRETRAIN` 13h, and `L1L2` 17h) are excluded from the 21-state coverage denominator.
 - Standard sideband packet architecture (`sb_packet_t`) per Figures 100-103 with 64-bit header, 32-UI gap, optional 64-bit payload, and CP/DP parity over scalar physical pins (`sb_tx_clk`, `sb_tx_data`, `sb_rx_clk`, `sb_rx_data`).
-- Verified across 12 directed unit tests in `tb/unit/`, sideband unit tests, independent sideband peer test (`tb_sideband_peer.sv`), and full 2-die loopback (`tb_loopback_top.sv`).
+- Verified across the directed unit-test suite, sideband unit tests, independent sideband peer test (`tb_sideband_peer.sv`), and full 2-die loopback (`tb_loopback_top.sv`).
 
 Sources:
 
@@ -442,4 +446,4 @@ Phase B/F implemented Active data-path gating and scrambling in `rtl/logical_phy
 
 ## Assessment conclusion
 
-The historical logical protocol gaps identified in this assessment have been resolved in the current RTL across Phases A–F and the sideband protocol remediation. The LTSM now implements spec-compliant request-response semantics, MBINIT.PARAM payload negotiation, LINKINIT Active Entry coordination, LinkReset recovery, deterministic PMNAK rejection, fatal TRAINERROR escalation, 4-phase stall tracking, and Active-gated scrambling. All 21 reachable states (including TRAINERROR) are verified across 12 directed unit tests, sideband peer tests, and two-die loopback, achieving 100% coverage with zero warnings.
+The historical logical protocol gaps identified in this assessment have been resolved in the current RTL across Phases A–F and the sideband protocol remediation. The LTSM now implements spec-compliant request-response semantics, MBINIT.PARAM payload negotiation, LINKINIT Active Entry coordination, LinkReset recovery, deterministic PMNAK rejection, fatal TRAINERROR escalation, 4-phase stall tracking, and Active-gated scrambling. The assessment does not claim a fixed unit-test count, coverage result, or warning-free final run.

@@ -255,6 +255,11 @@
 //                         instantiation.
 //   v0.0.12   2026-10-09  Documentation and hygiene pass: remove Author column
 //                         and add per-port inline comments.
+//   v0.0.13   2026-10-09  Expose directional mainband clock/OE ports (mb_tx_clk,
+//                         mb_tx_clk_oe, mb_tx_data_oe, and mb_tx_valid_oe)
+//                         and peer clock (mb_rx_clk).
+//   v0.0.14   2026-10-09  Use scalar physical output enables and require the
+//                         peer receive clock without a compatibility default.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -268,7 +273,7 @@ module ucie_main #(
 ) (
   input  logic        lclk,                 // 500 MHz main link clock
   input  logic        lreset_n,             // Active-low asynchronous reset for downstream lclk-domain state
-  input  logic        mbclk,                // 2 GHz forwarded clock fCK (Req.2)
+  input  logic        mbclk,                // Free-running local 2 GHz mainband source
   input  logic        sbclk,                // 800 MHz sideband clock
   input  logic        sbreset_n,            // Active-low sideband reset
   // ---------------------------------------------------------- FDI (Table 115)
@@ -319,10 +324,15 @@ module ucie_main #(
   input  logic        sb_rx_clk,            // Physical sideband forwarded clock/strobe from peer die
   input  logic        sb_rx_data,           // Physical sideband serialized data from peer die
   // ------------------------------------------------- main band to partner
-  output logic [NLANES-1:0] mb_tx_data,     // Physical main-band transmit data lanes to peer die
-  output logic        mb_tx_valid,          // Main-band transmit framing valid (Req.2)
-  input  logic [NLANES-1:0] mb_rx_data,     // Physical main-band receive data lanes from peer die
-  input  logic        mb_rx_valid           // Main-band receive framing valid (Req.2)
+  output logic        mb_tx_clk,            // Directional main band TX clock (forwarded clock fCK)
+  output logic        mb_tx_clk_oe,         // Directional main band TX clock output enable
+  output logic        mb_tx_data_oe,        // Scalar mainband TX data output enable
+  output logic        mb_tx_valid_oe,       // Directional main band TX valid output enable
+  output logic [NLANES-1:0] mb_tx_data,     // Forwarded main band TX data pins
+  output logic        mb_tx_valid,          // Main band TX framing valid qualifier
+  input  logic        mb_rx_clk,            // Physical mainband RX peer clock
+  input  logic [NLANES-1:0] mb_rx_data,     // Received main band RX data pins
+  input  logic        mb_rx_valid           // Main band RX framing valid qualifier
 );
 
   // ==========================================================================
@@ -563,7 +573,7 @@ module ucie_main #(
     .rdi_pl_speedmode      (rdi_pl_speedmode),
     .rdi_pl_stallreq       (rdi_pl_stallreq),
     .clear_start_link_train(clear_start_link_train),
-    .adapter_active_req    (1'b0),
+    .adapter_data_enable   (pl_state_sts == ucie_pkg::FDI_STS_ACTIVE),
     // Scalar sideband to partner
     .sb_tx_clk             (sb_tx_clk),
     .sb_tx_data            (sb_tx_data),
@@ -588,8 +598,13 @@ module ucie_main #(
     .phy_csr_rdata         (phy_csr_rdata),
     .phy_csr_rdata_vld     (phy_csr_rdata_vld),
     // Main band to partner
+    .mb_tx_clk             (mb_tx_clk),
+    .mb_tx_clk_oe          (mb_tx_clk_oe),
+    .mb_tx_data_oe         (mb_tx_data_oe),
+    .mb_tx_valid_oe        (mb_tx_valid_oe),
     .mb_tx_data            (mb_tx_data),
     .mb_tx_valid           (mb_tx_valid),
+    .mb_rx_clk             (mb_rx_clk),
     .mb_rx_data            (mb_rx_data),
     .mb_rx_valid           (mb_rx_valid),
     // Stubbed cfg

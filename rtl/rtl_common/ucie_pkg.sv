@@ -120,6 +120,8 @@
 //                     constant-group comment blocks with UCIe 1.0 citations.
 //   0.0.9 2026-10-09  Documentation and hygiene pass: remove Author column
 //                     and add per-port inline comments to all functions and tasks.
+//   0.0.10 2026-10-09 Add PARAM continuous clock mode bit index and immutable
+//                     mode value constants per Table 56.
 // ============================================================================
 `ifndef UciePkg_SV
 `define UciePkg_SV
@@ -1028,6 +1030,10 @@ package ucie_pkg;
   // Module 0 and differential clock encode as zero. Continuous clock sets
   // bit [9]. Vswing 01h sets bit [4]. 4 GT/s encodes as zero in [3:0].
   // The response has continuous differential clock at 4 GT/s.
+  // Clock mode bit 9 is immutable continuous mode; strobe mode is unsupported.
+  localparam int unsigned PARAM_CLOCK_MODE_BIT   = 9;
+  localparam logic        PARAM_CLOCK_CONTINUOUS = 1'b1;
+  localparam logic        PARAM_CLOCK_STROBE     = 1'b0;
   localparam logic [63:0] PARAM_REQ_DATA = 64'h0000_0000_0000_0210;
   localparam logic [63:0] PARAM_RSP_DATA = 64'h0000_0000_0000_0200;
 

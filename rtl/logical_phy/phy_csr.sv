@@ -4,15 +4,14 @@
 // Project     : UCIe 1.0 Simplified Endpoint
 // Description : Logical PHY Control and Status Register (CSR) block.
 //               Holds electrical parameter registers, negotiated link width,
-//               and training status. These registers are advertised to the
-//               partner during MBINIT.PARAM and are readable by the adapter
-//               through the sideband register access path.
+//               training status, and standards-aligned physical layer capability,
+//               control, and status registers (UCIe 1.0 Section 7.5.3).
 //
-//               NOTE: These are electrical *parameter* registers ONLY. There
-//               is NO analog front-end (AFE) implementation. The register
-//               values are fixed defaults or software-written placeholders
-//               used during the sideband parameter exchange. No analog
-//               calibration, no DFE/CTLE coefficients, no voltage/current
+//               NOTE: These are electrical *parameter* and configuration
+//               registers ONLY. There is NO analog front-end (AFE) implementation.
+//               The register values are fixed defaults or software-written
+//               placeholders used during the sideband parameter exchange.
+//               No analog calibration, no DFE/CTLE coefficients, no voltage/current
 //               DAC control — all of that is outside the scope of this
 //               proof-of-concept.
 //
@@ -20,7 +19,9 @@
 //               configuration and status registers), section 4.5.3.3
 //               MBINIT.PARAM (parameter exchange during link training),
 //               section 8.1 (Raw Die-to-Die Interface, Table 114 - RDI
-//               signal list).
+//               signal list), section 7.5.3.18 (PHY Capability, Offset 1000h),
+//               section 7.5.3.19 (PHY Control, Offset 1004h), section 7.5.3.20
+//               (PHY Status, Offset 1008h).
 //
 // --------------------------------------------------------------------------
 // Register map
@@ -51,12 +52,28 @@
 //                                   [2:1]   degrade_lanes[1:0].
 //                                   [63:3]  Reserved (reads 0).
 //
+//   0x1000   PHY_CAP       RO       Physical Layer Capability (spec 7.5.3.18).
+//                                   [12:11] Clock Mode Support: 2'h2 (Free
+//                                           running mode only).
+//                                   [14:13] Clock Phase Support: 2'h0 (Differential).
+//                                   [15]    Package Type: 1'b1 (Standard Package).
+//                                   All other fields read 0. No analog fields exist.
+//
+//   0x1004   PHY_CTRL      RO       Fixed profile control (spec 7.5.3.19).
+//                                   [5]     Clock Mode Select: 1'b1 (Free running mode).
+//                                           Writes cannot select strobe mode.
+//                                   [31:6]  Reserved / unsupported fields (0).
+//
+//   0x1008   PHY_STS       RO       Physical Layer Status (spec 7.5.3.20).
+//                                   [5]     Clock Mode Status: 1'b1 (Free running mode).
+//                                   [31:6]  Reserved / unsupported fields (0).
+//
 // --------------------------------------------------------------------------
 // Write path
 // --------------------------------------------------------------------------
-//   On csr_wr, the addressed register is updated from csr_wdata using
-//   csr_byte_en on the next rising lclk edge. Only TRAIN_CTL and ELEC_PARAM
-//   are writable; writes to other addresses are silently ignored.
+//   Writes update TRAIN_CTL and ELEC_PARAM with the enabled bytes.
+//   Writes to read-only or unmapped addresses have no effect.
+//   PHY_CTRL stays in continuous mode. Unsupported selections have no effect.
 //
 //   A private input, clear_start_link_train, clears the sticky TRAIN_CTL bit
 //   0 value after a successful Active Entry. The clear has priority over a
@@ -84,16 +101,12 @@
 // Implementation notes
 // --------------------------------------------------------------------------
 //   1. The CSR address space uses a 27-bit address (matching the sideband
-//      register access path width). Only the lowest bits are decoded; the
-//      upper bits are don't-care.
+//      register access path width).
 //   2. The ELEC_PARAM reset default encodes 1.0 V supply (0x0834 = 2100 mV
 //      — placeholder) and 2104 ohm termination (0x0C80 — placeholder).
 //      These are NOT real analog values; they exist solely for the parameter
 //      exchange protocol.
-//   3. lclk and lreset_n are used by the sequential logic. The unused
-//      always_comb block at the end suppresses lint warnings for the
-//      combinational reference to these signals (which may appear unused
-//      to some tools due to the generate-free structure).
+//   3. lclk and lreset_n are used by the sequential logic.
 //
 // --------------------------------------------------------------------------
 // Revision history
@@ -114,10 +127,6 @@
 //                        Active Entry. The clear has priority over a
 //                        concurrent csr_wr for bit 0 only; elec_param_q and
 //                        all status registers keep their existing behaviour.
-//                        Comments for
-//                        the interface, storage, write path and output now
-//                        cite PLAN.md section 15.9 Phase C and UCIe 1.0
-//                        section 7.5.
 //   v0.0.5  2026-09-28  Sideband protocol remediation:
 //                        - Add csr_be[7:0] port and merge enabled bytes on writes (Section 7.5).
 //                        - Preserve private-clear priority over CSR write (Section 7.5).
@@ -126,6 +135,12 @@
 //                        for lint suppression block.
 //   v0.0.7  2026-10-09  Documentation compliance pass: remove obsolete implementation-phase
 //                        references outside revision history and add per-port inline comments.
+//   v0.0.8  2026-10-09  Add explicit free-running-only capability (0x1000), control (0x1004),
+//                        and status (0x1008) registers per UCIe 1.0 Section 7.5.3;
+//                        add continuous-only physical register fields.
+//   v0.0.9  2026-10-09  Keep unsupported writes inert. Remove the CSR fatal port.
+//                        Use named profile constants and address-relative reads.
+// ============================================================================
 `ifndef PhyCsr_SV
 `define PhyCsr_SV
 `include "ucie_pkg.sv"
@@ -169,127 +184,94 @@ module phy_csr (
 );
 
   // =========================================================================
-  // Address decode constants  (spec 7.1 – PHY register offsets)
+  // Address decode constants  (spec 7.1 and 7.5.3 – PHY register offsets)
   // =========================================================================
-  // Each register is 64 bits wide (8-byte aligned). The offsets are local
-  // to the PHY CSR aperture.
-  // =========================================================================
-  localparam logic [26:0] CSR_TRAIN_CTL  = 27'h0; // start training
-  localparam logic [26:0] CSR_ELEC_PARAM = 27'h8; // electrical params
-  localparam logic [26:0] CSR_LINK_STS   = 27'h10; // LTSM status
-  localparam logic [26:0] CSR_TRAIN_STS  = 27'h18; // training status
+  // Legacy / simplified register offsets:
+  localparam logic [26:0] CSR_TRAIN_CTL  = 27'h0;    // start training (0x00)
+  localparam logic [26:0] CSR_ELEC_PARAM = 27'h8;    // electrical params (0x08)
+  localparam logic [26:0] CSR_LINK_STS   = 27'h10;   // LTSM status (0x10)
+  localparam logic [26:0] CSR_TRAIN_STS  = 27'h18;   // training status (0x18)
+
+  // Standards-aligned physical layer register offsets (UCIe 1.0 Section 7.5.3):
+  localparam logic [26:0] CSR_PHY_CAP    = 27'h1000; // Table 96: PHY Capability
+  localparam logic [26:0] CSR_PHY_CTRL   = 27'h1004; // Table 97: PHY Control
+  localparam logic [26:0] CSR_PHY_STS    = 27'h1008; // Table 98: PHY Status
+
+  // Fixed fields from UCIe 1.0 Tables 96 through 98.
+  // CAP: mode support [12:11] = 2, differential phase [14:13] = 0.
+  // CAP: Standard Package [15] = 1. Unsupported analog fields read 0.
+  // CONTROL and STATUS: mode [5] = 1, differential phase [6] = 0.
+  // The approved continuous-only profile does not implement writable modes.
+  localparam logic [31:0] PHY_CAP_CONTINUOUS_ONLY = 32'h0000_9000;
+  localparam logic [31:0] PHY_CONTROL_CONTINUOUS = 32'h0000_0020;
+  localparam logic [31:0] PHY_STATUS_CONTINUOUS = 32'h0000_0020;
 
   // =========================================================================
-  // Register storage  (spec 7.1 – electrical parameters, no analog)
+  // Register storage  (spec 7.1 and 7.5.3 – parameters and control)
   // =========================================================================
   // elec_param_q : Electrical parameter register. Fixed placeholder values
   //                for this reduced-capability set. Fields:
   //                  [15:0]  Supply voltage in mV (default 0x0834 = 2100 mV).
   //                  [31:16] Termination impedance (default 0x0C80 = 3200).
   //                  [63:32] Reserved.
-  //                NOTE: No analog implementation. These are register values
-  //                only, used during the MBINIT.PARAM sideband exchange.
   //
   // start_train_q: Training start bit. Writing 1 to TRAIN_CTL[0] asserts
   //                start_link_train, which causes the LTSM to exit RESET
   //                (spec 4.5.3.1).
-  //                The bit is sticky: it holds its value until reset, a
-  //                later TRAIN_CTL write, or the private Active Entry clear
-  //                input clear_start_link_train. The bit is the single
-  //                software Start copy owned by the logical PHY side of the
-  //                link, and the LTSM clears it once training has reached
-  //                Active via the LinkMgmt.RDI Active clear path.
   // =========================================================================
   logic [63:0] elec_param_q;
   logic        start_train_q;
 
   // =========================================================================
-  // Write path  (spec 7.1 – CSR write, electrical params only, no analog)
-  // =========================================================================
-  // On csr_wr, the addressed register is updated from csr_wdata. Only
-  // TRAIN_CTL and ELEC_PARAM are writable; writes to LINK_STS and
-  // TRAIN_STS (read-only status) are silently ignored (default case).
+  // always_ff: Byte-enabled writes and private Start clear
   //
-  // Reset initialises elec_param_q to the placeholder defaults and clears
-  // start_train_q.
-  //
-  // -------------------------------------------------------------------------
-  // Private Active Entry clear and its priority
-  // (LinkMgmt.RDI Active Entry clear; UCIe 1.0 section 7.5 - UCIe Registers)
-  // -------------------------------------------------------------------------
-  // clear_start_link_train is tested FIRST in the if/else chain, so the
-  // clear wins over a concurrent software write. Start Link Training is
-  // therefore deasserted in the same lclk cycle in which the LTSM reports a
-  // successful Active Entry.
-  //
-  // The clear only forces start_train_q to 0. A concurrent sideband write to
-  // ELEC_PARAM still lands, because elec_param_q keeps its own assignment
-  // inside the clear branch. A concurrent write to TRAIN_CTL is dropped for
-  // bit 0 only, which is the intended priority: the LTSM owns Start policy
-  // after Active Entry and a stale Start level must not re-arm training.
-  //
-  // A write to any other address leaves both registers unchanged when the
-  // clear is high.
+  // Only the simplified TRAIN_CTL and ELEC_PARAM registers hold writable state.
+  // The Active Entry clear has priority over a concurrent Start write.
+  // An electrical-parameter write still takes effect during that clear.
+  // All other writes have no effect, as in the existing simplified CSR map.
+  // Spec ref: UCIe 1.0 Section 7.5 and the approved continuous-only profile.
   // =========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      elec_param_q <= 64'h0000_0C80_0000_0834; // 1.0 V, 2104 ohm placeholder
-      start_train_q<= 1'b0;
-    end else if (clear_start_link_train) begin
-      // Private Active Entry clear. Highest priority for start_train_q.
+      elec_param_q <= 64'h0000_0C80_0000_0834;
       start_train_q <= 1'b0;
-      // A sideband write to ELEC_PARAM is still honoured during the clear.
+    end else begin
+      if (clear_start_link_train) begin
+        start_train_q <= 1'b0;
+      end else if (csr_wr && (csr_addr == CSR_TRAIN_CTL) && csr_be[0]) begin
+        start_train_q <= csr_wdata[0];
+      end
       if (csr_wr && (csr_addr == CSR_ELEC_PARAM)) begin
         for (int b = 0; b < 8; b++) begin
           if (csr_be[b]) elec_param_q[b*8 +: 8] <= csr_wdata[b*8 +: 8];
         end
       end
-    end else if (csr_wr) begin
-      case (csr_addr)
-        CSR_TRAIN_CTL : begin
-          if (csr_be[0]) start_train_q <= csr_wdata[0];
-        end
-        CSR_ELEC_PARAM: begin
-          for (int b = 0; b < 8; b++) begin
-            if (csr_be[b]) elec_param_q[b*8 +: 8] <= csr_wdata[b*8 +: 8];
-          end
-        end
-        default       : ;
-      endcase
     end
   end
 
   // =========================================================================
-  // start_link_train output  (spec 4.5.3.1 – RESET exit trigger)
-  // =========================================================================
-  // Directly reflects TRAIN_CTL bit 0. When asserted, the LTSM exits RESET
-  // and begins the link training sequence.
+  // assign: start_link_train - Start Link Training Trigger Driver
   //
-  // The value is the sticky storage start_train_q, so the output falls on
-  // reset, on a TRAIN_CTL write of 0, or on the private Active Entry clear
-  // input clear_start_link_train (LinkMgmt.RDI Active Entry clear). The clear path
-  // means the LTSM consumes the Start level once, then sees a low level
-  // after Active Entry instead of a held request.
-  // Because the clear is registered in the write-path always_ff above, the
-  // output drops on the lclk edge that follows the clear assertion.
+  // Directly reflects TRAIN_CTL bit 0. When asserted, the LTSM exits RESET
+  // and begins the link training sequence per Section 4.5.3.1.
+  // Cleared asynchronously on reset or synchronously by clear_start_link_train.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 - RESET State.
   // =========================================================================
   assign start_link_train = start_train_q;
 
   // =========================================================================
-  // Read path  (spec 7.1 – CSR read, one-cycle latency)
-  // =========================================================================
-  // On csr_rd, csr_rdata is loaded with the addressed register's value and
-  // csr_rdata_vld is asserted one cycle later. The case statement selects
-  // the register content:
-  //   TRAIN_CTL  : Bit 0 = start_train_q, bits [63:1] = 0. A read issued
-  //                while the private clear is active returns 0 in bit 0,
-  //                because the clear forces the stored bit low.
-  //   ELEC_PARAM : Full 64-bit electrical parameter register.
-  //   LINK_STS   : Bit 0 = lnk_is_x8, bits [15:8] = ltsm_state, rest = 0.
-  //   TRAIN_STS  : Bit 0 = train_error, bits [2:1] = degrade_lanes, rest = 0.
-  //   default    : All zeros for undefined addresses.
+  // always_ff: Read Path Decoding and Staging
   //
-  // csr_rdata_vld tracks csr_rd with a one-cycle delay (pipeline stage).
+  // On csr_rd, csr_rdata is loaded with the addressed register's value and
+  // csr_rdata_vld is asserted one cycle later. Standard offsets return
+  // explicit free-running-only capability and status without pretending
+  // complete unsupported PHY fields per UCIe 1.0 Section 7.5.3.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers;
+  //           Section 7.5.3.18 - Physical Layer Capability;
+  //           Section 7.5.3.19 - Physical Layer Control;
+  //           Section 7.5.3.20 - Physical Layer Status.
   // =========================================================================
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -297,29 +279,32 @@ module phy_csr (
       csr_rdata_vld <= 1'b0;
     end else begin
       csr_rdata_vld <= csr_rd;
-      case (csr_addr)
-        CSR_TRAIN_CTL : csr_rdata <= {63'b0, start_train_q};
-        CSR_ELEC_PARAM: csr_rdata <= elec_param_q;
-        CSR_LINK_STS  : csr_rdata <= {48'b0, ltsm_state, 7'b0, lnk_is_x8};
-        CSR_TRAIN_STS : csr_rdata <= {61'b0, degrade_lanes, train_error};
-        default       : csr_rdata <= 64'h0;
-      endcase
+      if (csr_rd) begin
+        case (csr_addr)
+          CSR_TRAIN_CTL : csr_rdata <= {63'b0, start_train_q};
+          CSR_ELEC_PARAM: csr_rdata <= elec_param_q;
+          CSR_LINK_STS  : csr_rdata <= {48'b0, ltsm_state, 7'b0, lnk_is_x8};
+          CSR_TRAIN_STS : csr_rdata <= {61'b0, degrade_lanes, train_error};
+          // A 64-bit read at 1000h includes the adjacent 1004h control DWORD.
+          CSR_PHY_CAP   : csr_rdata <= {PHY_CONTROL_CONTINUOUS, PHY_CAP_CONTINUOUS_ONLY};
+          // A 32-bit request at 1004h consumes the low DWORD, without replication.
+          CSR_PHY_CTRL  : csr_rdata <= {32'h0, PHY_CONTROL_CONTINUOUS};
+          CSR_PHY_STS   : csr_rdata <= {32'h0, PHY_STATUS_CONTINUOUS};
+          default       : csr_rdata <= 64'h0;
+        endcase
+      end
     end
   end
 
   // =========================================================================
   // always_comb: Unused Signal Suppression
-  // =========================================================================
+  //
   // lclk and lreset_n are consumed by the always_ff blocks above, but some
   // lint tools may flag them as combinationally unused. This explicit
   // always_comb reference silences those warnings.
   //
-  // The CSR block is otherwise pure sequential logic: a register file clocked
-  // on lclk with an asynchronous active-low reset, addressed by csr_addr and
-  // read back on csr_rdata. Both clock and reset therefore have a real role in
-  // the design; this block exists only to satisfy tools that judge usage
-  // combinationally rather than sequentially.
-  //
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
+  // =========================================================================
   logic unused;
 
   // -------------------------------------------------------------------------
@@ -327,10 +312,9 @@ module phy_csr (
   //
   // References lclk and lreset_n combinationally to satisfy linters and
   // prevent unused port warnings on tools that judge usage combinationally.
-  // The CSR block is otherwise pure sequential logic clocked on lclk.
   // The assigned value is never read, so synthesis discards this block.
   //
-  // Spec ref: UCIe 1.0, Section 7.5 - UCIe Registers.
+  // Spec ref: UCIe 1.0 Specification, Section 7.5 - UCIe Registers.
   // -------------------------------------------------------------------------
   always_comb begin
     unused = lclk | lreset_n;

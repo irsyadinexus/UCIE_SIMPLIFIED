@@ -84,6 +84,12 @@
 //                       sideband request, both recover to ACTIVE.
 //   v0.0.7  2026-10-09  Cleanup pass: add inline comments for task/function
 //                       arguments and split multi-signal declarations.
+//   v0.0.8  2026-10-09  Migrate to contract: free-running local sources, physical
+//                       forwarded clocks with OEs, remove mbclk_en, extend surfaced
+//                       clock monitors at Active with Valid low and early states.
+//   v0.0.9  2026-10-09  Verify full-FIFO descrambled streams without word duplication.
+//                       Check clock, data, and Valid pad disable through CAL.
+//                       Remove duplicate physical-clock and pad VCD declarations.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -96,12 +102,16 @@ module tb_link_init_wave;
   // ==========================================================================
   logic lclk;   // 500 MHz local clock (2.0 ns period)
   logic sbclk;  // 800 MHz sideband clock (1.25 ns period)
-  logic mbclk;  // 2.0 GHz mainband forwarded clock fCK (0.5 ns period)
+  logic d0_mbclk; // 2.0 GHz mainband local source for Die 0 (0.5 ns period)
+  logic d1_mbclk; // 2.0 GHz mainband local source for Die 1 (0.5 ns period, phase shifted)
 
   initial begin
-    lclk  = 1'b0;
-    sbclk = 1'b0;
-    mbclk = 1'b0;
+    lclk     = 1'b0;
+    sbclk    = 1'b0;
+    d0_mbclk = 1'b0;
+    d1_mbclk = 1'b0;
+    #0.125;
+    forever #0.250 d1_mbclk = ~d1_mbclk;
   end
 
   // --------------------------------------------------------------------------
@@ -123,22 +133,98 @@ module tb_link_init_wave;
   // --------------------------------------------------------------------------
   always #0.625 sbclk = ~sbclk;
 
-  logic mbclk_en;
-
   // --------------------------------------------------------------------------
-  // always: Gated Mainband Forwarded Clock Generator (2 GHz mbclk)
+  // always: Free-Running Mainband Local Clock Generator (2 GHz) for Die 0
   //
-  // Generates 2 GHz forwarded clock fCK (0.5 ns period) enabled when mbclk_en
-  // is asserted during high-speed training and ACTIVE states.
+  // Generates 2 GHz free-running local source fCK (0.5 ns period) for Die 0.
+  // Free-running local source operates continuously without state-gating.
   //
   // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Mainband Clocking.
   // --------------------------------------------------------------------------
-  always begin
-    if (mbclk_en === 1'b1) begin
-      #0.250 mbclk = ~mbclk;
-    end else begin
-      mbclk = 1'b0;
-      @(mbclk_en);
+  always #0.250 d0_mbclk = ~d0_mbclk;
+
+  // --------------------------------------------------------------------------
+  // Forwarded physical clock output enables and crossing wires from DUT outputs
+  // --------------------------------------------------------------------------
+  logic d0_mb_tx_clk;
+  logic d0_mb_tx_clk_oe;
+  logic d0_mb_tx_data_oe;
+  logic d0_mb_tx_valid_oe;
+
+  logic d1_mb_tx_clk;
+  logic d1_mb_tx_clk_oe;
+  logic d1_mb_tx_data_oe;
+  logic d1_mb_tx_valid_oe;
+
+  wire mb_d0_to_d1_clk = d0_mb_tx_clk_oe ? d0_mb_tx_clk : 1'b0;
+  wire mb_d1_to_d0_clk = d1_mb_tx_clk_oe ? d1_mb_tx_clk : 1'b0;
+
+  // Surfaced clock monitor counters for active idle observations
+  int d0_active_idle_clk_edges;
+  int d1_active_idle_clk_edges;
+  integer clk_errors;
+
+  initial begin
+    d0_active_idle_clk_edges = 0;
+    d1_active_idle_clk_edges = 0;
+    clk_errors = 0;
+  end
+  // --------------------------------------------------------------------------
+  // always: Die 0 Forwarded Clock Active Idle Edge Counter
+  //
+  // Monitors and counts clock transitions on the forwarded physical clock
+  // wire when Die 0 is in LT_ACTIVE state with mb_d0_to_d1_valid low.
+  // Verifies that fCK runs continuously even in data-valid transfer gaps.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Mainband Clocking.
+  // --------------------------------------------------------------------------
+  always @(posedge mb_d0_to_d1_clk or negedge mb_d0_to_d1_clk) begin
+    if ((d0_ltsm_state == LT_ACTIVE) && !mb_d0_to_d1_valid)
+      d0_active_idle_clk_edges = d0_active_idle_clk_edges + 1;
+  end
+
+  // --------------------------------------------------------------------------
+  // always: Die 1 Forwarded Clock Active Idle Edge Counter
+  //
+  // Monitors and counts clock transitions on the forwarded physical clock
+  // wire when Die 1 is in LT_ACTIVE state with mb_d1_to_d0_valid low.
+  // Verifies that fCK runs continuously even in data-valid transfer gaps.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Mainband Clocking.
+  // --------------------------------------------------------------------------
+  always @(posedge mb_d1_to_d0_clk or negedge mb_d1_to_d0_clk) begin
+    if ((d1_ltsm_state == LT_ACTIVE) && !mb_d1_to_d0_valid)
+      d1_active_idle_clk_edges = d1_active_idle_clk_edges + 1;
+  end
+
+  // --------------------------------------------------------------------------
+  // always: Early State Clock and Output Enable Assertion Monitor
+  //
+  // Asserts that mainband clock output enables and forwarded physical
+  // clock, data, and Valid pads remain disabled through RESET, SBINIT, PARAM, and CAL.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
+  // --------------------------------------------------------------------------
+  always @(posedge lclk) begin
+    if (d0_lreset_n && (d0_ltsm_state <= LT_MBINIT_CAL)) begin
+      if ({d0_mb_tx_clk_oe, d0_mb_tx_data_oe, d0_mb_tx_valid_oe} !== 3'b000) begin
+        $display("FAIL tb_link_init_wave: Die 0 clock, data, or Valid output enable is active before RPCLK");
+        clk_errors = clk_errors + 1;
+      end
+      if (mb_d0_to_d1_clk !== 1'b0) begin
+        $display("FAIL tb_link_init_wave: Die 0 forwarded clock active during early states");
+        clk_errors = clk_errors + 1;
+      end
+    end
+    if (d1_lreset_n && (d1_ltsm_state <= LT_MBINIT_CAL)) begin
+      if ({d1_mb_tx_clk_oe, d1_mb_tx_data_oe, d1_mb_tx_valid_oe} !== 3'b000) begin
+        $display("FAIL tb_link_init_wave: Die 1 clock, data, or Valid output enable is active before RPCLK");
+        clk_errors = clk_errors + 1;
+      end
+      if (mb_d1_to_d0_clk !== 1'b0) begin
+        $display("FAIL tb_link_init_wave: Die 1 forwarded clock active during early states");
+        clk_errors = clk_errors + 1;
+      end
     end
   end
 
@@ -284,7 +370,12 @@ module tb_link_init_wave;
   ) dut_die0 (
     .lclk                  (lclk),
     .lreset_n              (d0_lreset_n),
-    .mbclk                 (mbclk),
+    .mbclk                 (d0_mbclk),
+    .mb_tx_clk             (d0_mb_tx_clk),
+    .mb_tx_clk_oe          (d0_mb_tx_clk_oe),
+    .mb_tx_data_oe         (d0_mb_tx_data_oe),
+    .mb_tx_valid_oe        (d0_mb_tx_valid_oe),
+    .mb_rx_clk             (mb_d1_to_d0_clk),
     .sbclk                 (sbclk),
     .sbreset_n             (d0_sbreset_n),
     // FDI (Table 115)
@@ -352,7 +443,12 @@ module tb_link_init_wave;
   ) dut_die1 (
     .lclk                  (lclk),
     .lreset_n              (d1_lreset_n),
-    .mbclk                 (mbclk),
+    .mbclk                 (d1_mbclk),
+    .mb_tx_clk             (d1_mb_tx_clk),
+    .mb_tx_clk_oe          (d1_mb_tx_clk_oe),
+    .mb_tx_data_oe         (d1_mb_tx_data_oe),
+    .mb_tx_valid_oe        (d1_mb_tx_valid_oe),
+    .mb_rx_clk             (mb_d0_to_d1_clk),
     .sbclk                 (sbclk),
     .sbreset_n             (d1_sbreset_n),
     // FDI (Table 115)
@@ -475,21 +571,6 @@ module tb_link_init_wave;
   wire [4:0] d1_sb_rx_opcode       = dut_die1.u_lphy.sb_rx_opcode;
   wire [7:0] d1_sb_rx_msgcode      = dut_die1.u_lphy.sb_rx_msgcode;
   wire [7:0] d1_sb_rx_msgsubcode   = dut_die1.u_lphy.sb_rx_msgsubcode;
-
-  // --------------------------------------------------------------------------
-  // assign: mbclk_en - Mainband Clock Gating Enable Driver
-  //
-  // Enables the 2 GHz forwarded clock fCK whenever either die enters
-  // MBTRAIN.LINKSPEED, LINKINIT, or ACTIVE states.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
-  // --------------------------------------------------------------------------
-  assign mbclk_en = (d0_ltsm_state == LT_MB_LINKSPEED) ||
-                    (d1_ltsm_state == LT_MB_LINKSPEED) ||
-                    (d0_ltsm_state == LT_LINKINIT)     ||
-                    (d1_ltsm_state == LT_LINKINIT)     ||
-                    (d0_ltsm_state == LT_ACTIVE)       ||
-                    (d1_ltsm_state == LT_ACTIVE);
 
   // ==========================================================================
   // Protocol Layer BFM Stimulus & Automated Handshakes
@@ -754,7 +835,8 @@ module tb_link_init_wave;
   task automatic bidir_stream(
     input  int unsigned nbeats,    // Number of DATA_W-wide beats to transfer (16 bytes per beat at the default 128-bit width)
     input  int unsigned pattern,   // Deterministic data pattern selector (0=inc, 1=dec, 2=all-ones)
-    output int unsigned err_count  // Total mismatch errors detected across both dies
+    output int unsigned err_count, // Total mismatch errors detected across both dies
+    input bit fill_tx_fifos = 1'b0 // Hold consumption to exercise real full backpressure
   );
     logic [DATA_W-1:0] words [0:MAX_STREAM_BEATS-1];
     begin
@@ -775,8 +857,27 @@ module tb_link_init_wave;
       d0_lp_stream = STREAM_ID_S0_STREAMING;
       d1_lp_stream = STREAM_ID_S0_STREAMING;
 
+      // Stop only FIFO consumers. Both local and physical clocks stay continuous.
+      // This bounded test override exposes real full flags and pending scrambler results.
+      if (fill_tx_fifos) begin
+        force dut_die0.u_lphy.u_tx_gearbox.tx_enable = 1'b0;
+        force dut_die1.u_lphy.u_tx_gearbox.tx_enable = 1'b0;
+        repeat (4) @(negedge lclk);
+      end
+
       // Fork concurrent bidirectional transmission and reception
       fork
+        begin : bs_full_release
+          if (fill_tx_fifos) begin
+            repeat (32) @(negedge lclk);
+            if (d0_pl_trdy !== 1'b0 || d1_pl_trdy !== 1'b0) begin
+              $display("FAIL tb_link_init_wave: full TX FIFOs did not stop upstream acceptance");
+              err_count = err_count + 1;
+            end
+            release dut_die0.u_lphy.u_tx_gearbox.tx_enable;
+            release dut_die1.u_lphy.u_tx_gearbox.tx_enable;
+          end
+        end
         // Die 0 TX: Stream nbeats beats to Die 1
         begin : bs_d0_tx
           for (int i = 0; i < nbeats; i = i + 1) begin
@@ -843,6 +944,15 @@ module tb_link_init_wave;
           end
         end
       join
+      // Reject a duplicate after the expected stream, including pending pipeline words.
+      repeat (16) begin
+        @(posedge lclk);
+        #0.1;
+        if (d0_pl_valid || d1_pl_valid) begin
+          $display("FAIL tb_link_init_wave: duplicate word after the expected stream");
+          err_count = err_count + 1;
+        end
+      end
     end
   endtask
 
@@ -967,6 +1077,12 @@ module tb_link_init_wave;
       $fatal(1, "TEST FAILED tb_link_init_wave: %0d streaming errors detected", stream_errors);
     end
     $display("==========================================================================\n");
+
+    // Fill both real TX FIFOs while clocks run, then compare all descrambled words.
+    bidir_stream(24, 0, bidir_err, 1'b1);
+    if (bidir_err != 0)
+      $fatal(1, "TEST FAILED tb_link_init_wave: full-FIFO stream corrupted accepted words");
+    $display("SUCCESS: full TX FIFO backpressure preserves 24 ordered descrambled words in both directions");
 
     // ==========================================================================
     // 1. LinkReset Flow (Specification Section 8.3.3.1, Figure 125)
@@ -1200,6 +1316,13 @@ module tb_link_init_wave;
     #1000;
 
     // Final success summary
+    if (clk_errors == 0 && d0_active_idle_clk_edges > 0 && d1_active_idle_clk_edges > 0) begin
+      $display("SUCCESS: continuous clock at Active and OEs disabled early states verified (idle edges: %0d / %0d)",
+               d0_active_idle_clk_edges, d1_active_idle_clk_edges);
+    end else begin
+      $fatal(1, "TEST FAILED tb_link_init_wave: clock monitor errors: clk_errors=%0d idle_edges=(%0d,%0d)",
+             clk_errors, d0_active_idle_clk_edges, d1_active_idle_clk_edges);
+    end
     $display("==========================================================================");
     $display("TEST PASSED tb_link_init_wave: bringup, streaming, LinkReset, LinkError, and Disabled verified");
     $display("  1. Link bringup and 512B bidirectional data streaming verified");
@@ -1231,7 +1354,10 @@ module tb_link_init_wave;
     $dumpfile(wave_path);
 
     // Group 1: Timing (Clocks and Resets)
-    $dumpvars(0, lclk, sbclk, mbclk,
+    $dumpvars(0, lclk, sbclk, d0_mbclk, d1_mbclk,
+                 d0_mb_tx_clk, d0_mb_tx_clk_oe, d0_mb_tx_data_oe, d0_mb_tx_valid_oe,
+                 d1_mb_tx_clk, d1_mb_tx_clk_oe, d1_mb_tx_data_oe, d1_mb_tx_valid_oe,
+                 mb_d0_to_d1_clk, mb_d1_to_d0_clk,
                  d0_lreset_n, d0_sbreset_n,
                  d1_lreset_n, d1_sbreset_n);
 

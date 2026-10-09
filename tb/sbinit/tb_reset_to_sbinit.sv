@@ -64,12 +64,16 @@ module tb_reset_to_sbinit;
   // --------------------------------------------------------------------------
   logic lclk;
   logic sbclk;
-  logic mbclk;
+  logic d0_mbclk;
+  logic d1_mbclk;
 
   initial begin
-    lclk  = 1'b0;
-    sbclk = 1'b0;
-    mbclk = 1'b0;
+    lclk     = 1'b0;
+    sbclk    = 1'b0;
+    d0_mbclk = 1'b0;
+    d1_mbclk = 1'b0;
+    #0.125;
+    forever #0.250 d1_mbclk = ~d1_mbclk;
   end
 
   // --------------------------------------------------------------------------
@@ -90,24 +94,31 @@ module tb_reset_to_sbinit;
   // --------------------------------------------------------------------------
   always #0.625 sbclk = ~sbclk;     // 800 MHz, asynchronous to lclk
 
-  logic mbclk_en;
-
   // --------------------------------------------------------------------------
-  // always: Gated Mainband Clock Generator (2 GHz mbclk)
+  // always: Free-Running Mainband Local Clock Generator (2 GHz) for Die 0
   //
-  // Mainband clock stays parked through SBINIT and toggles at 2 GHz (0.25 ns half-
-  // period) when mbclk_en is asserted in LINKINIT or ACTIVE states.
+  // Generates 2 GHz free-running local clock source for Die 0 operation.
+  // Operates continuously without obsolete LTSM state-gating.
   //
   // Spec ref: UCIe 1.0 Specification, Section 5.1.1 - Mainband Clocking.
   // --------------------------------------------------------------------------
-  always begin
-    if (mbclk_en === 1'b1) begin
-      #0.250 mbclk = ~mbclk;
-    end else begin
-      mbclk = 1'b0;
-      @(mbclk_en);
-    end
-  end
+  always #0.250 d0_mbclk = ~d0_mbclk;
+
+  // --------------------------------------------------------------------------
+  // Forwarded physical clock output enables and crossing wires from DUT outputs
+  // --------------------------------------------------------------------------
+  logic d0_mb_tx_clk;
+  logic d0_mb_tx_clk_oe;
+  logic d0_mb_tx_data_oe;
+  logic d0_mb_tx_valid_oe;
+
+  logic d1_mb_tx_clk;
+  logic d1_mb_tx_clk_oe;
+  logic d1_mb_tx_data_oe;
+  logic d1_mb_tx_valid_oe;
+
+  wire mb_d0_to_d1_clk = d0_mb_tx_clk_oe ? d0_mb_tx_clk : 1'b0;
+  wire mb_d1_to_d0_clk = d1_mb_tx_clk_oe ? d1_mb_tx_clk : 1'b0;
 
   // --------------------------------------------------------------------------
   // Asynchronous per-die reset pairs
@@ -322,19 +333,6 @@ module tb_reset_to_sbinit;
   wire            d1_rdi_pl_stallreq = dut_die1.rdi_pl_stallreq;
 
   // --------------------------------------------------------------------------
-  // assign: mbclk_en - Mainband Forwarded Clock Gating Control
-  //
-  // Enables the 2 GHz mainband clock during LINKINIT and ACTIVE states when
-  // mainband data transmission or link initialization patterns are active.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
-  // --------------------------------------------------------------------------
-  assign mbclk_en = (d0_ltsm_state == LT_LINKINIT) ||
-                    (d1_ltsm_state == LT_LINKINIT) ||
-                    (d0_ltsm_state == LT_ACTIVE) ||
-                    (d1_ltsm_state == LT_ACTIVE);
-
-  // --------------------------------------------------------------------------
   parameter bit FAST_SIM = 1'b1;
   localparam time C_RESET_MIN_DWELL_NS = FAST_SIM ? 40_000 : 4_000_000;
 
@@ -348,7 +346,10 @@ module tb_reset_to_sbinit;
   // Spec ref: UCIe 1.0 Specification, Section 4.5.3.1 and Section 4.5.3.2.
   // --------------------------------------------------------------------------
   ucie_main #(.FAST_SIM(FAST_SIM)) dut_die0 (
-    .lclk(lclk), .lreset_n(d0_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
+    .lclk(lclk), .lreset_n(d0_lreset_n), .mbclk(d0_mbclk),
+    .mb_tx_clk(d0_mb_tx_clk), .mb_tx_clk_oe(d0_mb_tx_clk_oe),
+    .mb_tx_data_oe(d0_mb_tx_data_oe), .mb_tx_valid_oe(d0_mb_tx_valid_oe),
+    .mb_rx_clk(mb_d1_to_d0_clk), .sbclk(sbclk),
     .sbreset_n(d0_sbreset_n),
     .lp_irdy(d0_lp_irdy), .lp_valid(d0_lp_valid), .lp_data(d0_lp_data),
     .lp_stream(d0_lp_stream), .lp_stallack(d0_lp_stallack),
@@ -382,7 +383,10 @@ module tb_reset_to_sbinit;
   // Spec ref: UCIe 1.0 Specification, Section 4.5.3.2 - SBINIT.
   // --------------------------------------------------------------------------
   ucie_main #(.FAST_SIM(FAST_SIM)) dut_die1 (
-    .lclk(lclk), .lreset_n(d1_lreset_n), .mbclk(mbclk), .sbclk(sbclk),
+    .lclk(lclk), .lreset_n(d1_lreset_n), .mbclk(d1_mbclk),
+    .mb_tx_clk(d1_mb_tx_clk), .mb_tx_clk_oe(d1_mb_tx_clk_oe),
+    .mb_tx_data_oe(d1_mb_tx_data_oe), .mb_tx_valid_oe(d1_mb_tx_valid_oe),
+    .mb_rx_clk(mb_d0_to_d1_clk), .sbclk(sbclk),
     .sbreset_n(d1_sbreset_n),
     .lp_irdy(d1_lp_irdy), .lp_valid(d1_lp_valid), .lp_data(d1_lp_data),
     .lp_stream(d1_lp_stream), .lp_stallack(d1_lp_stallack),
@@ -501,7 +505,10 @@ module tb_reset_to_sbinit;
     // Keep the low-rate reset, state, FDI, and RDI probes active from time
     // zero. Do not dump the free-running internal sbclk. The external scalar
     // sideband clock/data pins remain in the dump.
-    $dumpvars(0, lclk, mbclk,
+    $dumpvars(0, lclk, d0_mbclk, d1_mbclk,
+                 d0_mb_tx_clk, d0_mb_tx_clk_oe, d0_mb_tx_data_oe, d0_mb_tx_valid_oe,
+                 d1_mb_tx_clk, d1_mb_tx_clk_oe, d1_mb_tx_data_oe, d1_mb_tx_valid_oe,
+                 mb_d0_to_d1_clk, mb_d1_to_d0_clk,
                  d0_lreset_n, d0_sbreset_n, d1_lreset_n, d1_sbreset_n,
                  sb_d0_to_d1_clk, sb_d0_to_d1_data,
                  sb_d1_to_d0_clk, sb_d1_to_d0_data,
@@ -644,7 +651,26 @@ module tb_reset_to_sbinit;
       $display("FAIL tb_reset_to_sbinit: Die1 pl_inband_pres asserted before SBINIT completion");
       errors = errors + 1;
     end
-
+    if (d0_lreset_n && (d0_ltsm_state <= LT_MBINIT_CAL)) begin
+      if ({d0_mb_tx_clk_oe, d0_mb_tx_data_oe, d0_mb_tx_valid_oe} !== 3'b000) begin
+        $display("FAIL tb_reset_to_sbinit: Die 0 clock, data, or Valid output enable is active before RPCLK");
+        errors = errors + 1;
+      end
+      if (mb_d0_to_d1_clk !== 1'b0) begin
+        $display("FAIL tb_reset_to_sbinit: Die 0 forwarded clock active during early states");
+        errors = errors + 1;
+      end
+    end
+    if (d1_lreset_n && (d1_ltsm_state <= LT_MBINIT_CAL)) begin
+      if ({d1_mb_tx_clk_oe, d1_mb_tx_data_oe, d1_mb_tx_valid_oe} !== 3'b000) begin
+        $display("FAIL tb_reset_to_sbinit: Die 1 clock, data, or Valid output enable is active before RPCLK");
+        errors = errors + 1;
+      end
+      if (mb_d1_to_d0_clk !== 1'b0) begin
+        $display("FAIL tb_reset_to_sbinit: Die 1 forwarded clock active during early states");
+        errors = errors + 1;
+      end
+    end
   end
 
   initial begin

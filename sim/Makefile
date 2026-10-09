@@ -179,11 +179,11 @@
 #     with zero warnings, all unit tests pass, loopback achieves bidirectional
 #     Raw Mode data transfer, all Phase F event evidence fragments validate,
 #     and cov_report.py reports 100% reachable coverage.
-#   - Simulator performance is a deliberate design concern. The main-band
-#     forwarded clock runs at 2 GHz (Req.2), which is 16 million edges across
-#     the 4 ms RESET dwell it must observe (Req.1). Testbenches gate that clock
-#     while the link is idle so Icarus does not evaluate an idle event queue
-#     for the whole reset period.
+#   - Each die has a free-running local 2 GHz mbclk source with independent phase.
+#     The DUT controls its physical forwarded TX clock and crosses it to peer RX.
+#     Testbenches do not stop the local source during RESET or enabled PARK.
+#     The exact nominal rates do not model indefinite frequency-drift compensation.
+#     The local source prerequisites and physical DDR-cell limits are in README.md.
 #
 # REVISION HISTORY
 #   v0.0.1  2025-XX-XX  Initial creation - compile, unit and loopback targets.
@@ -195,6 +195,9 @@
 #                       targets for scalar codec, SBINIT, Adapter FDI, and
 #                       literal golden-vector verification.
 #   v0.0.6  2026-09-29  Set the loopback wall-clock timeout to 900 seconds.
+#   v0.0.7  2026-10-09  Document independent free-running local mainband sources.
+#                       Add nominal gearbox and physical-controller phase sweeps.
+#                       Include phase acceptance in the complete integration gate.
 #
 # LICENSE
 #   SPDX-License-Identifier: Apache-2.0
@@ -227,14 +230,14 @@ INCLUDES := -I $(RTL)/rtl_common -I $(TB)/monitors
 # Ensure all files explicitly compile warning-free without suppression
 FILTER  := cat
 
-.PHONY: all compile unit sideband-unit sideband-peer loopback sbinit-wave coverage clean
+.PHONY: all compile unit mainband-phase sideband-unit sideband-peer loopback sbinit-wave link-init-wave coverage clean
 
 # ------------------------------------------------------------- all
 # Final integration gate. Executes the complete verification cascade:
 # compile -> unit -> loopback -> coverage. Requires zero compile warnings,
 # all unit PASS markers, link Active on both dies, bidirectional Raw Mode
 # transfers, and 100% merged Phase F coverage without holes.
-all: compile sideband-unit sideband-peer unit loopback coverage
+all: compile sideband-unit sideband-peer unit mainband-phase loopback coverage
 
 # ------------------------------------------------------------- compile
 # Zero errors and zero warnings is the gate.
@@ -284,6 +287,45 @@ unit: compile
 	  fi; \
 	done; \
 	echo "ALL UNIT TESTS PASSED"
+
+# ------------------------------------------------------- mainband phase sweep
+# Keep exact nominal rates and vary edge phase across one source period.
+# Each run checks physical pulses or ordered words, not private CDC state.
+mainband-phase: compile
+	@echo "== Mainband nominal phase sweep"
+	@for phase in 0.001 0.067 0.183 0.249 0.251 0.317 0.499; do \
+	  name=ut_gearbox; \
+	  $(IVERILOG) -g2012 -Wall $(INCLUDES) \
+	    -P $$name.MBCLK_PHASE_NS=$$phase \
+	    -o $(OUT)/$${name}_phase.vvp $(TB)/unit/$$name.sv \
+	    $(RTL_COMMON) $(RTL_PHY) $(RTL_ADAPT) \
+	    > $(LOGS)/$${name}_phase_$$phase.compile.txt 2>&1 || exit 1; \
+	  if [ -s $(LOGS)/$${name}_phase_$$phase.compile.txt ]; then \
+	    cat $(LOGS)/$${name}_phase_$$phase.compile.txt; exit 1; \
+	  fi; \
+	  $(VVP) $(OUT)/$${name}_phase.vvp \
+	    > $(LOGS)/$${name}_phase_$$phase.txt 2>&1 || exit 1; \
+	  cat $(LOGS)/$${name}_phase_$$phase.txt; \
+	  grep -q "^TEST PASSED $$name" $(LOGS)/$${name}_phase_$$phase.txt || exit 1; \
+	  echo "PASS gearbox source phase $$phase ns"; \
+	done
+	@for phase in 1 67 183 249 251 317 499; do \
+	  name=ut_mb_clock; \
+	  $(IVERILOG) -g2012 -Wall $(INCLUDES) \
+	    -P $$name.LCLK_PHASE_PS=$$phase \
+	    -o $(OUT)/$${name}_phase.vvp $(TB)/unit/$$name.sv \
+	    $(RTL_COMMON) $(RTL_PHY) $(RTL_ADAPT) \
+	    > $(LOGS)/$${name}_phase_$$phase.compile.txt 2>&1 || exit 1; \
+	  if [ -s $(LOGS)/$${name}_phase_$$phase.compile.txt ]; then \
+	    cat $(LOGS)/$${name}_phase_$$phase.compile.txt; exit 1; \
+	  fi; \
+	  $(VVP) $(OUT)/$${name}_phase.vvp \
+	    > $(LOGS)/$${name}_phase_$$phase.txt 2>&1 || exit 1; \
+	  cat $(LOGS)/$${name}_phase_$$phase.txt; \
+	  grep -q "^TEST PASSED $$name" $(LOGS)/$${name}_phase_$$phase.txt || exit 1; \
+	  echo "PASS controller link phase $$phase ps"; \
+	done
+	@echo "MAINBAND PHASE SWEEP OK"
 
 # ------------------------------------------------------ sideband unit
 # Focused scalar codec and raw SBINIT tests. These tests use the typed packet

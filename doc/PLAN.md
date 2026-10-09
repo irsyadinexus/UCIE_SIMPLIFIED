@@ -284,9 +284,31 @@ x8 degrade = 8 bytes/transfer, 32 transfers per 256 B.
 
 Valid asserted for the first 4 UI of each 8 UI transfer.
 
-### 6.3 Clock gating (spec 4.1.3)
+### 6.3 Directional continuous mainband clock
 
-Clock gating is not modeled in the fixed profile.
+The endpoint keeps one stable local 2 GHz `mbclk` input. It sends `mb_tx_clk` to the peer `mb_rx_clk`.
+The local source runs before hardware reset release and throughout operation.
+An internal acknowledgment reports source-domain reset release, not measured analog lock.
+
+The controller crosses coherent pad-enable and run requests from `lclk`.
+DISABLED turns off scalar clock, data, and Valid output enables.
+PARK keeps those enables on and holds the clock low. RUN forwards complete source pulses.
+The initial enabled precondition lasts at least two UIs.
+RESET, SBINIT, PARAM, and CAL keep the pads disabled. Recovery requests disable pads before the next RESET entry.
+RXCLKCAL peer start and done requests wait for the actual local run or stop acknowledgment before their responses.
+LINKSPEED, LINKINIT, and Active use a continuous clock, including Valid-low gaps.
+The profile advertises free-running-only clock support and does not implement strobe mode.
+
+Depth-eight Gray FIFOs cross complete TX and RX words. TX full creates ordinary RDI backpressure.
+RX full raises the existing fatal event because the physical receiver cannot stop each peer word.
+The TX elastic slot advances the scrambler only on `valid && irdy && trdy`.
+LINKINIT flushes both FIFO pointer domains together and waits for eight physical idle UIs.
+The receiver prepares and reseeds before either Active handshake obligation can complete.
+Local Active entry does not flush an early peer singleton. Ordinary stalls preserve accepted words.
+
+`mb_ddr_io` models the dedicated scalar DDR boundary. Hardware must use characterized DDR and clock-gate cells.
+The digital model supports independent phase at exact nominal rates, not indefinite frequency-drift compensation.
+Scalar pins and output enables do not prove differential analog levels, termination, eye margin, or jitter.
 
 ### 6.4 Scrambler / LFSR (spec 4.4.1)
 
@@ -303,7 +325,8 @@ Clock gating is not modeled in the fixed profile.
 | 6 | `23'h0277CE` |
 | 7 | `23'h1BB807` |
 
-LFSR reset on entry to LINKINIT. No effect in MBINIT.REPAIRMB and MBTRAIN.VALVREF.
+RX history resets during LINKINIT preparation, before the Active handshake. TX history resets at local Active entry.
+Training patterns do not advance user-data scrambling history.
 Scrambling **off** for Per-Lane-ID, VALTRAIN, and clock repair patterns.
 Tap matrix: the LFSR shifts right with feedback into bit 22, so register bit k at
 time t is output bit t+k. The realised recurrence is `o(t+23) = XOR of o(t+i)` over

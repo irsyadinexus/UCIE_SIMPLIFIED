@@ -216,6 +216,12 @@
 //   v0.0.29 2026-10-09  Documentation compliance pass: remove obsolete implementation-phase
 //                        references outside revision history, correct stale stall driver comment,
 //                        add per-port inline comments, and split multi-signal declarations.
+//   v0.0.30 2026-10-09  Integrate directional mb_tx_clock_ctrl, peer-clocked rx_gearbox,
+//                        TX/RX elastic buffer stages with capacity reservation, fatal
+//                        overflow, and coherent source/run acknowledgment.
+//   v0.0.31 2026-10-09  Preserve accepted TX words through full backpressure.
+//                        Prepare the shared RX/TX epoch before Active responses.
+//                        Gate user output with published FDI Active permission.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -253,7 +259,7 @@ module logical_phy #(
   output logic [2:0]  rdi_pl_speedmode,         // RDI link speed mode status (4 GT/s)
   output logic        rdi_pl_stallreq,          // RDI stall request to Adapter
   output logic        clear_start_link_train,   // Clear start link train command to CSR
-  input  logic        adapter_active_req,       // Adapter Active request (compatibility tie-off)
+  input  logic        adapter_data_enable,      // Adapter published FDI Active data permission
   // Public scalar physical sideband interface (UCIe 1.0 Section 4.1.5 and 5.13)
   output logic        sb_tx_clk,                // Physical sideband TX clock strobe
   output logic        sb_tx_data,               // Physical sideband TX serial data
@@ -280,8 +286,13 @@ module logical_phy #(
   output logic [63:0] phy_csr_rdata,            // PHY CSR read data word
   output logic        phy_csr_rdata_vld,        // PHY CSR read data valid strobe
   // -------------------------------------------------- main band to partner
+  output logic        mb_tx_clk,                // Directional forwarded main band TX clock strobe
+  output logic        mb_tx_clk_oe,             // Directional main band TX clock output enable
+  output logic        mb_tx_data_oe,            // Scalar main band TX data output enable
+  output logic        mb_tx_valid_oe,           // Scalar main band TX valid output enable
   output logic [NLANES-1:0] mb_tx_data,         // Forwarded main band TX data pins
   output logic        mb_tx_valid,              // Main band TX framing valid qualifier
+  input  logic        mb_rx_clk,                // Received main band RX peer clock
   input  logic [NLANES-1:0] mb_rx_data,         // Received main band RX data pins
   input  logic        mb_rx_valid,              // Main band RX framing valid qualifier
   input  logic [NC-1:0]   lp_cfg,               // FDI configuration credits (tie-off)
@@ -312,15 +323,13 @@ module logical_phy #(
   logic        user_data_enable;         // Active user-data gate, both paths
   logic        tx_user_transfer;         // accepted TX transfer strobe
   logic        rx_user_transfer;         // accepted RX transfer strobe
-  logic        tx_user_valid_q;          // TX valid stored with scramble word
-  logic        rx_user_valid_q;          // RX valid stored with descramble word
   logic        tx_user_valid;            // stored TX valid, drained word beat
   logic        rx_user_valid;            // stored RX valid, drained word beat
   logic        rx_epoch_synced_q;        // RX epoch aligned to a quiet gap
   logic [DATA_W-1:0] tx_user_word;       // scrambled 128-bit TX word
   logic [DATA_W-1:0] rx_user_word;       // descrambled 128-bit RX word
 
-  // --------------------------------------- mainband framing fault
+  // --------------------------------------- mainband framing & fatal faults
   // The RX gearbox owns detection. This module owns the clock-domain crossing
   // and the private event shape for the LTSM. The event path is re-armed per
   // epoch: see the framing-fault section at the Active data path.
@@ -335,6 +344,24 @@ module logical_phy #(
   logic        ltsm_fatal_policy_armed;  // LTSM can consume fatal events
   logic        ltsm_framing_fault_event; // one-lclk event to the LTSM
 
+  logic        rx_gearbox_overflow;        // rx_gearbox buffer overflow
+  logic        rx_gearbox_overflow_meta_q; // lclk synchronizer stage 1
+  logic        rx_gearbox_overflow_sync_q; // lclk synchronizer stage 2
+  logic        rx_gearbox_overflow_prev_q; // edge-detect register
+  logic        rx_gearbox_overflow_rise;   // fresh synchronized overflow edge
+
+  logic        rx_overflow_fault_q;        // RX elastic buffer overflow fault
+  logic        rx_overflow_fault_prev_q;   // edge-detect register
+  logic        rx_overflow_fault_rise;     // fresh overflow edge
+
+  // ------------------------------------- mainband clock controller nets
+  logic        ltsm_mb_clock_enable;     // LTSM mainband OE enable
+  logic        ltsm_mb_clock_run;        // LTSM mainband clock run command
+  logic        mb_source_ready;          // Source reset-release acknowledgment (lclk)
+  logic        mb_clock_running;         // Physical clock run acknowledgment (lclk)
+  logic        epoch_ready_q;             // Prepared RX before Active handshake
+  logic        rdi_lp_linkerror_rise;     // Link-domain Adapter LinkError edge
+
   // ------------------------------------- mainband gearbox interface (4.1.1)
   // Declared with the Active data path because the scramble stage reads the
   // RX word and drives the TX word before the gearbox instantiations appear.
@@ -342,8 +369,10 @@ module logical_phy #(
   //           UCIe 1.0 Section 4.1.2 mainband gearbox word interface.
   logic [DATA_W-1:0] tx_gearbox_word;    // word presented to the TX gearbox
   logic              tx_gearbox_valid;   // framing valid for that word
+  logic              tx_gearbox_ready;   // TX gearbox link-domain acceptance
   logic [DATA_W-1:0] rx_gearbox_word;    // word reassembled by the RX gearbox
   logic              rx_gearbox_valid;   // valid strobe for that word
+  logic              rx_gearbox_enable;  // RX capture permission (common discard)
 
   // ------------------------------------------------- Logical PHY typed sideband CDC
   // Typed sb_packet_t channels for transmit and receive, bridging arbitrated
@@ -1292,7 +1321,8 @@ module logical_phy #(
     .lreset_n        (lreset_n),
     .software_start_event(ltsm_software_start_event),
     .rdi_active_event(ltsm_rdi_active_event),
-    .rdi_active_req  (rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE),
+    .rdi_active_req  ((rdi_lp_state_req == ucie_pkg::RDI_REQ_ACTIVE) &&
+                      ((ltsm_state != ucie_pkg::LT_LINKINIT) || epoch_ready_q)),
     .rdi_linkreset_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_LINKRESET),
     .rdi_disabled_req(rdi_lp_state_req == ucie_pkg::RDI_REQ_DISABLED),
     .rdi_linkreset_published((rdi_pl_state_sts == ucie_pkg::RDI_STS_LINKRESET) ||
@@ -1357,7 +1387,11 @@ module logical_phy #(
     .tmr_expired     (tmr_expired),
     .rst_tmr_expired (rst_tmr_expired),
     .le_tmr_start    (le_tmr_start),
-    .le_tmr_expired  (le_tmr_expired)
+    .le_tmr_expired  (le_tmr_expired),
+    .mb_source_ready (mb_source_ready),
+    .mb_clock_running(mb_clock_running),
+    .mb_clock_enable (ltsm_mb_clock_enable),
+    .mb_clock_run    (ltsm_mb_clock_run)
   );
   // ---------------------------------------------------------------------------
   // 8 ms Residency Timer Instantiation  (u_resid_timer)
@@ -1822,141 +1856,254 @@ module logical_phy #(
   //           UCIe 1.0 Sections 4.5.3.6, 8.1.6, and 8.3.1 Active user data enable.
   // ---------------------------------------------------------------------------
   assign user_data_enable = ltsm_active_entry_done &&
+                            adapter_data_enable &&
+                            (rdi_pl_state_sts == RDI_STS_ACTIVE) &&
                             local_active_req &&
                             ltsm_active_state_stable &&
                             !rdi_lp_stallack &&
                             !ltsm_transition_active &&
                             !ltsm_framing_fault_event;
 
-  // ---------------------------------------------------------------------------
-  // assign: Accepted user-transfer strobes
-  //
-  // A transfer is accepted when the gate is open, the matching valid qualifier
-  // is high, and, for the receive direction, the receive epoch is aligned.
-  // These strobes advance the scramblers, so an idle, gated, or invalid cycle
-  // consumes no LFSR state and holds both arrays.
-  //
-  // The receive epoch qualification drops every word that arrives before the
-  // first quiet transfer gap of the new Active residency. The far die stops
-  // emitting its LINKINIT or other training pattern when it leaves LINKINIT,
-  // which can happen after this die already opened its gate, and its last
-  // training words are then still inside the receive path. Those words must
-  // never advance the Active descrambler: the far die's transmit scrambler
-  // counts only its own accepted Active words, so one extra descrambled word
-  // would shift the receive sequence and corrupt every later word.
-  //
-  // Because the two directions advance on their own accepted transfers, both
-  // ends must have an open gate before the first Active word reaches the
-  // receiver. The approved bring-up flow waits for both link-active
-  // indications before streaming, and every Active Entry re-seeds both
-  // arrays, so a receiver that starts accepting mid-stream only recovers
-  // after the next Active Entry.
-  //
-  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
-  //           UCIe 1.0 Sections 4.1.2 and 4.4.1 Active TX transfer qualification.
-  // ---------------------------------------------------------------------------
-  // ---------------------------------------------------------------------------
-  // assign: tx_user_transfer - Transmit Mainband Active Transfer Qualifier
-  //
-  // Qualifies that user data gate is open (user_data_enable) AND Adapter provides
-  // valid data (rdi_lp_valid) before advancing the TX scrambler array.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 4.4.1.
-  // ---------------------------------------------------------------------------
-  assign tx_user_transfer = user_data_enable && rdi_lp_valid;
+  logic mb_epoch_reset_n;                   // Common FIFO and serializer epoch
+  logic epoch_context;                      // LINKINIT or Active preparation epoch
+  logic epoch_quiet_reset_n;                // Quiet monitor common assertion
+  logic [2:0] rx_quiet_count_q;              // Consecutive low physical Valid cycles
+  logic rx_quiet_q;                          // Physical eight-UI quiet acknowledgment
+  (* async_reg = "true" *) logic [1:0] rx_quiet_sync_q; // Quiet acknowledgment ranks
+  logic [2:0] epoch_release_count_q;         // Local FIFO-release wait
+  // epoch_ready_q is declared with the controller handshake nets.
+  logic rx_epoch_seed_pulse;                // RX reseed before peer user traffic
+  logic epoch_flush;                        // Local pending-stage discard
+  logic tx_scramble_pending_q;              // One reserved scrambled payload
+  logic tx_scramble_saved_q;                // Pending output saved through backpressure
+  logic [DATA_W-1:0] tx_scrambled_word;      // Registered scrambler output
+  logic [DATA_W-1:0] tx_saved_word_q;        // Held payload when the gearbox is full
+  logic tx_pending_push;                    // Actual pending-to-gearbox acceptance
+  logic rx_read_enable;                     // RX FIFO dequeue capacity permission
 
-  // ---------------------------------------------------------------------------
-  // assign: rx_user_transfer - Receive Mainband Active Transfer Qualifier
-  //
-  // Qualifies that user data gate is open, RX gearbox has valid framed data,
-  // AND the receive epoch has completed quiet-gap synchronization.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 4.4.1.
-  // ---------------------------------------------------------------------------
-  assign rx_user_transfer = user_data_enable && rx_gearbox_valid &&
-                            rx_epoch_synced_q;
+  // Identify the receive epoch before either Active request or response.
+  // LINKINIT has no training payload and keeps the forwarded clock running.
+  // A transition out of the epoch asserts every related reset together.
+  // An ordinary Adapter stall does not change this context.
+  // Spec ref: UCIe 1.0 Sections 4.5.3.6 and 8.1.6.
+  assign epoch_context = ((ltsm_state == LT_LINKINIT) || (ltsm_state == LT_ACTIVE)) &&
+                         !ltsm_transition_active;
 
-  // ---------------------------------------------------------------------------
-  // always_ff: Receive-epoch alignment register
-  //
-  // Cleared at every Active Entry, which is the start of one receive epoch.
-  // It sets on the first cycle in which the gate is open and the receive
-  // gearbox reports no framed transfer, that is, on the first quiet transfer
-  // gap of the epoch. The gap is the boundary between the far die's training
-  // stream and its Active stream, so from the following word onward every
-  // accepted receive word belongs to the same stream the far transmit
-  // scrambler counts.
-  //
-  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
-  //           UCIe 1.0 Sections 4.1.2 and 4.4.1 TX/RX transfer valid pipeline.
-  // ---------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      rx_epoch_synced_q <= 1'b0;
-    end else if (active_entry_seed_pulse) begin
-      rx_epoch_synced_q <= 1'b0;
-    end else if (user_data_enable && !rx_gearbox_valid) begin
-      rx_epoch_synced_q <= 1'b1;
+  // Assert the physical quiet monitor when outside its preparation epoch.
+  // Assertion works even when the peer forwarded clock is stopped.
+  // Release waits for real physical clock edges in the monitor below.
+  // No local counter supplies a synthetic peer-clock acknowledgment.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.6.
+  assign epoch_quiet_reset_n = lreset_n && epoch_context;
+
+  // Require eight idle UIs, longer than a legal four-UI Valid-low frame tail.
+  // The peer clock samples consecutive complete low-Valid clock cycles.
+  // Any high or unknown Valid restarts the quiet count.
+  // The acknowledgment remains set until the next link epoch.
+  // Spec ref: UCIe 1.0 Section 4.1.2.
+  always_ff @(posedge mb_rx_clk or negedge epoch_quiet_reset_n) begin
+    if (!epoch_quiet_reset_n) begin
+      rx_quiet_count_q <= '0;
+      rx_quiet_q <= 1'b0;
+    end else if (!rx_quiet_q) begin
+      if (mb_rx_valid === 1'b0) begin
+        if (rx_quiet_count_q == 3'd3) rx_quiet_q <= 1'b1;
+        else rx_quiet_count_q <= rx_quiet_count_q + 3'd1;
+      end else rx_quiet_count_q <= '0;
     end
   end
 
-  // ---------------------------------------------------------------------------
-  // always_ff: Valid qualifiers for the registered scramble words
-  //
-  // Both scrambler arrays register their output, so a scrambled or
-  // descrambled word appears one lclk cycle after its accepted transfer.
-  // These registers delay the valid qualifiers by exactly the same cycle, so
-  // valid and data always describe the same word. They also clear both
-  // qualifiers synchronously when the Active-data gate closes.
-  //
-  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
-  //           UCIe 1.0 Sections 4.1.2 and 4.4.1 synchronous gate-close flush.
-  // ---------------------------------------------------------------------------
+  // Synchronize physical quiet and wait for both-domain FIFO release.
+  // Preparation starts during LINKINIT, not at the later local Active entry.
+  // Thus an early peer singleton cannot be erased by a local Active-entry flush.
+  // Four local cycles cover physical and link reset-release pipelines.
+  // Spec ref: UCIe 1.0 Sections 4.5.3.6 and 8.1.6.
+  always_ff @(posedge lclk or negedge epoch_quiet_reset_n) begin
+    if (!epoch_quiet_reset_n) begin
+      rx_quiet_sync_q <= '0;
+      epoch_release_count_q <= '0;
+      epoch_ready_q <= 1'b0;
+    end else begin
+      rx_quiet_sync_q <= {rx_quiet_sync_q[0], rx_quiet_q};
+      if (rx_quiet_sync_q[1] && mb_clock_running && !epoch_ready_q) begin
+        if (epoch_release_count_q == 3'd3) epoch_ready_q <= 1'b1;
+        else epoch_release_count_q <= epoch_release_count_q + 3'd1;
+      end
+    end
+  end
+
+  // Flush both FIFO pointers and serializers before the Active handshake.
+  // LINKINIT entry discards the local training queue and partial receive frame.
+  // The peer quiet acknowledgment releases this common assertion.
+  // Active entry and ordinary stalls keep the prepared epoch intact.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 8.1.6.
+  assign mb_epoch_reset_n = lreset_n && mb_source_ready &&
+                           (ltsm_state != LT_RESET) &&
+                           (ltsm_state != LT_TRAINERROR) &&
+                           !ltsm_phy_linkreset_req && !ltsm_phy_disabled_req &&
+                           !ltsm_transition_active &&
+                           ((ltsm_state != LT_LINKINIT) || rx_quiet_sync_q[1]);
+
+  // Discard local payload staging only when the complete link epoch resets.
+  // A temporary stall preserves accepted transmit and receive words.
+  // The same assertion reaches every physical FIFO pointer domain.
+  // No Active-entry-only reset can erase a peer word.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 8.3.1.
+  assign epoch_flush = !mb_epoch_reset_n;
+
+  // Prepare receive capture after real quiet, before Active can be advertised.
+  // This permission remains high across ordinary stalls and local Active entry.
+  // RX output consumption has its own capacity permission below.
+  // Stopped physical clocks never block reset assertion or sideband progress.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.6.
+  assign rx_gearbox_enable = epoch_context && rx_quiet_sync_q[1];
+
+  // Reseed receive history before the preparation handshake, not after it.
+  // LINKINIT entry has discarded all earlier received training words.
+  // Peer user data can start only after both sides advertise prepared readiness.
+  // Transmit history still reseeds at the local Active-entry pulse.
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.1.6.
+  assign rx_epoch_seed_pulse = (ltsm_state == LT_LINKINIT) && (ltsm_state_q != LT_LINKINIT);
+
+  // Expose the prepared receive epoch to existing status monitors.
+  // Readiness follows the real peer idle interval and reset-release wait.
+  // A local FIFO-empty observation alone cannot establish a new epoch.
+  // Ordinary Active stalls do not clear this status.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 8.1.6.
+  assign rx_epoch_synced_q = epoch_ready_q;
+
+  // Reserve one elastic slot for the registered scrambler result.
+  // A pending payload can leave only when the physical FIFO accepts it.
+  // That accepted push can replace the slot with a new RDI transfer.
+  // Full backpressure never advances a held Adapter word or its LFSR.
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.1.4.
+  assign rdi_pl_trdy = user_data_enable && epoch_ready_q &&
+                      (!tx_scramble_pending_q || tx_pending_push);
+
+  // Advance transmit history once per accepted RDI beat.
+  // Valid, initiator ready, and target ready all participate.
+  // The pending slot reserves storage before the output register updates.
+  // An isolated transfer needs no second word to leave that slot.
+  // Spec ref: UCIe 1.0 Sections 4.1.2, 4.4.1, and 8.1.4.
+  assign tx_user_transfer = rdi_lp_valid && rdi_lp_irdy && rdi_pl_trdy;
+
+  // Keep an accepted pending word visible until gearbox acceptance.
+  // Ordinary stalls close upstream acceptance but do not destroy this payload.
+  // The saved copy survives the scrambler's zero output on disabled cycles.
+  // The physical FIFO supplies the actual downstream acceptance signal.
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.3.1.
+  assign tx_user_valid = tx_scramble_pending_q && (ltsm_state == LT_ACTIVE) &&
+                         !ltsm_transition_active && !epoch_flush;
+
+  // Select either the fresh registered result or its retained copy.
+  // The slot saves a blocked fresh result before the scrambler output clears.
+  // The producer holds this selected payload through the accepted push edge.
+  // A new accepted upstream word replaces it only after that push.
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.1.4.
+  assign tx_user_word = tx_scramble_saved_q ? tx_saved_word_q : tx_scrambled_word;
+
+  // Record the real pending-to-gearbox transfer.
+  // Training owns a separate source and cannot consume this slot.
+  // The ready signal is the write-domain FIFO capacity indication.
+  // No local drain intent substitutes for this acceptance.
+  // Spec ref: UCIe 1.0 Section 8.1.4.
+  assign tx_pending_push = tx_user_valid && !pat_enable && tx_gearbox_ready;
+
+  // Retain one pending scrambler result through physical FIFO backpressure.
+  // The first blocked cycle captures the result before the scrambler zeros it.
+  // A successful push frees the saved copy and permits same-edge replacement.
+  // Epoch reset discards all accepted words from the old link epoch together.
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.3.1.
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      tx_user_valid_q <= 1'b0;
-      rx_user_valid_q <= 1'b0;
-    end else if (!user_data_enable) begin
-      tx_user_valid_q <= 1'b0;
-      rx_user_valid_q <= 1'b0;
+      tx_scramble_pending_q <= 1'b0;
+      tx_scramble_saved_q <= 1'b0;
+      tx_saved_word_q <= '0;
+    end else if (epoch_flush) begin
+      tx_scramble_pending_q <= 1'b0;
+      tx_scramble_saved_q <= 1'b0;
+      tx_saved_word_q <= '0;
     end else begin
-      tx_user_valid_q <= tx_user_transfer;
-      rx_user_valid_q <= rx_user_transfer;
-  end
+      tx_scramble_pending_q <= tx_user_transfer || (tx_scramble_pending_q && !tx_pending_push);
+      if (tx_pending_push) tx_scramble_saved_q <= 1'b0;
+      else if (tx_scramble_pending_q && !tx_scramble_saved_q) begin
+        tx_saved_word_q <= tx_scrambled_word;
+        tx_scramble_saved_q <= 1'b1;
+      end
+    end
   end
 
-  // ---------------------------------------------------------------------------
-  // assign: Active-gated valid qualifiers
-  //
-  // The scrambler outputs and valid registers share one lclk pipeline stage.
-  // Clear the pending valid qualifiers whenever the Active gate closes, so a
-  // word accepted before a framing fault or private transition cannot appear
-  // after the gate closes.
-  //
-  // A new Active Entry reseeds both scramblers before user acceptance resumes.
-  // This prevents a discarded in-flight word from shifting the next recovery
-  // epoch.
-  //
-  // Spec ref: UCIe 1.0 Sections 4.1.2, 4.4.1, and 8.1.6;
-  //           UCIe 1.0 Sections 4.1.2, 4.4.1, and 8.1.6 gated user valid.
-  // ---------------------------------------------------------------------------
-  // ---------------------------------------------------------------------------
-  // assign: tx_user_valid - Gated Transmit User Data Valid Driver
-  //
-  // Gated valid feeding the TX gearbox, synchronously forced low when gate closes.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 8.1.6.
-  // ---------------------------------------------------------------------------
-  assign tx_user_valid = tx_user_valid_q && user_data_enable;
+  localparam int unsigned RX_FIFO_DEPTH = 4;
+  localparam int unsigned RX_FIFO_PTR_W = 2;
+  logic [DATA_W-1:0] rx_fifo_mem [0:RX_FIFO_DEPTH-1]; // Descrambled words held across stalls
+  logic [RX_FIFO_PTR_W-1:0] rx_fifo_wr_ptr;           // Local buffer write pointer
+  logic [RX_FIFO_PTR_W-1:0] rx_fifo_rd_ptr;           // Local buffer read pointer
+  logic [2:0] rx_fifo_count;                         // Local buffered words
+  logic rx_descramble_pending_q;                    // Registered descrambler output is valid
+  logic [DATA_W-1:0] rx_descrambled_word;            // Registered descrambler result
 
-  // ---------------------------------------------------------------------------
-  // assign: rx_user_valid - Gated Receive User Data Valid Driver
-  //
-  // Gated valid feeding RDI pl_valid, synchronously forced low when gate closes.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 8.1.6.
-  // ---------------------------------------------------------------------------
-  assign rx_user_valid = rx_user_valid_q && user_data_enable;
+  // Reserve two local entries for the FIFO-output and descrambler pipelines.
+  // Physical receive capture continues across stalls, without per-word backpressure.
+  // A full physical FIFO raises the existing fatal overflow path.
+  // The local consumer holds complete words until the RDI gate reopens.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 8.3.1.
+  assign rx_read_enable = epoch_ready_q && !ltsm_transition_active &&
+                          (rx_fifo_count < 3'(RX_FIFO_DEPTH-2));
+
+  // Descramble every accepted physical FIFO output exactly once.
+  // Output capture can precede local Active publication after epoch preparation.
+  // The elastic receive buffer retains that early peer singleton.
+  // Ordinary stalls hold queued words without resetting receive history.
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.1.6.
+  assign rx_user_transfer = rx_gearbox_valid && epoch_ready_q && !epoch_flush;
+
+  // Deliver buffered words only while RDI accepts Active user data.
+  // A fresh descrambler result bypasses the empty local buffer.
+  // A blocked fresh result enters the queue on the next link edge.
+  // Consecutive received words preserve exactly-once order.
+  // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.1.6.
+  always_comb begin
+    rx_user_valid = user_data_enable && ((rx_fifo_count != 0) || rx_descramble_pending_q);
+    rx_user_word = (rx_fifo_count != 0) ? rx_fifo_mem[rx_fifo_rd_ptr] : rx_descrambled_word;
+  end
+
+  // Retain decoded words across local stalls and early peer Active entry.
+  // A buffered output pop can coincide with a new descrambler-result push.
+  // The reserved pipeline capacity prevents a normal full-buffer write.
+  // An impossible overflow still joins the existing fatal path.
+  // Spec ref: UCIe 1.0 Sections 4.1.2 and 8.3.1.
+  always_ff @(posedge lclk or negedge lreset_n) begin
+    if (!lreset_n) begin
+      rx_fifo_wr_ptr <= '0;
+      rx_fifo_rd_ptr <= '0;
+      rx_fifo_count <= '0;
+      rx_descramble_pending_q <= 1'b0;
+      rx_overflow_fault_q <= 1'b0;
+    end else if (epoch_flush) begin
+      rx_fifo_wr_ptr <= '0;
+      rx_fifo_rd_ptr <= '0;
+      rx_fifo_count <= '0;
+      rx_descramble_pending_q <= 1'b0;
+      rx_overflow_fault_q <= 1'b0;
+    end else begin
+      rx_descramble_pending_q <= rx_user_transfer;
+      if (user_data_enable) begin
+        if (rx_fifo_count != 0) begin
+          rx_fifo_rd_ptr <= rx_fifo_rd_ptr + 1'b1;
+          if (rx_descramble_pending_q) begin
+            rx_fifo_mem[rx_fifo_wr_ptr] <= rx_descrambled_word;
+            rx_fifo_wr_ptr <= rx_fifo_wr_ptr + 1'b1;
+          end else rx_fifo_count <= rx_fifo_count - 1'b1;
+        end
+      end else if (rx_descramble_pending_q) begin
+        if (rx_fifo_count < 3'(RX_FIFO_DEPTH)) begin
+          rx_fifo_mem[rx_fifo_wr_ptr] <= rx_descrambled_word;
+          rx_fifo_wr_ptr <= rx_fifo_wr_ptr + 1'b1;
+          rx_fifo_count <= rx_fifo_count + 1'b1;
+        end else rx_overflow_fault_q <= 1'b1;
+      end
+    end
+  end
 
   // ---------------------------------------------------------------------------
   // generate: Independent per-byte TX and RX scrambler arrays
@@ -1990,7 +2137,7 @@ module logical_phy #(
         .lfsr_reset(active_entry_seed_pulse),
         .enable    (tx_user_transfer),
         .data_in   (rdi_lp_data[8*b +: 8]),
-        .data_out  (tx_user_word[8*b +: 8]),
+        .data_out  (tx_scrambled_word[8*b +: 8]),
         .state_obs ()
       );
     end
@@ -2008,89 +2155,113 @@ module logical_phy #(
       scrambler #(.LANE_ID(b)) u_rx_scrambler (
         .lclk      (lclk),
         .lreset_n  (lreset_n),
-        .lfsr_reset(active_entry_seed_pulse),
+        .lfsr_reset(rx_epoch_seed_pulse),
         .enable    (rx_user_transfer),
         .data_in   (rx_gearbox_word[8*b +: 8]),
-        .data_out  (rx_user_word[8*b +: 8]),
+        .data_out  (rx_descrambled_word[8*b +: 8]),
         .state_obs ()
       );
     end
   endgenerate
 
   // ---------------------------------------------------------------------------
-  // always_ff: Private mainband framing-fault synchronizer
+  // Module instantiation: Main-Band Transmit Clock Controller
   //
-  // The RX gearbox detects an invalid framing boundary on mbclk and holds its
-  // fault indication until lreset_n. Two lclk registers transfer that level
-  // into the policy clock domain, so the LTSM never samples an mbclk
-  // transition. The second stage is the safe lclk-domain fault level.
+  // Manages the scalar 2 GHz forwarded clock and pad enables. The link-domain
+  // pad-enable request feeds the data and Valid driver enables. The continuous
+  // run request forwards the local free-running source. Source readiness and
+  // physical run state acknowledge back into the link domain.
   //
-  // Spec ref: UCIe 1.0 Section 4.1.2; framing fault CDC synchronizer.
+  // Spec ref: UCIe 1.0 Specification, Section 5.2 - Forwarded Clock fCK.
+  // ---------------------------------------------------------------------------
+  mb_tx_clock_ctrl u_tx_clk_ctrl (
+    .lclk          (lclk),
+    .lreset_n      (lreset_n),
+    .mbclk         (mbclk),
+    .enable_req    (ltsm_mb_clock_enable),
+    .run_req       (ltsm_mb_clock_run),
+    .source_ready  (mb_source_ready),
+    .clock_running (mb_clock_running),
+    .mb_tx_clk     (mb_tx_clk),
+    .mb_tx_clk_oe  (mb_tx_clk_oe),
+    .mb_tx_data_oe (mb_tx_data_oe),
+    .mb_tx_valid_oe(mb_tx_valid_oe)
+  );
+
+  // ---------------------------------------------------------------------------
+  // always_ff: Hardware Fatal Fault Synchronizers and Edge Baselines
+  //
+  // Synchronizes RX gearbox framing fault, RX gearbox overflow, and RX
+  // datapath overflow into lclk domain for edge detection.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2, 4.5.3.8, and 7.5.3.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      rx_framing_fault_meta_q <= 1'b0;
-      rx_framing_fault_sync_q <= 1'b0;
+      rx_framing_fault_meta_q     <= 1'b0;
+      rx_framing_fault_sync_q     <= 1'b0;
+      rx_framing_fault_prev_q     <= 1'b0;
+      rx_gearbox_overflow_meta_q  <= 1'b0;
+      rx_gearbox_overflow_sync_q  <= 1'b0;
+      rx_gearbox_overflow_prev_q  <= 1'b0;
+      rx_overflow_fault_prev_q    <= 1'b0;
     end else begin
-      rx_framing_fault_meta_q <= rx_framing_fault;
-      rx_framing_fault_sync_q <= rx_framing_fault_meta_q;
+      rx_framing_fault_meta_q     <= rx_framing_fault;
+      rx_framing_fault_sync_q     <= rx_framing_fault_meta_q;
+      rx_framing_fault_prev_q     <= rx_framing_fault_sync_q;
+
+      rx_gearbox_overflow_meta_q  <= rx_gearbox_overflow;
+      rx_gearbox_overflow_sync_q  <= rx_gearbox_overflow_meta_q;
+      rx_gearbox_overflow_prev_q  <= rx_gearbox_overflow_sync_q;
+
+      rx_overflow_fault_prev_q    <= rx_overflow_fault_q;
     end
   end
 
   // ---------------------------------------------------------------------------
-  // always_ff: Framing-fault edge baseline
+  // assign: rx_framing_fault_rise - Fresh Synchronized Framing Fault Edge
   //
-  // The synchronized gearbox level is sticky until lreset_n. This register
-  // converts it to one fresh edge event and prevents a level-shaped input from
-  // keeping the LTSM fatal policy asserted across recovery.
+  // Rising-edge pulse of synchronized RX gearbox framing fault.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
-  //           UCIe 1.0 Sections 4.1.2 and 4.5.3.8 framing fault edge detection.
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 4.5.3.8.
   // ---------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) rx_framing_fault_prev_q <= 1'b0;
-    else           rx_framing_fault_prev_q <= rx_framing_fault_sync_q;
-  end
+  assign rx_framing_fault_rise = rx_framing_fault_sync_q && !rx_framing_fault_prev_q;
 
   // ---------------------------------------------------------------------------
-  // assign: Fresh synchronized framing-fault edge
+  // assign: rx_gearbox_overflow_rise - Fresh Synchronized Gearbox Overflow Edge
   //
-  // The gearbox bit is a sticky observation, not a fatal level. A rising edge
-  // is the only fresh event, so an already-reported fault does not retrigger
-  // the recovered link when its gearbox bit remains high.
+  // Rising-edge pulse of synchronized RX gearbox async FIFO overflow.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
-  //           UCIe 1.0 Sections 4.1.2 and 4.5.3.8 framing fault rise detection.
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 4.5.3.8.
   // ---------------------------------------------------------------------------
-  assign rx_framing_fault_rise = rx_framing_fault_sync_q &&
-                                 !rx_framing_fault_prev_q;
+  assign rx_gearbox_overflow_rise = rx_gearbox_overflow_sync_q && !rx_gearbox_overflow_prev_q;
 
   // ---------------------------------------------------------------------------
-  // assign: LTSM fatal-policy arm level
+  // assign: rx_overflow_fault_rise - Fresh RX Datapath Buffer Overflow Edge
+  //
+  // Rising-edge pulse of RX elastic buffer fatal overflow condition.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 and Section 4.5.3.8.
+  // ---------------------------------------------------------------------------
+  assign rx_overflow_fault_rise = rx_overflow_fault_q && !rx_overflow_fault_prev_q;
+
+  // ---------------------------------------------------------------------------
+  // assign: ltsm_fatal_policy_armed - LTSM fatal-policy arm level
   //
   // RESET and SBINIT intentionally do not consume post-SBINIT fatal events.
-  // The level mirrors the LTSM sideband-policy boundary without adding a
-  // public protocol or a second recovery state machine.
+  // The level mirrors the LTSM sideband-policy boundary.
   //
-  // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8;
-  //           UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8 fatal policy arming.
+  // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8.
   // ---------------------------------------------------------------------------
-  assign ltsm_fatal_policy_armed = (ltsm_state != LT_RESET) &&
-                                    (ltsm_state != LT_SBINIT);
+  assign ltsm_fatal_policy_armed = (ltsm_state != ucie_pkg::LT_RESET) &&
+                                   (ltsm_state != ucie_pkg::LT_SBINIT);
 
   // ---------------------------------------------------------------------------
   // always_ff: Epoch-qualified framing-fault retention
   //
-  // A fresh fault edge that arrives while RESET or SBINIT cannot be consumed
-  // by the LTSM. Retain that one event until the first armed policy cycle,
-  // then clear it after one pulse. This private retention re-arms event
-  // delivery across LinkReset and Disabled recovery without clearing the
-  // gearbox sticky bit or adding a top-level error port. An edge consumed
-  // during an armed epoch is not retained, so its sticky residual does not
-  // retrigger the recovered link.
+  // Retains framing fault edge that arrives during RESET or SBINIT until armed.
   //
-  // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8;
-  //           UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8 fatal fault hold register.
+  // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -2102,89 +2273,59 @@ module logical_phy #(
     end
   end
 
-  // ---------------------------------------------------------------------------
-  // assign: Private LTSM fatal / framing-fault event
-  //
-  // An edge reaches the existing fatal policy immediately when armed. A
-  // retained edge produces one pulse on the first armed epoch cycle. The
-  // event remains private and one-cycle shaped, so fatal recovery keeps its
-  // existing TRAINERROR Entry and LinkReset policy.
-  //
-  // Spec ref: UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2;
-  //           UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2 link error edge detector.
-  // ---------------------------------------------------------------------------
   logic rdi_lp_linkerror_q;
+
   // ---------------------------------------------------------------------------
   // always_ff: Adapter LinkError edge synchronizer and history register
   //
-  // Samples the private rdi_lp_linkerror input from the D2D Adapter on each
-  // rising edge of lclk to detect a rising edge (rdi_lp_linkerror_rise).
-  // This edge pulse is combined with other fatal fault sources to trigger
-  // escalation into the LTSM fatal policy and TRAINERROR Entry exchange.
+  // Samples rdi_lp_linkerror on lclk to detect rising edge.
   //
-  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114) and Section 8.2;
-  //           Section 8.3.2.7 - LinkError State.
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 and Section 8.3.2.7.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) rdi_lp_linkerror_q <= 1'b0;
     else           rdi_lp_linkerror_q <= rdi_lp_linkerror;
   end
-  wire rdi_lp_linkerror_rise = rdi_lp_linkerror && !rdi_lp_linkerror_q;
 
   // ---------------------------------------------------------------------------
-  // assign: ltsm_framing_fault_event - private physical fatal event aggregator
+  // assign: rdi_lp_linkerror_rise - Fresh Adapter LinkError Edge
   //
-  // Combines three independent hardware fatal indications into a single
-  // unified pulse driving the LTSM fatal policy:
-  //   1. rx_framing_fault_rise   - gearbox 1100 sync pattern tracking loss.
-  //   2. codec_rx_overflow_rise  - sideband receiver buffer overflow.
-  //   3. rdi_lp_linkerror_rise   - adapter/protocol fatal error assertion.
-  // Gated by ltsm_fatal_policy_armed (active in all post-RESET states).
-  // Also holds rx_framing_fault_pending_q if a fault arrived during RESET.
+  // Rising-edge pulse of Adapter link error input.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2;
-  //           UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2 fatal framing fault event.
+  // Spec ref: UCIe 1.0 Specification, Section 8.1 and Section 8.3.2.7.
   // ---------------------------------------------------------------------------
-  assign ltsm_framing_fault_event = ((rx_framing_fault_rise || codec_rx_overflow_rise || rdi_lp_linkerror_rise) &&
+  assign rdi_lp_linkerror_rise = rdi_lp_linkerror && !rdi_lp_linkerror_q;
+
+  // ---------------------------------------------------------------------------
+  // assign: ltsm_framing_fault_event - Private Hardware Fatal Event Aggregator
+  //
+  // Aggregates framing fault, codec overflow, linkerror, gearbox overflow,
+  // and RX buffer overflow into a unified fatal trigger.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 4.1.2, 4.5.3.8, and 8.3.3.2.
+  // ---------------------------------------------------------------------------
+  assign ltsm_framing_fault_event = ((rx_framing_fault_rise ||
+                                      codec_rx_overflow_rise ||
+                                      rdi_lp_linkerror_rise ||
+                                      rx_gearbox_overflow_rise ||
+                                      rx_overflow_fault_rise) &&
                                      ltsm_fatal_policy_armed) ||
                                     rx_framing_fault_pending_q;
-  // ---------------------------------------------------------------------------
-  // Main-Band 4 GT/s DDR Gearboxes (spec 4.1.1 and 5.2)
-  // ---------------------------------------------------------------------------
-  // The TX gearbox bridges the 500 MHz 128-bit lclk word to eight UI slices
-  // per lane. The RX gearbox reassembles eight received UIs into one lclk
-  // word for rdi_pl_data. The source mux below selects a LINKINIT diagnostic,
-  // a low immediate-success training state, or the gated Active user word.
-  // The RX gearbox additionally reports a private mainband framing fault.
-  // The four gearbox interface signals are declared with the Active data path
-  // section above, because the scramble stage already uses them.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.1, Section 4.1.2, Section 5.2, and
-  //           Section 8.1.2.
-  // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
   // always_comb: Mainband source and Active user-data gate
   //
-  // Routes a selected LINKINIT diagnostic pattern to the TX gearbox when
-  // pat_enable is high. During immediate-success MBINIT and MBTRAIN states,
-  // it drives a zero word with framing low. The final branch carries the
-  // scrambled Active user word only while its gated valid qualifier is high;
-  // every other state drives a zero word with framing low, so no Adapter
-  // traffic can reach the main band before the link is fully Active.
+  // Routes LINKINIT diagnostic pattern to TX gearbox when pat_enable is high,
+  // zero word during MBINIT/MBTRAIN, or scrambled Active user word.
   //
-  // The training-pattern branch is separate from the Active data path: patterns never enter
-  // the data scramblers. The MBINIT/MBTRAIN guard is retained as an explicit
-  // MBINIT/MBTRAIN guarantee even though the Active gate now blocks those states.
-  //
-  // Spec ref: UCIe 1.0, Sections 4.1.2, 4.4.1, 4.5.3.3, 4.5.3.4, and 4.5.3.6;
-  //           UCIe 1.0, Sections 4.1.2, 4.4.1, 4.5.3.3, 4.5.3.4, and 4.5.3.6.
-  // -------------------------------------------------------------------------
+  // Spec ref: UCIe 1.0, Sections 4.1.2, 4.4.1, 4.5.3.3, 4.5.3.4, and 4.5.3.6.
+  // ---------------------------------------------------------------------------
   always_comb begin
     if (pat_enable) begin
       tx_gearbox_word  = pat_data_out;
       tx_gearbox_valid = 1'b1;
-    end else if ((ltsm_state >= LT_MBINIT_PARAM) &&
-                 (ltsm_state <= LT_MB_REPAIR)) begin
+    end else if ((ltsm_state >= ucie_pkg::LT_MBINIT_PARAM) &&
+                 (ltsm_state <= ucie_pkg::LT_MB_REPAIR)) begin
       tx_gearbox_word  = '0;
       tx_gearbox_valid = 1'b0;
     end else if (tx_user_valid) begin
@@ -2199,13 +2340,9 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   // Module instantiation: TX gearbox
   //
-  // Serialises one 128-bit lclk word into eight DDR UI slices per lane. The
-  // word and its framing valid come from the source mux above, so the training
-  // pattern path and the scrambled Active user word share one serializer and
-  // never interleave within a word.
+  // Serialises one 128-bit lclk word into eight DDR UI slices per lane.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2;
-  //           UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2 TX gearbox instantiation.
+  // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2.
   // ---------------------------------------------------------------------------
   tx_gearbox #(
     .NBYTES(NBYTES),
@@ -2213,10 +2350,13 @@ module logical_phy #(
   ) u_tx_gearbox (
     .lclk       (lclk),
     .lreset_n   (lreset_n),
+    .epoch_reset_n(mb_epoch_reset_n),
     .mbclk      (mbclk),
+    .tx_enable  (mb_clock_running),
     .tx_word    (tx_gearbox_word),
     .tx_valid   (tx_gearbox_valid),
     .tx_load    (1'b1),
+    .tx_ready   (tx_gearbox_ready),
     .mb_tx_data (mb_tx_data),
     .mb_tx_valid(mb_tx_valid)
   );
@@ -2224,13 +2364,10 @@ module logical_phy #(
   // ---------------------------------------------------------------------------
   // Module instantiation: RX gearbox
   //
-  // Reassembles the received DDR UI slices into one 128-bit lclk word and
-  // reports an invalid mainband framing boundary as a private fault. The
-  // fault is synchronized and shaped into the LTSM event above; it is not a
-  // public error output.
+  // Reassembles received DDR UI slices on peer mb_rx_clk into parallel
+  // 128-bit lclk words, reporting boundary framing faults and FIFO overflow.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2;
-  //           UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2 RX gearbox instantiation.
+  // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2.
   // ---------------------------------------------------------------------------
   rx_gearbox #(
     .NBYTES(NBYTES),
@@ -2238,55 +2375,17 @@ module logical_phy #(
   ) u_rx_gearbox (
     .lclk        (lclk),
     .lreset_n    (lreset_n),
-    .mbclk       (mbclk),
+    .epoch_reset_n(mb_epoch_reset_n),
+    .mbclk       (mb_rx_clk),
+    .rx_enable   (rx_gearbox_enable),
+    .rx_drain_enable(rx_read_enable),
     .mb_rx_data  (mb_rx_data),
     .mb_rx_valid (mb_rx_valid),
     .rx_word     (rx_gearbox_word),
     .rx_word_vld (rx_gearbox_valid),
-    .framing_fault(rx_framing_fault)
+    .framing_fault(rx_framing_fault),
+    .overflow    (rx_gearbox_overflow)
   );
-
-  // ---------------------------------------------------------------------------
-  // RDI Physical-Layer Outputs: trdy / valid / data
-  // ---------------------------------------------------------------------------
-  // These three continuous assigns form the physical-layer half of the RDI
-  // transmit handshake. They are the only path by which received main-band
-  // data leaves this module, so they are what makes the receive datapath
-  // observable to the adapter.
-  //
-  //   rdi_pl_trdy  - transmit ready. The PHY is always ready in this
-  //                  simplified endpoint, so trdy simply mirrors the protocol
-  //                  layer's irdy. There is no flow-control state to model
-  //                  because the loopback never backpressures. trdy is not
-  //                  gated: the Active data gate above, not trdy, is what
-  //                  keeps user traffic off the main band.
-  //
-  //   rdi_pl_valid - receive valid. Qualified by the Active user-data gate, so
-  //                  it marks only a descrambled word that the far die sent
-  //                  while the link was fully Active. This is the framing
-  //                  boundary of spec 4.1.2: valid marks the cycle on which
-  //                  rdi_pl_data carries a complete word. The valid register
-  //                  inside the scramble stage delays this qualifier by the
-  //                  same lclk cycle as the descrambled data.
-  //
-  //   rdi_pl_data  - receive data. The descrambled word that rides with
-  //                  rdi_pl_valid, and zero whenever that qualifier is low, so
-  //                  valid and data always describe the same word and no
-  //                  pre-Active or stale word can reach the adapter.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing; Section 4.4.1 -
-  // Scrambling; Section 8.1 - Raw Die-to-Die Interface (RDI);
-  // Table 114 - RDI Signal List; Section 8.1.4 Handshake rules.
-  // ---------------------------------------------------------------------------
-  // ---------------------------------------------------------------------------
-  // assign: rdi_pl_trdy - RDI Target Ready Handshake Pass-Through
-  //
-  // Loopback connection passing Adapter initiator ready (rdi_lp_irdy) directly
-  // through to target ready (rdi_pl_trdy) for unthrottled streaming.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 8.1 (Table 114 - RDI Signal List).
-  // ---------------------------------------------------------------------------
-  assign rdi_pl_trdy  = rdi_lp_irdy;
 
   // ---------------------------------------------------------------------------
   // assign: rdi_pl_valid - RDI Receive Mainband Valid Data Qualifier
@@ -2317,7 +2416,7 @@ module logical_phy #(
   //
   // Spec ref: UCIe 1.0 Specification, Section 8.1 and Section 8.3.1.
   // ---------------------------------------------------------------------------
-  assign unused = adapter_active_req | rdi_stall_complete |
+  assign unused = rdi_stall_complete |
                   phy_retrain_done | sb_msg_timeout |
                   sb_stall_sent | lane_bytes[0][0] | sb_rx_cdc_busy |
                   raw_rx_result_busy | raw_tx_done_busy |
@@ -2327,7 +2426,6 @@ module logical_phy #(
                   rx_cdc_packet.tag[0] | rx_cdc_packet.be[0] |
                   rx_cdc_packet.status[0] | rx_cdc_packet.addr[0] |
                   rx_cdc_packet.msg_info[8] | codec_tx_ready;
-
 endmodule
 
 `endif

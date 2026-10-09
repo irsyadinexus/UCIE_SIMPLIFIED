@@ -1,567 +1,549 @@
 // ============================================================================
 // File        : mb_gearbox.sv
 // Project     : UCIe 1.0 Simplified Endpoint
-// Description : Main-band DDR serialiser / deserialiser (gearbox) for the
-//               4 GT/s physical interface (Req.2).
+// Description : Continuous-profile x16 mainband DDR word gearboxes.
 //
-// PHYSICAL LAYER MODEL (spec 4.1.1, 5.2)
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// At 4 GT/s the main band runs at fCK = 2 GHz with DDR (double data rate)
-// transfer: one bit per lane per clock edge, giving 4 GT/s per lane. The RDI
-// side runs on lclk = 500 MHz with a 128-bit data bus (NBYTES = 16). Both
-// sides carry the same payload expressed two ways:
+// PHYSICAL PROFILE
+// ~~~~~~~~~~~~~~~~
+// The supported profile has sixteen lanes, sixteen bytes, and eight UIs per word.
+// The local source runs continuously at 2 GHz before hardware reset release.
+// The link clock runs at 500 MHz with an independent phase.
+// The physical receive clock is the peer forwarded clock, not the local source.
+// Each lane carries one byte, least significant bit first.
+// Lane L at UI U carries word bit 8*L+U.
+// One word takes four source cycles, or 2 ns at the supported rate.
+// Parameter names remain available for the existing module interface.
+// They do not advertise a different physical speed or an unsupported profile.
 //
-//   128 b @ 500 MHz (single-edge lclk) = 64 Gbps
-//    32 b @ 2 GHz   (per mbclk cycle)  = 32 b x 2 GHz   = 64 Gbps
+// TRANSMIT CONTRACT
+// ~~~~~~~~~~~~~~~~~
+// tx_ready qualifies a free FIFO entry after local reset release.
+// Only tx_load AND tx_valid AND tx_ready writes a word.
+// The depth-eight Gray FIFO crosses each word from lclk to the local source.
+// tx_enable crosses through two source-domain registers.
+// Permission controls FIFO consumption, not the local source clock.
+// A queued isolated word starts as soon as permission and a readable head exist.
+// No two-word priming requirement delays an isolated word.
+// A busy serializer consumes the next head at the next four-cycle boundary.
+// The first pair comes directly from the current FIFO head at its consume edge.
+// The remaining pairs come from the saved word.
+// Dedicated DDR cells capture each pair before serializer state advances.
+// This order sustains one word per 2 ns without losing an odd UI.
+// Disabled permission discards an in-flight partial word but preserves queued words.
+// An epoch reset discards the queue and all serializer state.
+// Permission must stay low until the controller acknowledges physical RUN.
 //
-// A DDR clock cycle moves 32 bits: 16 bits (one per lane) on the rising
-// (high) phase and 16 bits on the falling (low) phase. One lclk word is
-// therefore four mbclk cycles = eight UIs, and each lane carries eight bits
-// (one byte) per word.
+// RECEIVE CONTRACT
+// ~~~~~~~~~~~~~~~~
+// Dedicated DDR cells capture both data and Valid at every ending UI edge.
+// The receive parser processes both captured UIs in their physical order.
+// It does not align a word to a reset counter or a local source phase.
+// After release, the parser first observes a real low Valid UI.
+// The next high Valid UI starts bit zero of a new word.
+// This rule discards a frame that began before capture permission or epoch release.
+// Each word must contain four high Valid UIs followed by four low Valid UIs.
+// The parser also accepts a word that starts on the odd UI of a captured pair.
+// A corrupt word never enters the receive FIFO.
+// Legal whole words enter the depth-eight Gray FIFO once at their final UI.
+// The local lclk consumes each readable FIFO head once.
+// A stopped physical receive clock cannot repeat the last source-domain word.
+// Buffered complete words can still drain after that clock stops.
 //
-// LANE MAPPING (spec 4.1.1 - byte k on lane k, bit 0 first)
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// A UI is one DDR edge. At UI u (u = 0..7) lane L carries bit
-// `sample_word[8*L + u]`: byte L of the word is transported on lane L, one
-// bit per UI, least-significant bit first. Equivalently, over the eight UIs
-// of a word, lane L carries the byte sample_word[8*L +: 8].
+// RESET AND EPOCH CONTRACT
+// ~~~~~~~~~~~~~~~~~~~~~~~~
+// Hardware and epoch resets assert one common reset across both FIFO domains.
+// Each clock domain releases reset after two of its own rising edges.
+// Neither gearbox independently clears just one FIFO pointer.
+// RX capture disable also asserts this common receive reset.
+// It discards queued words, a partial frame, and paired capture state immediately.
+// A stopped physical receive clock cannot prevent that discard.
+// A new receive epoch requires captured idle before the first wanted frame.
+// Integration must retain its quiet interval before new scrambled user traffic.
+// RX domain release can await physical edges without delaying sideband progress.
 //
-// The serializer therefore GATHERS one bit from each lane byte per UI; it is
-// not a contiguous slice of the word. A contiguous-slice serializer happens
-// to round-trip in a loopback because transmitter and receiver transpose
-// identically, so the unit test checks the wire directly against the
-// per-lane equation above.
+// FAULT CONTRACT
+// ~~~~~~~~~~~~~~
+// framing_fault records an illegal four-high, four-low receive frame.
+// overflow records a complete legal word rejected by a full receive FIFO.
+// Both flags clear only on hardware reset, not an epoch reset or capture disable.
+// The integration layer synchronizes these flags into its fatal policy.
+// FIFO full is ordinary transmit backpressure, not a transmit framing fault.
+// There is no rate correction for indefinitely unequal average die frequencies.
 //
-// CLOCK RELATIONSHIP (explicit phase contract)
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// mbclk (fCK, 2 GHz) is exactly 4x lclk (500 MHz) and phase-locked to it
-// (fCK is the forwarded clock from the same PLL in this model). One lclk
-// cycle contains four mbclk cycles and eight mbclk edges. The contract is:
-//
-//   cycle c spans [cT, (c+1)T) with posedge at cT and negedge at cT + T/2.
-//   rising  (high) phase carries UI 2c   (bit 2c   of every lane byte)
-//   falling (low)  phase carries UI 2c+1 (bit 2c+1 of every lane byte)
-//
-// SYNTHESIS DISCIPLINE
-// ~~~~~~~~~~~~~~~~~~~~
-// Every flop below is a single-edge flop. There is deliberately NO
-// `always @(a or b)` two-edge construct, which would not be a portable
-// synthesizable flip-flop. DDR behaviour is expressed as follows:
-//
-//   TX : registered `ser_q` word, cycle counter and framing snapshot; the
-//        pin is a combinational per-lane gather selected by the mbclk level
-//        in an explicit I/O wrapper region.
-//   RX : a `negedge mbclk` register captures the high-phase lane vector; the
-//        `posedge mbclk` assembler scatters it plus the low-phase lane vector
-//        into the word. Both are single-edge flops.
-//
-// VALID FRAMING AND THE PRIVATE FAULT (spec 4.1.2, PLAN.md 6.2)
-// ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-// Valid is asserted for the FIRST FOUR UI of each eight-UI transfer. One
-// mbclk cycle carries two UI (high phase = UI 2c, low phase = UI 2c+1), so
-// the legal per-cycle framing pattern of a transfer window is
-//
-//   mbclk cycle : 0    1    2    3
-//   UI          : 0,1  2,3  4,5  6,7
-//   valid       : 1    1    0    0      (word in flight)
-//   valid       : 0    0    0    0      (idle)
-//
-// The transmitter asserts mb_tx_valid only in cycles 0 and 1 of a window that
-// carries a real beat. rx_gearbox checks the same pattern: it latches the
-// qualifier level of cycle 0 as the window reference and requires cycles 1, 2
-// and 3 to carry 1, 0 and 0. Any other level is a framing violation - an
-// early transition (the qualifier falls inside the valid window or rises in
-// the middle of an idle window), a late transition (the qualifier is still
-// high after the fourth UI), or a receive window that is not a transfer
-// window at all. The receiver then rejects the assembled word, so no
-// rx_word_vld pulse is produced, and the sticky `framing_fault` output records
-// the condition. It is private: only the logical PHY reads it, it holds until
-// lreset_n, and no public port exposes it.
-//
-// Port Summary
-// ~~~~~~~~~~~~
-//   tx_gearbox : lclk, lreset_n, mbclk, tx_word[127:0], tx_valid, tx_load,
-//                mb_tx_data[15:0], mb_tx_valid
-//   rx_gearbox : lclk, lreset_n, mbclk, mb_rx_data[15:0], mb_rx_valid,
-//                rx_word[127:0], rx_word_vld, framing_fault
-//
-// Spec References
-// ~~~~~~~~~~~~~~~
-//   4.1.1  - lane and width definitions, byte-to-lane mapping, DDR transfer
-//   4.1.2  - valid framing: valid asserted for the first four UI of each
-//            eight-UI transfer
-//   5.2    - main band signalling, forwarded clock (fCK)
-//   8.1.2  - lclk = fCK/4 at 4 GT/s with NBYTES = 16
+// SPECIFICATION REFERENCES
+// ~~~~~~~~~~~~~~~~~~~~~~~~
+// UCIe 1.0 Section 4.1.1 defines byte lanes and DDR bit order.
+// UCIe 1.0 Section 4.1.2 defines Valid framing.
+// UCIe 1.0 Sections 5.2 and 8.1.2 define mainband source and link clocks.
 //
 // --------------------------------------------------------------------------
 // Revision History
 // --------------------------------------------------------------------------
-//   v0.0.1  2026-09-23  First commit to git. TX/RX DDR gearboxes for the 4 GT/s
-//                        main band with the 2 GHz forwarded clock.
-//   v0.0.2  2026-09-23  Req.2: collapse the per-lane phase gather into one
-//                        always @* with a case on cyc_q, and use an NBA on the
-//                        DDR pin mux, so Icarus keeps the 2 GHz event queue small.
-//   v0.0.3  2026-09-23  Documentation: add per-construct comment blocks with spec
-//                        references.
-//   v0.0.4  2026-09-25  Phase E: add the private sticky `framing_fault` output
-//                        to rx_gearbox and its four-cycle valid-framing boundary
-//                        monitor. No public port changes.
-//   v0.0.5  2026-09-25  Phase E: assert mb_tx_valid in mbclk cycles 0 and 1 only,
-//                        that is the first four UI of the eight-UI transfer
-//                        (PLAN.md 6.2), and require the same 1100 pattern in the
-//                        rx boundary monitor. The monitor now rejects early, late,
-//                        or malformed framing, suppresses the word strobe for a
-//                        rejected window, and keeps the fault sticky until
-//                        lreset_n. No public port changes.
-//   v0.0.6  2026-10-08  Documentation compliance pass: adjust signal declarations
-//                        and add dedicated construct comments for framing
-//                        expectation and boundary monitoring.
-//   v0.0.7  2026-10-09  Documentation compliance pass: normalize revision columns from revision
-//                        history, remove obsolete implementation-phase references outside
-//                        revision history, add per-port inline comments, and split multi-signal
-//                        declarations.
+//   v0.0.1  2026-09-23  Initial TX and RX gearboxes.
+//   v0.0.4  2026-09-25  Phase E: add sticky framing history.
+//   v0.0.8  2026-10-09  Add mainband asynchronous FIFOs.
+//   v0.0.9  2026-10-09  Implement epoch, permission, and ready APIs.
+//                       Use DDR cells and receive-Valid-based UI alignment.
 // ============================================================================
-`ifndef MbGearbox_SV
-`define MbGearbox_SV
-`include "ucie_pkg.sv"
 
-// ===========================================================================
-// tx_gearbox: parallel 128-bit lclk word -> per-lane DDR slices on mbclk,
-//             with the four-UI valid-framing qualifier.
-// ===========================================================================
+`include "ucie_pkg.sv"
 `timescale 1ns/1ps
 module tx_gearbox #(
-  parameter int unsigned NBYTES = ucie_pkg::NBYTES,  // 16 bytes = 128-bit word
-  parameter int unsigned NLANES = ucie_pkg::NLANES_MAX, // 16 lanes
-  parameter int unsigned NSLICE = 8                  // UI slices per word
+  parameter int unsigned NBYTES = ucie_pkg::NBYTES,     // Parallel word bytes
+  parameter int unsigned NLANES = ucie_pkg::NLANES_MAX, // Physical data lanes
+  parameter int unsigned NSLICE = 8                    // UIs per lane byte
 ) (
-  input  logic                 lclk,        // Link clock (500 MHz)
-  input  logic                 lreset_n,    // Active-low asynchronous reset
-  input  logic                 mbclk,       // 2 GHz forwarded clock (fCK)
-  input  logic [NBYTES*8-1:0]  tx_word,     // one word per lclk
-  input  logic                 tx_valid,    // current word is a real beat
-  input  logic                 tx_load,     // 1-cycle strobe: sample word
-  output logic [NLANES-1:0]    mb_tx_data,  // DDR output, 1 bit/lane/edge
-  output logic                 mb_tx_valid  // framing qualifier: high in
-                                            // mbclk cycles 0 and 1, low in
-                                            // cycles 2 and 3 (first four UI)
+  input  logic                 lclk,          // Local 500 MHz link clock
+  input  logic                 lreset_n,      // Common hardware reset
+  input  logic                 epoch_reset_n, // Common serializer and FIFO epoch
+  input  logic                 mbclk,         // Ungated local 2 GHz source
+  input  logic                 tx_enable,     // Stable physical-run/data permission
+  input  logic [NBYTES*8-1:0]   tx_word,       // Word held through accepted write
+  input  logic                 tx_valid,      // Real payload qualifier
+  input  logic                 tx_load,       // Write request
+  output logic                 tx_ready,      // Link-domain FIFO acceptance ready
+  output wire [NLANES-1:0]     mb_tx_data,    // Physical DDR data samples
+  output wire                  mb_tx_valid    // Physical four-high/four-low framing
 );
+  localparam int unsigned NCYC = NSLICE/2;
+  localparam int unsigned CYC_W = $clog2(NCYC);
+  logic common_reset_n;                            // Both-domain epoch assertion
+  (* async_reg = "true" *) logic [1:0] lrelease_q; // Link reset release
+  (* async_reg = "true" *) logic [1:0] mbrelease_q; // Source reset release
+  logic tx_lreset_n;                               // Released link reset
+  logic tx_mbreset_n;                              // Released source reset
+  (* async_reg = "true" *) logic [1:0] enable_sync_q; // Source permission ranks
+  logic fifo_winc;                                 // Accepted word write
+  logic fifo_wfull;                                // Link-domain full flag
+  logic fifo_rinc;                                 // Serializer head consume
+  logic [NBYTES*8-1:0] fifo_rdata;                  // Current source-domain head
+  logic fifo_rvalid;                               // Readable source-domain head
+  logic [NBYTES*8-1:0] ser_q;                       // Saved in-flight word
+  logic ser_active_q;                              // A saved word has remaining pairs
+  logic [CYC_W-1:0] cyc_q;                         // Next saved-word pair index
+  logic [NBYTES*8-1:0] send_word_w;                 // Word for the next DDR pair
+  logic [CYC_W-1:0] send_cyc_w;                    // Pair index before the launch edge
+  logic [NLANES-1:0] hi_w;                         // Even UI prepared for DDR cells
+  logic [NLANES-1:0] lo_w;                         // Odd UI prepared for DDR cells
+  logic valid_w;                                   // Valid for both UIs of this pair
 
-  localparam int unsigned NCYC  = NSLICE / 2;   // 4 mbclk cycles per word
-  localparam int unsigned CYC_W = 2;            // 0..3 cycle counter
-  localparam logic [CYC_W-1:0] LAST_CYC = CYC_W'(NCYC-1);
-  // Last mbclk cycle whose two UI lie inside the four-UI valid window
-  // (spec 4.1.2, PLAN.md 6.2): UI 0..3 of an eight-UI transfer are the two UI
-  // of cycle 0 and the two UI of cycle 1, so valid is high for cycles 0 and 1.
-  localparam logic [CYC_W-1:0] LAST_VALID_CYC = CYC_W'(NSLICE/4 - 1);
+  // Assert the serializer and both FIFO domains together.
+  // Hardware reset and epoch reset have the same data-path discard semantics.
+  // Permission alone does not flush queued transmit words.
+  // Both local release chains observe this one common assertion.
+  // No independent read-pointer or write-pointer flush exists.
+  assign common_reset_n = lreset_n && epoch_reset_n;
 
-  logic [NBYTES*8-1:0] word_q;
-  logic                valid_q;
-
-  // -------------------------------------------------------------------------
-  // always_ff: lclk Domain Word and Framing Registers
-  //
-  // Captures the 128-bit TX word and its valid qualifier from the RDI /
-  // logical-PHY datapath on each posedge lclk.  word_q holds the data
-  // and valid_q holds the framing flag.  Both are single-writer
-  // registers in the lclk domain.
-  //
-  // valid_q is set only when both tx_load and tx_valid are asserted in
-  // the same cycle; otherwise it clears, ensuring the framing bit on
-  // the mainband deasserts during idle lclk cycles. The mbclk framing
-  // generator below additionally limits the qualifier to the first four UI
-  // of the transfer (spec 4.1.2, PLAN.md 6.2).
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      word_q  <= {NBYTES*8{1'b0}};
-      valid_q <= 1'b0;
-    end else begin
-      valid_q <= tx_load && tx_valid;
-      if (tx_load) word_q <= tx_word;
-    end
+  // Release the link-side acceptance path after two local rising edges.
+  // The FIFO uses the same common assertion and release length.
+  // tx_ready remains low throughout the release interval.
+  // A reset-time producer request cannot enter the memory.
+  // Source permission does not affect this write-domain release.
+  always_ff @(posedge lclk or negedge common_reset_n) begin
+    if (!common_reset_n) lrelease_q <= 2'b00;
+    else lrelease_q <= {lrelease_q[0], 1'b1};
   end
 
-  logic [NBYTES*8-1:0] ser_q;
-  logic                ser_val_q;
-  logic [CYC_W-1:0]    cyc_q;
-
-  // -------------------------------------------------------------------------
-  // always_ff: mbclk Domain Snapshot and Cycle Counter
-  //
-  // Runs on posedge mbclk (2 GHz forwarded clock, spec Section 5.2).
-  // Maintains three registers:
-  //   ser_q     — 128-bit word snapshot used by the phase-gather mux.
-  //   ser_val_q — framing-valid snapshot; mb_tx_valid gates it with the
-  //               four-UI valid window of the mbclk cycle counter.
-  //   cyc_q     — 2-bit cycle counter (0..3), one count per mbclk cycle.
-  //
-  // Single-edge-flop snapshot discipline: ser_q and ser_val_q are
-  // PRELOADED on the last cycle (cyc_q == LAST_CYC) from the lclk-
-  // domain registers word_q and valid_q.  This ensures the snapshot is
-  // stable for all four mbclk cycles of the next word — no tearing is
-  // possible because the lclk register is written only once per four
-  // mbclk cycles and the snapshot is taken at a deterministic phase.
-  //
-  // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock);
-  //           Section 4.1.1 - Byte to Lane Mapping.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge mbclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      ser_q     <= {NBYTES*8{1'b0}};
-      ser_val_q <= 1'b0;
-      cyc_q     <= {CYC_W{1'b0}};
-    end else begin
-      if (cyc_q == LAST_CYC) begin
-        ser_q     <= word_q;      // preload next word data ...
-        ser_val_q <= valid_q;     // ... and its framing together
-      end
-      cyc_q <= (cyc_q == LAST_CYC) ? {CYC_W{1'b0}} : cyc_q + 1'b1;
-    end
+  // Release source-domain serialization after two source rising edges.
+  // The internal source continues even when the physical clock is parked.
+  // Asynchronous assertion discards the saved in-flight word.
+  // The read-side FIFO uses the same source release length.
+  // This release does not require a second queued word.
+  always_ff @(posedge mbclk or negedge common_reset_n) begin
+    if (!common_reset_n) mbrelease_q <= 2'b00;
+    else mbrelease_q <= {mbrelease_q[0], 1'b1};
   end
 
-  logic [NLANES-1:0] hi_w;
-  logic [NLANES-1:0] lo_w;
+  // Select the link-domain synchronized release.
+  // Common assertion clears this qualifier asynchronously.
+  // The producer sees readiness only after local release.
+  // The source clock cannot bypass write-domain reset.
+  // The FIFO and acceptance path share the same epoch.
+  assign tx_lreset_n = lrelease_q[1];
 
-  // -------------------------------------------------------------------------
-  // always @*: Per-Lane Phase-Gather Combinational Mux
-  //
-  // Implements the spec 4.1.1 equation:  mb_tx_data[lane] = word[8*lane + u]
-  //
-  // At each mbclk cycle c (c = cyc_q = 0..3), two UIs are transmitted
-  // per lane:
-  //   hi_w[L] = ser_q[8*L + 2*c]     (rising / high phase, even UI)
-  //   lo_w[L] = ser_q[8*L + 2*c + 1] (falling / low phase, odd UI)
-  //
-  // The case statement selects constant bit indices per cycle so the
-  // gather is a pure wiring mux with no barrel shifter, keeping the
-  // combinational depth minimal.  Each lane independently picks one
-  // bit from its own byte — this is the GATHER operation (not a
-  // contiguous-slice shift).
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
-  // -------------------------------------------------------------------------
+  // Select the source-domain synchronized release.
+  // Common assertion clears this qualifier asynchronously.
+  // Serializer state and its DDR cells share this release.
+  // The source clock remains free-running throughout PARK.
+  // Read permission adds its own two-register synchronization below.
+  assign tx_mbreset_n = mbrelease_q[1];
+
+  // Synchronize stable data-consumption permission into the local source.
+  // Physical RUN acknowledgment must precede this permission at the caller.
+  // A deasserted permission prevents further FIFO head consumption.
+  // The serializer also discards an unfinished frame on deassertion.
+  // Epoch assertion clears both synchronizer ranks immediately.
+  always_ff @(posedge mbclk or negedge tx_mbreset_n) begin
+    if (!tx_mbreset_n) enable_sync_q <= 2'b00;
+    else enable_sync_q <= {enable_sync_q[0], tx_enable};
+  end
+
+  // Report exact FIFO acceptance readiness in the link domain.
+  // Full backpressure is normal and must hold the producer word.
+  // Reset release is part of acceptance, not just the full flag.
+  // A disabled serializer can buffer words until its FIFO fills.
+  // No almost-full or two-word priming threshold affects this output.
+  assign tx_ready = tx_lreset_n && !fifo_wfull;
+
+  // Qualify a complete transmit FIFO write with the public handshake.
+  // The producer must hold its payload through this accepted link edge.
+  // Invalid loads do not consume an entry.
+  // Full requests remain unaccepted without corrupting stored words.
+  // Integration advances its scrambler only for its accepted upstream transfer.
+  assign fifo_winc = tx_load && tx_valid && tx_ready;
+
+  // Cross complete words from the link clock to the ungated local source.
+  // Both reset ports receive the identical common epoch assertion.
+  // The FIFO presents its current head before the consume edge.
+  // The serializer snapshots that head and launches its first pair together.
+  // Registered Gray full and empty flags preserve bounded isolated-word access.
+  mb_async_fifo #(.DATA_W(NBYTES*8), .DEPTH(8)) u_tx_fifo (
+    .wclk(lclk),
+    .wrst_n(common_reset_n),
+    .winc(fifo_winc),
+    .wdata(tx_word),
+    .wfull(fifo_wfull),
+    .walmost_full(),
+    .woverflow(),
+    .woverflow_pulse(),
+    .rclk(mbclk),
+    .rrst_n(common_reset_n),
+    .rinc(fifo_rinc),
+    .rdata(fifo_rdata),
+    .rempty(),
+    .rvalid(fifo_rvalid),
+    .runderflow()
+  );
+
+  // Consume one head only when the next pair starts a new word.
+  // A saved word uses its remaining three pairs without another FIFO read.
+  // Deasserted permission never advances the read pointer.
+  // An isolated readable word can start immediately without a fill threshold.
+  // The next word starts one edge after the prior final pair with no idle pair.
+  assign fifo_rinc = tx_mbreset_n && enable_sync_q[1] &&
+                     !ser_active_q && fifo_rvalid;
+
+  // Prepare the next pair before the rising-edge DDR cell capture.
+  // The first pair uses the readable FIFO head directly.
+  // Subsequent pairs use the serializer snapshot and its next-pair index.
+  // Data and Valid stay zero while permission is low or no word exists.
+  // The DDR cell saves the odd UI before this state advances.
   always @* begin
-    case (cyc_q)
-      2'd0: begin
-        for (int l = 0; l < NLANES; l = l + 1) begin
-          hi_w[l] = ser_q[8*l+0];
-          lo_w[l] = ser_q[8*l+1];
-        end
+    send_word_w = ser_active_q ? ser_q : fifo_rdata;
+    send_cyc_w = ser_active_q ? cyc_q : '0;
+    hi_w = '0;
+    lo_w = '0;
+    valid_w = 1'b0;
+    if (tx_mbreset_n && enable_sync_q[1] && (ser_active_q || fifo_rvalid)) begin
+      for (int lane = 0; lane < NLANES; lane = lane+1) begin
+        hi_w[lane] = send_word_w[8*lane + 2*int'(send_cyc_w)];
+        lo_w[lane] = send_word_w[8*lane + 2*int'(send_cyc_w) + 1];
       end
-      2'd1: begin
-        for (int l = 0; l < NLANES; l = l + 1) begin
-          hi_w[l] = ser_q[8*l+2];
-          lo_w[l] = ser_q[8*l+3];
-        end
-      end
-      2'd2: begin
-        for (int l = 0; l < NLANES; l = l + 1) begin
-          hi_w[l] = ser_q[8*l+4];
-          lo_w[l] = ser_q[8*l+5];
-        end
-      end
-      default: begin
-        for (int l = 0; l < NLANES; l = l + 1) begin
-          hi_w[l] = ser_q[8*l+6];
-          lo_w[l] = ser_q[8*l+7];
-        end
-      end
-    endcase
+      valid_w = (send_cyc_w < CYC_W'(NCYC/2));
+    end
   end
 
-  logic [NLANES-1:0] tx_mux;
+  // Save a newly consumed word and advance exactly four pair launches.
+  // The DDR cells sample the pre-edge pair, including the direct first head pair.
+  // After the final pair, the next edge can consume the following head.
+  // A permission stop discards only the unfinished snapshot.
+  // Common epoch reset also discards every queued FIFO word.
+  always_ff @(posedge mbclk or negedge tx_mbreset_n) begin
+    if (!tx_mbreset_n) begin
+      ser_q <= '0;
+      ser_active_q <= 1'b0;
+      cyc_q <= '0;
+    end else if (!enable_sync_q[1]) begin
+      ser_q <= '0;
+      ser_active_q <= 1'b0;
+      cyc_q <= '0;
+    end else if (ser_active_q) begin
+      if (cyc_q == CYC_W'(NCYC-1)) begin
+        ser_active_q <= 1'b0;
+        cyc_q <= '0;
+      end else cyc_q <= cyc_q + CYC_W'(1);
+    end else if (fifo_rvalid) begin
+      ser_q <= fifo_rdata;
+      ser_active_q <= 1'b1;
+      cyc_q <= CYC_W'(1);
+    end
+  end
 
-  // -------------------------------------------------------------------------
-  // always: DDR Pin Mux — Level-Sensitive Output Selection
-  //
-  // Selects hi_w (rising-phase data) when mbclk is high and lo_w
-  // (falling-phase data) when mbclk is low.  Uses a non-blocking
-  // assignment (NBA) so the output transitions cleanly in the inactive
-  // region of the simulation event queue, avoiding glitches in Icarus
-  // Verilog's 2 GHz scheduler.  This is NOT a registered flop — it is
-  // an event-driven latch-like construct that models the DDR output
-  // buffer behaviour on the forwarded clock.
-  //
-  // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock DDR).
-  // -------------------------------------------------------------------------
-  // Uses NBA so output transitions cleanly in the inactive region of the edge.
-  always @(mbclk or hi_w or lo_w) tx_mux <= mbclk ? hi_w : lo_w;
+  for (genvar lane = 0; lane < NLANES; lane = lane+1) begin : g_tx_ddr
+    // Launch this lane through the dedicated DDR physical cell model.
+    // Even and odd samples come from the same prepared serializer pair.
+    // The cell holds the odd sample across serializer state changes.
+    // Its internal driver stays enabled because external pad OEs are separate.
+    // The unused receive ports do not substitute for a physical receive clock.
+    mb_ddr_io u_data_io (
+      .clk(mbclk), .rst_n(tx_mbreset_n),
+      .tx_data_hi(hi_w[lane]), .tx_data_lo(lo_w[lane]), .tx_oe(1'b1),
+      .rx_data_hi(), .rx_data_lo(), .rx_pair_valid(),
+      .pad_tx(mb_tx_data[lane]), .pad_rx(1'b0)
+    );
+  end
 
-  // -------------------------------------------------------------------------
-  // assign: Main-Band TX Data Output
-  //
-  // Drives the 16-lane main-band transmit data bus from the DDR pin
-  // mux (tx_mux).  This is a direct wire alias with no additional
-  // logic — the per-lane bit selection is handled entirely by the
-  // phase-gather combinational mux and the DDR pin mux above.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping.
-  // -------------------------------------------------------------------------
-  assign mb_tx_data  = tx_mux;
-
-  // -------------------------------------------------------------------------
-  // assign: Main-Band TX Valid / Framing Output
-  //
-  // Drives the framing qualifier of the main-band transmit bus from the mbclk
-  // cycle counter and the valid snapshot for the word in ser_q:
-  //
-  //   cyc_q       : 0    1    2    3
-  //   UI          : 0,1  2,3  4,5  6,7
-  //   mb_tx_valid : 1    1    0    0      (ser_val_q = 1)
-  //   mb_tx_valid : 0    0    0    0      (ser_val_q = 0, idle)
-  //
-  // Valid framing asserts the qualifier for the FIRST FOUR UI of each eight-UI
-  // transfer (spec 4.1.2, PLAN.md 6.2), and one mbclk cycle carries two UI, so
-  // the AND with `cyc_q <= LAST_VALID_CYC` produces the legal pattern for a
-  // real beat and a constant low while idle. The level changes only at the
-  // half-transfer boundary or at a word boundary, never inside a phase, so the
-  // receiver sees one unchanged level per mbclk cycle.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
-  //           PLAN.md Section 6.2 - Valid framing.
-  // -------------------------------------------------------------------------
-  assign mb_tx_valid = ser_val_q && (cyc_q <= LAST_VALID_CYC);
+  // Launch Valid with the same edge semantics as each data lane.
+  // A real word has two high pairs followed by two low pairs.
+  // Both UIs in a pair use the same framing level.
+  // There is no combinational serializer-counter path to the physical pin.
+  // The controller clock gate remains independent of this signal.
+  mb_ddr_io u_valid_io (
+    .clk(mbclk), .rst_n(tx_mbreset_n),
+    .tx_data_hi(valid_w), .tx_data_lo(valid_w), .tx_oe(1'b1),
+    .rx_data_hi(), .rx_data_lo(), .rx_pair_valid(),
+    .pad_tx(mb_tx_valid), .pad_rx(1'b0)
+  );
 endmodule
 
-// ===========================================================================
-// rx_gearbox: per-lane DDR slices on mbclk -> parallel 128-bit lclk word,
-//             with the private sticky framing-pattern fault monitor.
-// ===========================================================================
-`timescale 1ns/1ps
 module rx_gearbox #(
-  parameter int unsigned NBYTES = ucie_pkg::NBYTES,
-  parameter int unsigned NLANES = ucie_pkg::NLANES_MAX,
-  parameter int unsigned NSLICE = 8
+  parameter int unsigned NBYTES = ucie_pkg::NBYTES,     // Parallel word bytes
+  parameter int unsigned NLANES = ucie_pkg::NLANES_MAX, // Physical data lanes
+  parameter int unsigned NSLICE = 8                    // UIs per lane byte
 ) (
-  input  logic                 lclk,        // Link clock (500 MHz)
-  input  logic                 lreset_n,    // Active-low asynchronous reset
-  input  logic                 mbclk,       // 2 GHz forwarded clock (fCK)
-  input  logic [NLANES-1:0]    mb_rx_data,  // DDR input, 1 bit/lane/edge
-  input  logic                 mb_rx_valid, // framing qualifier: 1,1,0,0 per
-                                            // eight-UI transfer window
-  output logic [NBYTES*8-1:0]  rx_word,     // assembled word, lclk domain
-  output logic                 rx_word_vld, // 1-cycle strobe: rx_word valid
-  output logic                 framing_fault // private sticky boundary fault
+  input  logic                 lclk,          // Local 500 MHz link clock
+  input  logic                 lreset_n,      // Common hardware reset
+  input  logic                 epoch_reset_n, // Common capture and FIFO epoch
+  input  logic                 mbclk,         // Physical peer forwarded clock
+  input  logic                 rx_enable,     // Capture permission with common discard
+  input  logic                 rx_drain_enable, // Local complete-word dequeue permission
+  input  logic [NLANES-1:0]     mb_rx_data,    // Physical peer DDR lane samples
+  input  logic                 mb_rx_valid,   // Physical peer DDR Valid samples
+  output logic [NBYTES*8-1:0]   rx_word,       // Complete local-domain word
+  output logic                 rx_word_vld,   // One accepted FIFO head per lclk cycle
+  output logic                 framing_fault, // Hardware-reset-only framing history
+  output logic                 overflow       // Hardware-reset-only receive overflow
 );
+  localparam int unsigned UI_W = $clog2(NSLICE);
+  logic common_reset_n;                            // Both-domain capture discard
+  (* async_reg = "true" *) logic [1:0] lrelease_q; // Local output reset release
+  (* async_reg = "true" *) logic [1:0] mbrelease_q; // Physical capture permission release
+  logic rx_lreset_n;                               // Released local reset
+  logic rx_mbreset_n;                              // Released physical capture reset
+  wire [NLANES-1:0] pair_hi;                       // Captured even lane UIs
+  wire [NLANES-1:0] pair_lo;                       // Captured odd lane UIs
+  wire pair_valid_hi;                             // Captured even Valid UI
+  wire pair_valid_lo;                             // Captured odd Valid UI
+  wire pair_ready;                                // Complete physical pair exists
+  logic armed_q;                                  // A real idle UI has been observed
+  logic armed_next;                               // Next receive alignment arm
+  logic frame_active_q;                           // A new frame has begun
+  logic frame_active_next;                        // Next receive frame state
+  logic frame_ok_q;                               // Frame pattern remains legal
+  logic frame_ok_next;                            // Next pattern legality
+  logic [UI_W-1:0] ui_q;                          // Next UI index within the frame
+  logic [UI_W-1:0] ui_next;                        // Next parser UI index
+  logic [NBYTES*8-1:0] asm_q;                      // Partial receive word
+  logic [NBYTES*8-1:0] asm_next;                   // Partial word after both captured UIs
+  logic [NBYTES*8-1:0] complete_word_w;            // Final word including the last UI
+  logic [NLANES-1:0] ui_data_w;                    // Current captured UI in the parser
+  logic ui_valid_w;                               // Current captured Valid in the parser
+  logic frame_fault_w;                            // Current pair has a framing violation
+  logic fifo_winc;                                // This pair completes one legal word
+  logic fifo_wfull;                               // Physical-domain FIFO full flag
+  logic fifo_rinc;                                // Local readable-head consume
+  logic [NBYTES*8-1:0] fifo_rdata;                 // Local readable word head
+  logic fifo_rvalid;                              // Local FIFO head qualifier
 
-  localparam int unsigned NCYC  = NSLICE / 2;
-  localparam int unsigned CYC_W = 2;
-  localparam logic [CYC_W-1:0] LAST_CYC = CYC_W'(NCYC-1);
-  // Last mbclk cycle whose two UI lie inside the four-UI valid window
-  // (spec 4.1.2, PLAN.md 6.2): the legal framing pattern of a transfer window
-  // is high in cycles 0 and 1 and low in cycles 2 and 3.
-  localparam logic [CYC_W-1:0] LAST_VALID_CYC = CYC_W'(NSLICE/4 - 1);
+  // Discard the entire receive epoch when capture permission drops.
+  // The same assertion reaches both FIFO pointers and the partial frame.
+  // A stopped physical clock cannot retain stale queued words through disable.
+  // Each domain synchronizes release when capture permission returns.
+  // Sticky framing and overflow history use hardware reset separately.
+  assign common_reset_n = lreset_n && epoch_reset_n && rx_enable;
 
-  logic [NLANES-1:0] even_cap_q;
-
-  // -------------------------------------------------------------------------
-  // always_ff (negedge mbclk): High-Phase Lane Capture Register
-  //
-  // Samples the mainband receive data on the falling edge of mbclk.
-  // During the high phase of each mbclk cycle the DDR pins carry the
-  // even UI (bit 2c of every lane byte).  The negedge captures this
-  // value into even_cap_q so it is available to the posedge assembler
-  // below alongside the odd UI.
-  //
-  // This is a single-edge flop (negedge mbclk) — not a dual-edge
-  // construct — consistent with the synthesis discipline described in
-  // the file header.
-  //
-  // Spec ref: UCIe 1.0, Section 5.2 - Overview (forwarded clock DDR);
-  //           Section 4.1.1 - Byte to Lane Mapping.
-  // -------------------------------------------------------------------------
-  always_ff @(negedge mbclk or negedge lreset_n) begin
-    if (!lreset_n) even_cap_q <= {NLANES{1'b0}};
-    else           even_cap_q <= mb_rx_data;
+  // Release the local receive output path after two lclk rising edges.
+  // Assertion clears output validity immediately.
+  // The FIFO read side uses the same common reset and release length.
+  // The physical receive clock does not delay local reset assertion.
+  // Words remain invalid until a complete new physical frame reaches the FIFO.
+  always_ff @(posedge lclk or negedge common_reset_n) begin
+    if (!common_reset_n) lrelease_q <= 2'b00;
+    else lrelease_q <= {lrelease_q[0], 1'b1};
   end
 
-  // -------------------------------------------------------------------------
-  // always_ff (posedge mbclk): Word Assembler and Cycle Counter
-  //
-  // On each posedge mbclk, scatters one UI pair (even from even_cap_q,
-  // odd from mb_rx_data) into the correct bit positions of the 128-bit
-  // assembly register asm_q.  The scatter follows the spec 4.1.1
-  // byte-to-lane mapping:
-  //   asm_q[8*L + 2*c]   <= even_cap_q[L]   (even UI)
-  //   asm_q[8*L + 2*c+1] <= mb_rx_data[L]   (odd UI)
-  //
-  // On the last cycle (cyc_q == LAST_CYC = 3), the fully assembled
-  // word is copied into word_hold_q.  The word-valid strobe asm_val_q is
-  // produced by the framing monitor below, which decides whether the window
-  // carried the legal framing pattern.  word_hold_q is a complete,
-  // non-tearing snapshot: it
-  // explicitly builds each byte from the current pair (bits 7:6) plus
-  // the six bits already accumulated in asm_q, so the lclk domain
-  // never reads a partially assembled buffer.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.1 - Byte to Lane Mapping;
-  //           Section 4.1.2 - Valid Framing.
-  // -------------------------------------------------------------------------
-  logic [NBYTES*8-1:0] asm_q;
-  logic [NBYTES*8-1:0] word_hold_q;
-  logic [CYC_W-1:0]    cyc_q;
-  logic                asm_val_q;   // written by the framing monitor below
+  // Synchronize capture permission release into the physical clock domain.
+  // Permission disable asserts this chain and both FIFO domains asynchronously.
+  // Two physical rising edges precede any new capture state.
+  // A stopped physical clock can delay release without affecting sideband logic.
+  // The parser must then observe captured low Valid before a new wanted frame.
+  always_ff @(posedge mbclk or negedge common_reset_n) begin
+    if (!common_reset_n) mbrelease_q <= 2'b00;
+    else mbrelease_q <= {mbrelease_q[0], 1'b1};
+  end
 
-  // -------------------------------------------------------------------------
-  // always_ff: Word Assembly Pipeline Register
-  //
-  // One single-edge process owns asm_q, word_hold_q and cyc_q, so no two
-  // blocks write slices of the same vector. asm_val_q keeps a single writer
-  // as well: the framing monitor below. It is declared here because the lclk
-  // output register samples it together with word_hold_q.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.1.1 - Byte to Lane Mapping.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge mbclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      asm_q       <= {NBYTES*8{1'b0}};
-      word_hold_q <= {NBYTES*8{1'b0}};
-      cyc_q       <= {CYC_W{1'b0}};   // phase 0: matches the TX phase
-    end else begin
-      for (int l = 0; l < NLANES; l = l + 1) begin
-        case (cyc_q)
-          2'd0: begin asm_q[8*l+0] <= even_cap_q[l];
-                      asm_q[8*l+1] <= mb_rx_data[l]; end
-          2'd1: begin asm_q[8*l+2] <= even_cap_q[l];
-                      asm_q[8*l+3] <= mb_rx_data[l]; end
-          2'd2: begin asm_q[8*l+4] <= even_cap_q[l];
-                      asm_q[8*l+5] <= mb_rx_data[l]; end
-          default: begin asm_q[8*l+6] <= even_cap_q[l];
-                         asm_q[8*l+7] <= mb_rx_data[l]; end
-        endcase
-        if (cyc_q == LAST_CYC) begin
-          // Build the held byte explicitly from the current pair plus the
-          // prior six bits: bit 7 = mb_rx_data[l], bit 6 = even_cap_q[l]
-          word_hold_q[8*l +: 8] <= {mb_rx_data[l], even_cap_q[l],
-                                    asm_q[8*l +: 6]};
+  // Select local synchronized reset release for the output register.
+  // Common assertion invalidates the output without a local edge.
+  // A read transfer requires both this release and the FIFO head qualifier.
+  // Epoch discard never resets only the local pointer.
+  // Sticky hardware fault history is independent of this signal.
+  assign rx_lreset_n = lrelease_q[1];
+
+  // Select physical synchronized reset release for capture and parsing.
+  // The peer forwarded clock is the only clock for this release.
+  // The local source clock cannot invent a received UI.
+  // An unfinished capture pair disappears on common assertion.
+  // A new legal frame requires a physical low-to-high Valid boundary.
+  assign rx_mbreset_n = mbrelease_q[1];
+
+  for (genvar lane = 0; lane < NLANES; lane = lane+1) begin : g_rx_ddr
+    // Capture this lane from the dedicated peer physical input pin.
+    // The physical forwarded clock samples both ending UI edges.
+    // The paired outputs retain even-before-odd order.
+    // The transmit side of this input-cell instance stays disabled.
+    // No reset counter supplies synthetic data or clock alignment.
+    mb_ddr_io u_data_io (
+      .clk(mbclk), .rst_n(rx_mbreset_n),
+      .tx_data_hi(1'b0), .tx_data_lo(1'b0), .tx_oe(1'b0),
+      .rx_data_hi(pair_hi[lane]), .rx_data_lo(pair_lo[lane]), .rx_pair_valid(),
+      .pad_tx(), .pad_rx(mb_rx_data[lane])
+    );
+  end
+
+  // Capture Valid through the same physical DDR boundary as the data lanes.
+  // Separate even and odd levels detect half-cycle framing changes.
+  // Pair validity excludes the first incomplete pair after reset release.
+  // A stopped receive clock leaves only a source-domain held pair.
+  // The word FIFO, not a held pair level, drives local output transfers.
+  mb_ddr_io u_valid_io (
+    .clk(mbclk), .rst_n(rx_mbreset_n),
+    .tx_data_hi(1'b0), .tx_data_lo(1'b0), .tx_oe(1'b0),
+    .rx_data_hi(pair_valid_hi), .rx_data_lo(pair_valid_lo), .rx_pair_valid(pair_ready),
+    .pad_tx(), .pad_rx(mb_rx_valid)
+  );
+
+  // Parse the two captured physical UIs in their received order.
+  // A real idle UI arms alignment before the next high Valid UI.
+  // Every active frame checks four high and four low UIs, including odd edges.
+  // A final UI can complete one frame before the other UI starts the next.
+  // The final assembled value writes the FIFO once on this physical rising edge.
+  always_comb begin
+    armed_next = armed_q;
+    frame_active_next = frame_active_q;
+    frame_ok_next = frame_ok_q;
+    ui_next = ui_q;
+    asm_next = asm_q;
+    complete_word_w = '0;
+    fifo_winc = 1'b0;
+    frame_fault_w = 1'b0;
+    ui_data_w = '0;
+    ui_valid_w = 1'b0;
+    if (rx_mbreset_n && pair_ready) begin
+      for (int pair_ui = 0; pair_ui < 2; pair_ui = pair_ui+1) begin
+        ui_data_w = (pair_ui == 0) ? pair_hi : pair_lo;
+        ui_valid_w = (pair_ui == 0) ? pair_valid_hi : pair_valid_lo;
+        if (!frame_active_next) begin
+          if (!armed_next) begin
+            if (ui_valid_w == 1'b0) armed_next = 1'b1;
+          end else if (ui_valid_w == 1'b1) begin
+            asm_next = '0;
+            for (int lane = 0; lane < NLANES; lane = lane+1) begin
+              asm_next[8*lane] = ui_data_w[lane];
+            end
+            frame_active_next = 1'b1;
+            frame_ok_next = 1'b1;
+            ui_next = UI_W'(1);
+          end
+        end else begin
+          if (ui_valid_w !== (ui_next < UI_W'(NSLICE/2))) begin
+            frame_ok_next = 1'b0;
+            frame_fault_w = 1'b1;
+          end
+          for (int lane = 0; lane < NLANES; lane = lane+1) begin
+            asm_next[8*lane + int'(ui_next)] = ui_data_w[lane];
+          end
+          if (ui_next == UI_W'(NSLICE-1)) begin
+            if (frame_ok_next) begin
+              complete_word_w = asm_next;
+              fifo_winc = 1'b1;
+            end
+            frame_active_next = 1'b0;
+            armed_next = (ui_valid_w === 1'b0);
+            ui_next = '0;
+          end else ui_next = ui_next + UI_W'(1);
         end
       end
-      cyc_q <= (cyc_q == LAST_CYC) ? {CYC_W{1'b0}} : cyc_q + 1'b1;
     end
   end
 
-  // -------------------------------------------------------------------------
-  // always_ff (posedge mbclk): Word-Boundary Framing Monitor and Word Strobe
-  //
-  // Valid framing (spec 4.1.2, PLAN.md 6.2) asserts the qualifier for the
-  // first four UI of an eight-UI transfer. One mbclk cycle carries two UI
-  // (high phase = UI 2c, low phase = UI 2c+1), so the legal per-cycle pattern
-  // of a transfer window is
-  //
-  //   cyc_q       : 0    1    2    3
-  //   UI          : 0,1  2,3  4,5  6,7
-  //   mb_rx_valid : 1    1    0    0     (word in flight)
-  //   mb_rx_valid : 0    0    0    0     (idle)
-  //
-  // A posedge reads the level that was stable during the cycle that ends at
-  // that edge, so the capture at the cycle 0 edge is the window reference.
-  // frame_ref_q holds that reference; on the cycle 1, 2 and 3 edges the level
-  // must be frame_ref_q, 0 and 0, which frame_exp_w states as one equation.
-  // Any mismatch is a framing violation:
-  //
-  //   - an early transition: the qualifier falls inside the valid window, or
-  //     rises in the middle of an idle window, so the receive boundary is not
-  //     the transfer boundary;
-  //   - a late transition: the qualifier is still high after the fourth UI;
-  //   - a malformed pattern: the level changes and returns inside one window,
-  //     which is caught because every cycle is compared, not just the last.
-  //
-  // frame_ok_q carries the verdict of the window so far, so a rejected window
-  // cannot produce a word strobe. framing_fault is sticky: the first violation
-  // sets it and it holds until lreset_n, because after a bad boundary the
-  // assembled words can no longer be trusted. The comparison uses the raw pin
-  // level rather than a snapshot, so it does not miss a level that changes and
-  // returns inside the window.
-  //
-  // This process keeps a single writer for every register it drives:
-  // frame_ref_q, frame_ok_q, asm_val_q and framing_fault. asm_val_q is the
-  // word-valid strobe - a window carries a word only when its reference was
-  // high, cycles 1 and 2 matched, and cycle 3 is the fourth low UI - so an
-  // idle or rejected window never strobes. framing_fault is private to the
-  // logical PHY, which synchronises it into lclk and forwards it to the LTSM
-  // fatal policy.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
-  //           Active-gated mainband framing monitoring.
-  // -------------------------------------------------------------------------
-  logic frame_ref_q;    // cycle-0 qualifier level of the window in progress
-  logic frame_ok_q;     // window matches the legal pattern so far
-  logic frame_exp_w;
+  // Save parser state once per complete physical clock cycle.
+  // Both captured UIs already contributed to the combinational next state.
+  // Common reset discards partial words and observed-idle alignment.
+  // No fixed reset phase counter determines a frame start.
+  // The separate FIFO write uses the same pre-edge completed-word calculation.
+  always_ff @(posedge mbclk or negedge rx_mbreset_n) begin
+    if (!rx_mbreset_n) begin
+      armed_q <= 1'b0;
+      frame_active_q <= 1'b0;
+      frame_ok_q <= 1'b0;
+      ui_q <= '0;
+      asm_q <= '0;
+    end else begin
+      armed_q <= armed_next;
+      frame_active_q <= frame_active_next;
+      frame_ok_q <= frame_ok_next;
+      ui_q <= ui_next;
+      asm_q <= asm_next;
+    end
+  end
 
-  // -------------------------------------------------------------------------
-  // assign: frame_exp_w - expected framing qualifier level
-  //
-  // Level that the cycle ending at this mbclk edge must carry. frame_ref_q is
-  // the cycle-0 level, so a window with a word requires 1, 1, 0, 0 and an
-  // idle window requires 0, 0, 0, 0.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing.
-  // -------------------------------------------------------------------------
-  assign frame_exp_w = frame_ref_q && (cyc_q <= LAST_VALID_CYC);
-
-  // -------------------------------------------------------------------------
-  // always_ff: Valid Framing Boundary Monitor & Fault Detector
-  //
-  // Monitors the four mbclk cycles of each 8-UI word window against the
-  // mandatory 1100 framing pattern. Any boundary mismatch flags framing_fault
-  // sticky high and rejects word validity (asm_val_q = 0) per Section 4.1.2.
-  //
-  // Spec ref: UCIe 1.0 Specification, Section 4.1.2 - Valid Framing;
-  //           Section 4.5.3.8 - TRAINERROR escalation.
-  // -------------------------------------------------------------------------
+  // Keep hardware-reset-only receive fault history.
+  // Epoch reset and capture disable suppress events but never clear old faults.
+  // Framing faults arise from a captured UI, not a local phase estimate.
+  // Overflow records the exact legal-word write rejected by the full FIFO.
+  // Integration synchronizes these source-domain sticky levels into lclk.
   always_ff @(posedge mbclk or negedge lreset_n) begin
     if (!lreset_n) begin
-      frame_ref_q   <= 1'b0;
-      frame_ok_q    <= 1'b0;
-      asm_val_q     <= 1'b0;
       framing_fault <= 1'b0;
-    end else if (cyc_q == {CYC_W{1'b0}}) begin
-      frame_ref_q <= mb_rx_valid;         // cycle 0 sets the window reference
-      frame_ok_q  <= 1'b1;                // legal pattern so far
-    end else begin
-      if (mb_rx_valid != frame_exp_w) begin
-        frame_ok_q    <= 1'b0;            // reject the word of this window
-        framing_fault <= 1'b1;            // sticky until lreset_n
-      end
-      if (cyc_q == LAST_CYC) begin
-        // Window complete: cycle 0 was high, cycles 1 and 2 matched, and
-        // cycle 3 must be low for the word to be valid.
-        asm_val_q <= frame_ref_q && frame_ok_q && !mb_rx_valid;
-      end
+      overflow <= 1'b0;
+    end else if (rx_mbreset_n) begin
+      if (frame_fault_w) framing_fault <= 1'b1;
+      if (fifo_winc && fifo_wfull) overflow <= 1'b1;
     end
   end
 
-  // -------------------------------------------------------------------------
-  // always_ff (posedge lclk): RX Output Registers — lclk Domain Transfer
-  //
-  // Captures word_hold_q and asm_val_q from the mbclk domain into the
-  // lclk domain on each posedge lclk.  Because word_hold_q is a
-  // complete non-tearing snapshot (written only on the last mbclk cycle
-  // of each word), and lclk is phase-locked at fCK/4, this register
-  // always samples a fully assembled 128-bit word.
-  //
-  // rx_word_vld acts as a one-cycle strobe indicating that rx_word
-  // contains a valid received beat.  It follows asm_val_q, which the framing
-  // monitor sets at the end of a window that carried the legal 1100 pattern,
-  // so an idle window or a window rejected for bad framing produces no beat.
-  // Downstream RDI logic uses this as the rdi_pl_valid qualifier.
-  //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
-  //           Section 8.1.2 - Interface clocking requirements.
-  // -------------------------------------------------------------------------
-  always_ff @(posedge lclk or negedge lreset_n) begin
-    if (!lreset_n) begin
-      rx_word     <= {NBYTES*8{1'b0}};
+  // Cross only complete legal words from the peer physical clock into lclk.
+  // The write data includes the last captured UI of the word.
+  // A full FIFO rejects the write without changing memory or pointers.
+  // Both reset ports receive the identical common capture-epoch assertion.
+  // Read-head semantics support one local consume edge per delivered word.
+  mb_async_fifo #(.DATA_W(NBYTES*8), .DEPTH(8)) u_rx_fifo (
+    .wclk(mbclk),
+    .wrst_n(common_reset_n),
+    .winc(fifo_winc),
+    .wdata(complete_word_w),
+    .wfull(fifo_wfull),
+    .walmost_full(),
+    .woverflow(),
+    .woverflow_pulse(),
+    .rclk(lclk),
+    .rrst_n(common_reset_n),
+    .rinc(fifo_rinc),
+    .rdata(fifo_rdata),
+    .rempty(),
+    .rvalid(fifo_rvalid),
+    .runderflow()
+  );
+
+  // Consume each readable local FIFO head without a source-level valid echo.
+  // A read is accepted only after local reset release.
+  // The accepted edge advances the Gray read pointer once.
+  // A stopped physical clock leaves a finite queue that drains to empty.
+  // The same head cannot produce another output after its accepted read.
+  assign fifo_rinc = rx_lreset_n && rx_drain_enable && fifo_rvalid;
+
+  // Register one output transfer per accepted local FIFO head.
+  // Consecutive legal words can produce consecutive qualified lclk cycles.
+  // The empty flag ends output validity after the final buffered word.
+  // Common assertion clears output validity even with a stopped peer clock.
+  // No source-domain held word-valid level drives this output directly.
+  always_ff @(posedge lclk or negedge rx_lreset_n) begin
+    if (!rx_lreset_n) begin
+      rx_word <= '0;
       rx_word_vld <= 1'b0;
     end else begin
-      rx_word     <= word_hold_q;
-      rx_word_vld <= asm_val_q;
+      rx_word_vld <= fifo_rinc;
+      if (fifo_rinc) rx_word <= fifo_rdata;
     end
   end
-
 endmodule
-
-`endif

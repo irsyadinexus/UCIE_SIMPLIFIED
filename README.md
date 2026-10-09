@@ -21,7 +21,12 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - **Runtime Power Management (L1 / L2)**: Not supported.
 - **Electrical PHY**: Not supported (implements negotiated parameters and digital logic, no analog circuitry).
 - **Sideband Frequency**: 800 MHz SDR (spec accurate). Features asynchronous Clock Domain Crossing (CDC) mailboxes between the 500 MHz `lclk` domain and the 800 MHz `sbclk` physical codec domain.
-- **Mainband Frequency**: Physical interface operates as a true 4 GT/s DDR link with a 2 GHz forwarded clock (`fCK`), DDR mainband transfer, and `lclk` at 500 MHz (slowest IO data rate).
+- **Mainband Frequency**: The continuous-only x16 profile uses a 2 GHz forwarded clock, 4 GT/s DDR transfers, and a 500 MHz `lclk`.
+- **Mainband Clock Interface**: Each endpoint keeps one local input, `mbclk`. The source must run at 2 GHz before hardware reset release. It must remain stable throughout operation. The controller returns source-domain reset readiness internally. It does not measure PLL lock or source health.
+- **Directional Mainband Pins**: `mb_tx_clk` drives the peer `mb_rx_clk`. Scalar `mb_tx_clk_oe`, `mb_tx_data_oe`, and `mb_tx_valid_oe` describe pad drive permission. RESET, SBINIT, PARAM, and CAL disable the pads. Enabled electrical idle holds the clock, data, and Valid low.
+- **Mainband Clock Policy**: RXCLKCAL peer requests control local clock start and stop. Responses wait for physical run-state acknowledgment. LINKSPEED, LINKINIT, and Active use a continuous clock, including Active Valid-low gaps. Strobe mode is not supported.
+- **Mainband CDC**: Depth-eight Gray FIFOs cross complete words in both directions. TX full applies RDI backpressure. RX overflow enters the existing fatal policy. LINKINIT prepares a quiet receive epoch before the Active handshake. Ordinary stalls preserve accepted words.
+- **Mainband Digital Limits**: Independent source phases are supported at the exact nominal rates. The model does not compensate for indefinite frequency drift. `mb_ddr_io` models dedicated DDR cells. Hardware must map this boundary to characterized DDR and clock-gate cells. Scalar pins and OEs do not prove analog compliance.
 - **RDI / Adapter Clock (`lclk`)**: 500 MHz (exact bandwidth match: 16 bytes @ 500 MHz = 64 Gbps for x16 @ 4 GT/s).
 - **Standard Package Width**: x16 only (no runtime x8 degrade negotiated on the main line; the byte-to-lane mapper implements both x8 degrade halves and is verified by directed unit test).
 - **Data Width**: Parameterized `NBYTES`, default 16 bytes (128 bits), on both FDI and RDI.
@@ -33,6 +38,19 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
   - Direct transition to RESET: LinkError exits directly to RESET without passing through LinkReset (UCIe 1.0 Figures 111, 119, 126).
   - Response draining prior to reset.
 - **Timer Constants**: 4 ms RESET minimum, 8 ms residency/message timeouts, and 4 ms stall keep-alive are implemented at true spec physical values in `rtl/rtl_common/timer.sv` calibrated to `lclk` = 500 MHz; no RTL timer constant is divided for simulation speed.
+
+### Continuous-profile PHY registers
+
+The PHY keeps the existing simplified CSR map and adds explicit continuous-only fields at the standard offsets.
+
+| Offset | Register | 64-bit read value |
+|---|---|---|
+| `1000h` | PHY Capability and adjacent Control | `00000020_00009000h` |
+| `1004h` | PHY Control | `00000000_00000020h` |
+| `1008h` | PHY Status | `00000000_00000020h` |
+
+Writes cannot select strobe mode. They leave these fixed fields unchanged, consistent with the existing simplified write-ignore policy.
+The legacy Start and electrical-parameter registers remain writable.
 
 ## Topology & Module Hierarchy
 
@@ -47,7 +65,8 @@ rtl/d2d_adapter/        d2d_adapter.sv, fdi_state_machine.sv,
 rtl/logical_phy/        logical_phy.sv, rdi_state_machine.sv, ltsm.sv,
                         sb_codec.sv, sb_init_raw.sv, sb_cdc_mailbox.sv,
                         pattern_gen.sv, byte_lane_mapper.sv,
-                        mb_gearbox.sv, phy_csr.sv
+                        mb_gearbox.sv, mb_async_fifo.sv,
+                        mb_tx_clock_ctrl.sv, mb_ddr_io.sv, phy_csr.sv
 ```
 
 Structural block hierarchy:
@@ -67,9 +86,11 @@ UCIE Main (ucie_main.sv)
         |-- Raw SBINIT Detector & Driver (sb_init_raw.sv: 4.5.3.2 Standard Package SBINIT primitive)
         |-- Sideband CDC Mailboxes (sb_cdc_mailbox.sv: 500 MHz lclk <-> 800 MHz sbclk)
         |-- Training Pattern Generator (pattern_gen.sv: Per-Lane-ID, VALTRAIN, clock repair, LFSR)
-        |-- Main-Band DDR Gearbox (mb_gearbox.sv: 500 MHz lclk <-> 2 GHz fCK DDR)
+        |-- Mainband DDR Gearboxes and Word FIFOs (local TX source / peer RX clock)
+        |-- Mainband Clock Controller (coherent requests, scalar OEs, safe full pulses)
+        |-- DDR Cell Boundary (mb_ddr_io.sv: physical launch and paired capture)
         |-- Byte-to-Lane Mapper (byte_lane_mapper.sv: x16 and both x8 degrade halves)
-        |-- Independent TX/RX Scramblers (scrambler.sv arrays seeded at Active Entry)
+        |-- Independent TX/RX Scramblers (scrambler.sv: RX reseed during LINKINIT preparation; TX reseed at local Active entry)
         `-- PHY CSR (phy_csr.sv: electrical parameters, byte enables, no analog)
 ```
 
@@ -78,12 +99,14 @@ UCIE Main (ucie_main.sv)
 Verification environment under Icarus Verilog 12.0 (`make -C sim all`):
 
 ```
-tb/unit/          12 directed unit testbenches covering every FSM, datapath block, and protocol policy:
+tb/unit/          Directed unit testbenches for FSMs, datapath blocks, and protocol policy:
                   - ut_fdi_sm.sv        (FDI state machine transitions & LinkError direct RESET exit)
-                  - ut_gearbox.sv       (2 GHz DDR gearbox, framing injection, sampling)
+                  - ut_gearbox.sv       (DDR order, singleton recovery, full backpressure, stopped clock, RX overflow)
+                  - ut_mb_async_fifo.sv (asynchronous FIFO ordering, wrap, full/empty, coordinated reset)
+                  - ut_mb_clock.sv      (physical clock start/stop, precondition, OEs, DDR cell boundary)
                   - ut_lfsr.sv          (PRBS-23 training pattern generator)
                   - ut_ltsm.sv          (LTSM sequencer walk, timeouts, recovery)
-                  - ut_ltsm_policy.sv   (LTSM policy scenarios 1-10, incl. LinkError dwell gating)
+                  - ut_ltsm_policy.sv   (protocol policy, LinkError dwell, directional RXCLKCAL, source readiness)
                   - ut_mapper.sv        (x16 / x8 byte lane mapping and lane reversal)
                   - ut_pattern_gen.sv   (Training pattern generator mux and LFSR)
                   - ut_rdi_sm.sv        (RDI state machine transitions & direct RESET exit)
@@ -115,15 +138,15 @@ scripts/          Automated compliance and construct checking scripts.
 
 ## Code Quality & Comment Rule Compliance
 
-All 39 SystemVerilog files (19 RTL + 20 testbench) strictly adhere to repository comment and documentation standards:
+The SystemVerilog files obey the repository comment and documentation standards:
 - **Header Blocks**: 50 to 500 lines per file (actual range: 50–313 lines), complete with ASCII architecture/state machine diagrams, theory of operation, and formal revision history tables.
 - **Revision History**: Clean, monotonic revision logs with individual date-stamped entries describing changes.
 - **Construct Documentation**: Every `always_ff`, `always_comb`, `always`, `assign` statement, and child module instantiation is immediately preceded by a detailed, spec-cited comment block (minimum 5 lines).
 - **Automated Checkers**:
   ```bash
   python3 scripts/check_comment_rule.py   # Verifies headers (50-500 lines), rev history, and >=5-line construct comments
-  python3 scripts/check_rtl_constructs.py # Verifies construct coverage across all 19 RTL files
-  python3 scripts/check_tb_constructs.py  # Verifies construct coverage across all 20 testbench files
+  python3 scripts/check_rtl_constructs.py # Verifies RTL construct comments
+  python3 scripts/check_tb_constructs.py  # Verifies testbench construct comments
   ```
 
 ## Simulation Quick Start
@@ -136,7 +159,8 @@ make -C sim clean && make -C sim all
 
 # Run specific verification targets:
 make -C sim compile         # Elaborate RTL with -Wall (zero warnings required)
-make -C sim unit            # Run all 12 directed unit testbenches
+make -C sim unit            # Run all directed unit testbenches
+make -C sim mainband-phase  # Sweep nominal source/request phase across one mainband period
 make -C sim sideband-unit   # Run focused sideband codec and SBINIT tests
 make -C sim sideband-peer   # Run independent golden-vector peer test
 make -C sim loopback        # Run two-die loopback bring-up and streaming test

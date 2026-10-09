@@ -96,7 +96,7 @@
 //                        block as CSR and generic request transport while the
 //                        Logical PHY LTSM owns LinkMgmt.RDI Active policy.
 //   v0.0.7  2026-09-25  Document dormant timer hooks and reduced credit
-//                        accounting after the Phase D policy cutover.
+//                        accounting after transitioning to adapter CSR/request transport without peer-Active policy.
 //   v0.1.0  2026-09-28  Major architectural rewrite per UCIe 1.0 Sections 3.1.1,
 //                        6.1, 7.5, 8.2, and 8.3:
 //                        1. Add canonical typed private Adapter client interface
@@ -122,6 +122,10 @@
 //                        construct comment blocks (5-30 lines) with UCIe 1.0
 //                        spec citations across all always/assign/instantiation
 //                        blocks.
+//   v0.1.2  2026-10-09  Documentation and hygiene pass: remove obsolete
+//                        implementation-phase references outside revision history,
+//                        remove Author column, add per-port inline comments,
+//                        split multi-signal declarations, and correct stale comments.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -136,33 +140,33 @@ import ucie_pkg::*;
 module adapter_sb_if #(
   parameter int unsigned NC = 8
 ) (
-  input  logic                lclk,
-  input  logic                lreset_n,
+  input  logic                lclk,                  // 500 MHz main link clock
+  input  logic                lreset_n,              // Active-low asynchronous reset
 
   // --------------------------------------------------------------------------
   // FDI Configuration Sideband Interface (Protocol Layer <-> Adapter)
   // UCIe 1.0 Section 8.2.3, Table 115
   // --------------------------------------------------------------------------
-  input  logic [NC-1:0]       lp_cfg,
-  input  logic                lp_cfg_vld,
-  input  logic                lp_cfg_crd,
-  output logic [NC-1:0]       pl_cfg,
-  output logic                pl_cfg_vld,
-  output logic                pl_cfg_crd,
+  input  logic [NC-1:0]       lp_cfg,                // Inbound FDI configuration byte from Protocol Layer
+  input  logic                lp_cfg_vld,            // Inbound FDI configuration valid qualifier
+  input  logic                lp_cfg_crd,            // Inbound FDI configuration credit return from Protocol Layer
+  output logic [NC-1:0]       pl_cfg,                // Outbound FDI configuration byte to Protocol Layer
+  output logic                pl_cfg_vld,            // Outbound FDI configuration valid qualifier
+  output logic                pl_cfg_crd,            // Outbound FDI configuration credit return to Protocol Layer
 
   // --------------------------------------------------------------------------
   // Private Adapter Sideband Packet Client Interface (<-> logical_phy)
   // Matches logical_phy adapter_sb_* ports (UCIe 1.0 Section 6.1)
   // --------------------------------------------------------------------------
-  output logic                adapter_sb_tx_valid,
-  input  logic                adapter_sb_tx_ready,
-  output sb_packet_t          adapter_sb_tx_packet,
-  input  logic                adapter_sb_rx_valid,
-  output logic                adapter_sb_rx_ready,
-  input  sb_packet_t          adapter_sb_rx_packet,
-  input  logic                adapter_sb_rx_cp_error,
-  input  logic                adapter_sb_rx_dp_error,
-  input  logic                adapter_sb_rx_format_error,
+  output logic                adapter_sb_tx_valid,   // Outbound sideband packet transmit valid to PHY arbiter
+  input  logic                adapter_sb_tx_ready,   // Outbound sideband packet transmit ready from PHY arbiter
+  output sb_packet_t          adapter_sb_tx_packet,  // Outbound typed sideband packet to PHY arbiter
+  input  logic                adapter_sb_rx_valid,   // Inbound sideband packet valid from PHY router
+  output logic                adapter_sb_rx_ready,   // Inbound sideband packet acknowledge/pop to PHY router
+  input  sb_packet_t          adapter_sb_rx_packet,  // Inbound typed sideband packet from PHY router
+  input  logic                adapter_sb_rx_cp_error,// Control Parity error flag for inbound packet
+  input  logic                adapter_sb_rx_dp_error,// Data Parity error flag for inbound packet
+  input  logic                adapter_sb_rx_format_error,// Format error flag for inbound packet
 
   // --------------------------------------------------------------------------
   // RDI / FDI State & Status Inputs (UCIe 1.0 Table 114, Table 115)
@@ -173,53 +177,53 @@ module adapter_sb_if #(
   // --------------------------------------------------------------------------
   // Adapter State Request Outputs (UCIe 1.0 Section 8.3.2)
   // --------------------------------------------------------------------------
-  output logic                adapter_state_req_vld,
-  output logic [3:0]          adapter_state_req,
+  output logic                adapter_state_req_vld, // Adapter-initiated state request valid qualifier
+  output logic [3:0]          adapter_state_req,     // Adapter-initiated state request encoding
 
   // --------------------------------------------------------------------------
   // Adapter CSR Access Bus (to adapter_regfile, UCIe 1.0 Section 7.5)
   // --------------------------------------------------------------------------
-  output logic                csr_wr,
-  output logic                csr_rd,
-  output logic [26:0]         csr_addr,
-  output logic [63:0]         csr_wdata,
-  output logic [7:0]          csr_be,
-  input  logic [63:0]         csr_rdata,
-  input  logic                csr_rdata_vld,
+  output logic                csr_wr,                // Adapter CSR write strobe to adapter_regfile
+  output logic                csr_rd,                // Adapter CSR read strobe to adapter_regfile
+  output logic [26:0]         csr_addr,              // 27-bit Adapter CSR byte address
+  output logic [63:0]         csr_wdata,             // 64-bit Adapter CSR write data
+  output logic [7:0]          csr_be,                // 8-bit Adapter CSR write byte enables
+  input  logic [63:0]         csr_rdata,             // 64-bit Adapter CSR read data from adapter_regfile
+  input  logic                csr_rdata_vld,         // Adapter CSR read data valid indication
 
   // --------------------------------------------------------------------------
   // Target Select and Separate PHY CSR Access Channel (spec 7.5)
   // --------------------------------------------------------------------------
-  output logic                csr_target,            // 1'b0: Adapter CSR, 1'b1: PHY CSR
-  output logic                phy_csr_wr,
-  output logic                phy_csr_rd,
-  output logic [26:0]         phy_csr_addr,
-  output logic [63:0]         phy_csr_wdata,
-  output logic [7:0]          phy_csr_be,
-  input  logic [63:0]         phy_csr_rdata,
-  input  logic                phy_csr_rdata_vld,
+  output logic                csr_target,            // Target CSR decode (1'b0: Adapter CSR, 1'b1: PHY CSR)
+  output logic                phy_csr_wr,            // Dedicated PHY CSR write strobe to logical_phy
+  output logic                phy_csr_rd,            // Dedicated PHY CSR read strobe to logical_phy
+  output logic [26:0]         phy_csr_addr,          // 27-bit PHY CSR byte address
+  output logic [63:0]         phy_csr_wdata,         // 64-bit PHY CSR write data
+  output logic [7:0]          phy_csr_be,            // 8-bit PHY CSR write byte enables
+  input  logic [63:0]         phy_csr_rdata,         // 64-bit PHY CSR read data from logical_phy
+  input  logic                phy_csr_rdata_vld,     // Dedicated PHY CSR read data valid indication
 
   // --------------------------------------------------------------------------
   // Remote Register Access Mailbox Channel (to/from adapter_regfile mailbox)
   // --------------------------------------------------------------------------
-  input  logic                rem_req_vld,
-  output logic                rem_req_rdy,
-  input  sb_packet_t          rem_req_pkt,
-  output logic                rem_cpl_vld,
-  output sb_packet_t          rem_cpl_pkt,
+  input  logic                rem_req_vld,           // Remote mailbox request valid from adapter_regfile
+  output logic                rem_req_rdy,           // Remote mailbox request ready to adapter_regfile
+  input  sb_packet_t          rem_req_pkt,           // Remote mailbox request packet from adapter_regfile
+  output logic                rem_cpl_vld,           // Remote mailbox completion valid to adapter_regfile
+  output sb_packet_t          rem_cpl_pkt,           // Remote mailbox completion packet to adapter_regfile
 
   // --------------------------------------------------------------------------
   // Status, Error, and Monitoring Outputs
   // --------------------------------------------------------------------------
-  output logic                adapter_fatal,
-  output logic                adapter_linkerror,
-  output logic                stage3_done,
-  output logic                adapter_capability_done,
-  output logic                protocol_error,
-  output logic                fdi_format_error,
-  output logic                sb_credit_returned,
-  output logic                sb_stall_sent,
-  output logic                sb_msg_timeout
+  output logic                adapter_fatal,         // Fatal protocol error status indication
+  output logic                adapter_linkerror,     // LinkError state escalation request trigger
+  output logic                stage3_done,           // Stage 3 parameter exchange completed indication
+  output logic                adapter_capability_done,// Adapter capability exchange completed status
+  output logic                protocol_error,        // Sideband protocol violation status indicator
+  output logic                fdi_format_error,      // FDI configuration packet framing format error
+  output logic                sb_credit_returned,    // Credit return pulse monitor indicator
+  output logic                sb_stall_sent,         // Stall completion emitted monitor indicator
+  output logic                sb_msg_timeout         // Remote request message timeout monitor indicator
 );
 
   import ucie_pkg::*;
@@ -297,11 +301,11 @@ module adapter_sb_if #(
   // UCIe 1.0 Section 6.1.2.1 (Figure 101, Table 50, Table 52)
   // ==========================================================================
   function automatic sb_packet_t make_cpl_packet(
-    input sb_packet_t  req_pkt,
-    input logic [63:0] req_hdr,
-    input sb_status_t  status,
-    input logic [63:0] rdata,
-    input logic        is_timeout
+    input sb_packet_t  req_pkt,    // Original request packet
+    input logic [63:0] req_hdr,    // Original 64-bit request header word
+    input sb_status_t  status,     // Completion status code (SC, UR, CA, Stall)
+    input logic [63:0] rdata,      // Read completion data payload
+    input logic        is_timeout  // Asserted if completion generated by timeout
   );
     sb_packet_t cpl;
     logic [63:0] hdr_payload;
@@ -350,10 +354,14 @@ module adapter_sb_if #(
   // ==========================================================================
 
   // --- FDI RX Phase Counter and Assembly Registers ---
-  fdi_rx_state_t fdi_rx_state_q, fdi_rx_state_d;
-  logic [2:0]    fdi_rx_cnt_q,   fdi_rx_cnt_d;
-  logic [63:0]   fdi_rx_hdr_q,   fdi_rx_hdr_d;
-  logic [63:0]   fdi_rx_pld_q,   fdi_rx_pld_d;
+  fdi_rx_state_t fdi_rx_state_q;
+  fdi_rx_state_t fdi_rx_state_d;
+  logic [2:0]    fdi_rx_cnt_q;
+  logic [2:0]    fdi_rx_cnt_d;
+  logic [63:0]   fdi_rx_hdr_q;
+  logic [63:0]   fdi_rx_hdr_d;
+  logic [63:0]   fdi_rx_pld_q;
+  logic [63:0]   fdi_rx_pld_d;
 
   logic          fdi_rx_complete_pulse;
   sb_packet_t    fdi_rx_pkt;
@@ -363,9 +371,12 @@ module adapter_sb_if #(
   logic [63:0]   fdi_rx_pld_complete;
 
   // Sticky error and protocol status registers
-  logic          fdi_format_err_q, fdi_format_err_d;
-  logic          protocol_err_q,   protocol_err_d;
-  logic          adapter_fatal_q,  adapter_fatal_d;
+  logic          fdi_format_err_q;
+  logic          fdi_format_err_d;
+  logic          protocol_err_q;
+  logic          protocol_err_d;
+  logic          adapter_fatal_q;
+  logic          adapter_fatal_d;
 
   logic          fdi_rx_format_err_event;
   logic          fdi_decode_format_err_event;
@@ -381,35 +392,48 @@ module adapter_sb_if #(
   wire           adapter_sb_rx_err_event     = adapter_sb_rx_valid && adapter_sb_rx_ready && adapter_sb_rx_integrity_err;
 
   // --- FDI Credit Accounting Registers ---
-  logic [2:0]    fdi_rx_crd_q,     fdi_rx_crd_d;   // Inbound request capacity (init 4)
-  logic [2:0]    fdi_tx_crd_q,     fdi_tx_crd_d;   // Protocol Layer credits for Adapter TX (init 4)
+  logic [2:0]    fdi_rx_crd_q;                   // Inbound request capacity (init 4)
+  logic [2:0]    fdi_rx_crd_d;
+  logic [2:0]    fdi_tx_crd_q;                   // Protocol Layer credits for Adapter TX (init 4)
+  logic [2:0]    fdi_tx_crd_d;
   logic          fdi_req_reserve_event;
   logic          fdi_req_release_event;
 
   // --- Remote Credit Accounting Registers (spec 6.1.3) ---
-  logic [2:0]    remote_req_crd_q, remote_req_crd_d; // Outgoing remote credits (init 4, max 4)
-  logic [2:0]    pending_cr_q,     pending_cr_d;     // Credits owed to remote partner
+  logic [2:0]    remote_req_crd_q;               // Outgoing remote credits (init 4, max 4)
+  logic [2:0]    remote_req_crd_d;
+  logic [2:0]    pending_cr_q;                   // Credits owed to remote partner
+  logic [2:0]    pending_cr_d;
 
   // --- Four-Entry Remote Request Table ---
-  logic [3:0]  rem_table_valid_q, rem_table_valid_d;
-  sb_packet_t  rem_table_pkt_q   [4];
-  sb_packet_t  rem_table_pkt_d   [4];
-  logic [31:0] rem_table_timer_q [4];
-  logic [31:0] rem_table_timer_d [4];
-  logic [3:0]  rem_table_route_q, rem_table_route_d;
+  logic [3:0]    rem_table_valid_q;
+  logic [3:0]    rem_table_valid_d;
+  sb_packet_t    rem_table_pkt_q   [4];
+  sb_packet_t    rem_table_pkt_d   [4];
+  logic [31:0]   rem_table_timer_q [4];
+  logic [31:0]   rem_table_timer_d [4];
+  logic [3:0]    rem_table_route_q;
+  logic [3:0]    rem_table_route_d;
 
   // --- Local CSR Engine Registers ---
-  csr_state_t    csr_fsm_q,        csr_fsm_d;
-  csr_held_req_t csr_held_q,       csr_held_d;
-  logic [63:0]   csr_held_rdata_q, csr_held_rdata_d;
-  logic          csr_rd_pulse_q,   csr_rd_pulse_d;
+  csr_state_t    csr_fsm_q;
+  csr_state_t    csr_fsm_d;
+  csr_held_req_t csr_held_q;
+  csr_held_req_t csr_held_d;
+  logic [63:0]   csr_held_rdata_q;
+  logic [63:0]   csr_held_rdata_d;
+  logic          csr_rd_pulse_q;
+  logic          csr_rd_pulse_d;
 
   // --- Independent Completion Queues (Always-Sink, Never Credit-Gated) ---
   // FDI Completion Queue (outgoing on pl_cfg)
   sb_packet_t    fdi_cpl_q [4];
-  logic [1:0]    fdi_cpl_wr_ptr_q, fdi_cpl_wr_ptr_d;
-  logic [1:0]    fdi_cpl_rd_ptr_q, fdi_cpl_rd_ptr_d;
-  logic [2:0]    fdi_cpl_count_q,  fdi_cpl_count_d;
+  logic [1:0]    fdi_cpl_wr_ptr_q;
+  logic [1:0]    fdi_cpl_wr_ptr_d;
+  logic [1:0]    fdi_cpl_rd_ptr_q;
+  logic [1:0]    fdi_cpl_rd_ptr_d;
+  logic [2:0]    fdi_cpl_count_q;
+  logic [2:0]    fdi_cpl_count_d;
 
   logic          csr_fdi_cpl_push;
   sb_packet_t    csr_fdi_cpl_push_pkt;
@@ -420,9 +444,12 @@ module adapter_sb_if #(
 
   // Remote Completion Queue (outgoing on adapter_sb_tx)
   sb_packet_t    rem_cpl_fifo_q [4];
-  logic [1:0]    rem_cpl_wr_ptr_q, rem_cpl_wr_ptr_d;
-  logic [1:0]    rem_cpl_rd_ptr_q, rem_cpl_rd_ptr_d;
-  logic [2:0]    rem_cpl_count_q,  rem_cpl_count_d;
+  logic [1:0]    rem_cpl_wr_ptr_q;
+  logic [1:0]    rem_cpl_wr_ptr_d;
+  logic [1:0]    rem_cpl_rd_ptr_q;
+  logic [1:0]    rem_cpl_rd_ptr_d;
+  logic [2:0]    rem_cpl_count_q;
+  logic [2:0]    rem_cpl_count_d;
 
   logic          csr_rem_cpl_push;
   sb_packet_t    csr_rem_cpl_push_pkt;
@@ -430,35 +457,57 @@ module adapter_sb_if #(
   sb_packet_t    rem_cpl_push_pkt;
 
   // --- FDI TX Serializer Registers (pl_cfg) ---
-  pl_tx_state_t  pl_tx_state_q,    pl_tx_state_d;
-  logic [2:0]    pl_tx_cnt_q,      pl_tx_cnt_d;
-  logic [NC-1:0] pl_cfg_q,         pl_cfg_d;
-  logic          pl_cfg_vld_q,     pl_cfg_vld_d;
-  logic          pl_cfg_crd_q,     pl_cfg_crd_d;
+  pl_tx_state_t  pl_tx_state_q;
+  pl_tx_state_t  pl_tx_state_d;
+  logic [2:0]    pl_tx_cnt_q;
+  logic [2:0]    pl_tx_cnt_d;
+  logic [NC-1:0] pl_cfg_q;
+  logic [NC-1:0] pl_cfg_d;
+  logic          pl_cfg_vld_q;
+  logic          pl_cfg_vld_d;
+  logic          pl_cfg_crd_q;
+  logic          pl_cfg_crd_d;
 
   // --- Reduced-Profile Stage 3 State Machine Registers ---
-  stage3_state_t s3_state_q,       s3_state_d;
-  logic [31:0]   cap_timer_q,      cap_timer_d;
-  logic [31:0]   ad0_timer_q,      ad0_timer_d;
-  logic [31:0]   lm_timer_q,       lm_timer_d;
+  stage3_state_t s3_state_q;
+  stage3_state_t s3_state_d;
+  logic [31:0]   cap_timer_q;
+  logic [31:0]   cap_timer_d;
+  logic [31:0]   ad0_timer_q;
+  logic [31:0]   ad0_timer_d;
+  logic [31:0]   lm_timer_q;
+  logic [31:0]   lm_timer_d;
 
-  logic          local_act_req_sent_q, local_act_req_sent_d;
-  logic          local_act_rsp_rcvd_q, local_act_rsp_rcvd_d;
-  logic          peer_act_req_rcvd_q,  peer_act_req_rcvd_d;
-  logic          peer_act_rsp_sent_q,  peer_act_rsp_sent_d;
+  logic          local_act_req_sent_q;
+  logic          local_act_req_sent_d;
+  logic          local_act_rsp_rcvd_q;
+  logic          local_act_rsp_rcvd_d;
+  logic          peer_act_req_rcvd_q;
+  logic          peer_act_req_rcvd_d;
+  logic          peer_act_rsp_sent_q;
+  logic          peer_act_rsp_sent_d;
 
-  logic          owed_rsp_pmnak_q,     owed_rsp_pmnak_d;
-  logic          owed_rsp_dis_q,       owed_rsp_dis_d;
-  logic          owed_rsp_lr_q,        owed_rsp_lr_d;
+  logic          owed_rsp_pmnak_q;
+  logic          owed_rsp_pmnak_d;
+  logic          owed_rsp_dis_q;
+  logic          owed_rsp_dis_d;
+  logic          owed_rsp_lr_q;
+  logic          owed_rsp_lr_d;
 
-  logic          stage3_done_q,        stage3_done_d;
-  logic          adapter_capability_done_q, adapter_capability_done_d;
-  logic          state_req_vld_q,      state_req_vld_d;
-  logic [3:0]    state_req_q,          state_req_d;
+  logic          stage3_done_q;
+  logic          stage3_done_d;
+  logic          adapter_capability_done_q;
+  logic          adapter_capability_done_d;
+  logic          state_req_vld_q;
+  logic          state_req_vld_d;
+  logic [3:0]    state_req_q;
+  logic [3:0]    state_req_d;
 
   // Remote Mailbox Client Completion Registers
-  logic          rem_cpl_vld_q,        rem_cpl_vld_d;
-  sb_packet_t    rem_cpl_pkt_q,        rem_cpl_pkt_d;
+  logic          rem_cpl_vld_q;
+  logic          rem_cpl_vld_d;
+  sb_packet_t    rem_cpl_pkt_q;
+  sb_packet_t    rem_cpl_pkt_d;
 
   // Monitor pulse flags
   logic          sb_credit_ret_pulse;
@@ -1025,7 +1074,10 @@ module adapter_sb_if #(
   end
 
   // Completion Tag Matching across all 4 entries
-  sb_packet_t rem_tbl_0, rem_tbl_1, rem_tbl_2, rem_tbl_3;
+  sb_packet_t    rem_tbl_0;
+  sb_packet_t    rem_tbl_1;
+  sb_packet_t    rem_tbl_2;
+  sb_packet_t    rem_tbl_3;
 
   // --------------------------------------------------------------------------
   // assign: rem_tbl_0 - Remote Request Entry 0 Content Tap
@@ -1270,7 +1322,7 @@ module adapter_sb_if #(
   // --------------------------------------------------------------------------
   // assign: adapter_fatal_d - Sticky Adapter Fatal Error Aggregator
   //
-  // Rolls up fatal sideband conditions; cleared only on link RESET.
+  // Rolls up fatal sideband conditions; clears on hardware lreset_n or RDI_STS_RESET.
   //
   // Spec ref: UCIe 1.0 Specification, Section 6.1.3 and Section 8.3.2.7.
   // --------------------------------------------------------------------------

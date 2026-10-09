@@ -77,7 +77,7 @@
 //      AND the logical PHY completed its Active Entry work.
 //   3. The completed Active Entry result is the private LTSM output
 //      phy_active_entry_done, which stays high for the whole LTSM ACTIVE
-//      residency (PLAN.md Section 15.9 Phase C).
+//      residency per LinkMgmt.RDI Active Entry requirements.
 //   4. The LTSM owns the remote PHY Active exchange through its sideband
 //      LinkMgmt.RDI request and response. No Adapter peer-Active feedback
 //      participates in this RDI state decision.
@@ -137,6 +137,9 @@
 //   v0.0.9  2026-10-08  Documentation compliance pass: expand the state-diagram
 //                        header and the per-construct comment blocks with UCIe
 //                        1.0 citations.
+//   v0.0.10 2026-10-09  Documentation compliance pass: remove obsolete implementation-phase
+//                        references outside revision history, add per-port inline comments,
+//                        and split multi-signal declarations.
 // ============================================================================
 `ifndef RdiStateMachine_SV
 `define RdiStateMachine_SV
@@ -147,21 +150,21 @@ import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module rdi_state_machine (
-  input  logic        lclk,
-  input  logic        lreset_n,
+  input  logic        lclk,                  // Link clock (500 MHz)
+  input  logic        lreset_n,              // Active-low asynchronous reset
 
   // ---- Adapter side (RDI). Table 114, the subset this project implements.
-  input  rdi_req_t    rdi_lp_state_req,
+  input  rdi_req_t    rdi_lp_state_req,      // State request from Adapter
   input  logic        rdi_lp_linkerror = 1'b0, // Adapter fatal indication
-  input  logic        adapter_active_req, // public compatibility, policy-inert
-  output rdi_sts_t    rdi_pl_state_sts,
-  input  logic        rdi_lp_stallack,
-  output logic        rdi_pl_inband_pres,
-  output logic        rdi_pl_linkerror,
-  output logic        rdi_pl_phyinrecenter,
-  output logic        rdi_pl_cerror,
-  output logic        rdi_pl_nferror,
-  output logic        rdi_pl_trainerror,
+  input  logic        adapter_active_req,    // public compatibility, policy-inert
+  output rdi_sts_t    rdi_pl_state_sts,      // Current RDI state status to Adapter
+  input  logic        rdi_lp_stallack,       // Stall acknowledge from Adapter
+  output logic        rdi_pl_inband_pres,    // In-band presence indication to Adapter
+  output logic        rdi_pl_linkerror,      // Link error indication to Adapter
+  output logic        rdi_pl_phyinrecenter,  // PHY in retrain indication to Adapter
+  output logic        rdi_pl_cerror,         // Correctable error indication to Adapter
+  output logic        rdi_pl_nferror,        // Non-fatal error indication to Adapter
+  output logic        rdi_pl_trainerror,     // Training error indication to Adapter
 
   // ---- Logical PHY side. Physical status and events.
   input  logic        phy_link_trained,      // LTSM reached ACTIVE
@@ -183,8 +186,10 @@ module rdi_state_machine (
 
   import ucie_pkg::*;
 
-  rdi_sts_t state_q, state_d;
-  logic     reset_req_sampled_q, reset_req_sampled_d;
+  rdi_sts_t state_q;                         // current RDI state (registered)
+  rdi_sts_t state_d;                         // next RDI state (combinational)
+  logic     reset_req_sampled_q;
+  logic     reset_req_sampled_d;
 
 
   // =========================================================================
@@ -354,7 +359,7 @@ module rdi_state_machine (
   //   rdi_pl_phyinrecenter - retrain indication. The fixed profile does not
   //                          support Retrain and never publishes the RETRAIN
   //                          state, so this indication stays low
-  //                          (PLAN.md Section 15.5 Phase D).
+  //                          (fixed profile retrain suppression policy).
   //   rdi_pl_cerror        - correctable-error pass-through (Table 114).
   //   rdi_pl_nferror       - non-fatal-error pass-through (Table 114).
   //   rdi_pl_trainerror    - forwarded from phy_train_error; the LTSM has
@@ -450,7 +455,8 @@ module rdi_state_machine (
   localparam logic [1:0] STALL_ACKED    = 2'd2;
   localparam logic [1:0] STALL_RELEASED = 2'd3;
 
-  logic [1:0] stall_phase_q, stall_phase_d;
+  logic [1:0] stall_phase_q;
+  logic [1:0] stall_phase_d;
 
   // -------------------------------------------------------------------------
   // always_ff: Stall phase register
@@ -549,7 +555,7 @@ module rdi_state_machine (
   //
   // Spec ref: UCIe 1.0, Section 8.1.5 - RDI state transitions;
   //           Table 114 - RDI Signal List;
-  //           PLAN.md Section 15.5 - Phase D retrain suppression.
+  //           fixed profile retrain suppression policy.
   // -------------------------------------------------------------------------
   always_comb begin
     unused_phy_retrain_req = phy_retrain_req;
@@ -558,11 +564,11 @@ module rdi_state_machine (
   // always_comb: Unused adapter Active compatibility input
   //
   // Consumes adapter_active_req so the preserved public port does not create a
-  // lint warning. Phase D removes peer-Active policy from the RDI, so this
+  // lint warning. The LinkMgmt.RDI policy removes peer-Active feedback from the RDI, so this
   // sink has no effect on state transitions or output signals.
   //
   // Spec ref: UCIe 1.0 Section 8.1.5, Table 114;
-  //           PLAN.md Section 15.5 - Phase D policy ownership.
+  //           LTSM LinkMgmt.RDI Active handshake policy ownership.
   // -------------------------------------------------------------------------
   always_comb begin
     unused_adapter_active_req = adapter_active_req;

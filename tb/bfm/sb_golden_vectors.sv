@@ -49,11 +49,12 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-28  -           Initial creation of literal golden vectors.
-//   v0.0.2  2026-10-08  -           Documentation compliance pass: add full
-//                                    header with packet layouts and citations.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-28  Initial creation of literal golden vectors.
+//   v0.0.2  2026-10-08  Documentation compliance pass: add full
+//                       header with packet layouts and citations.
+//   v0.0.3  2026-10-09  Cleanup pass: remove unused table column from revision table.
 // ============================================================================
 `ifndef SB_GOLDEN_VECTORS_SV
 `define SB_GOLDEN_VECTORS_SV

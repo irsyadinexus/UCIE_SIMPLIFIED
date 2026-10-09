@@ -12,7 +12,7 @@
 //   UCIe 1.0 Specification, Section 8.3.1 - Stall handshake
 //   UCIe 1.0 Specification, Section 8.3.2 - State Request and Status
 //   UCIe 1.0 Specification, Table 114 - RDI Signal List
-//   PLAN.md, Section 15.9 Phase F - Coverage and Verification Integration
+//   PLAN.md, Section 15.9 - Coverage and Verification Integration
 // DESCRIPTION
 //   Directed unit test for the RDI state machine (rtl/logical_phy/
 //   rdi_state_machine.sv). The DUT is instantiated directly and driven
@@ -33,7 +33,7 @@
 //           --> LINKERROR --> RESET --> ACTIVE (direct per Fig 111 & 8.3.2.7)
 //           --> DISABLED --> RESET --> ACTIVE --> four-phase stall
 //
-//   and, in addition to the state sequence itself, checks the Phase D policy:
+//   and, in addition to the state sequence itself, checks the RDI adapter policy:
 //
 //     1. ACTIVE waits for the completed LTSM Active Entry result
 //        (phy_active_entry_done). A trained link alone must not publish
@@ -52,7 +52,7 @@
 //   The test also keeps the pass-through checks of the original build:
 //   pl_cerror, pl_nferror and pl_inband_pres.
 
-// Evidence export (Phase F):
+// Evidence export:
 //   On clean zero-error completion, the test exports a minimal JSON evidence
 //   fragment to logs/rdi_sm_evidence.json capturing proof of PMNAK power
 //   management rejection, LinkReset handling, Disabled handling, and
@@ -136,13 +136,17 @@
 //   SPDX-License-Identifier: Apache-2.0
 //   v0.0.9  2026-10-08  Documentation compliance pass: expand the header and the
 //                       per-construct comment blocks with UCIe 1.0 citations.
+//   v0.0.10 2026-10-09  Cleanup pass: remove obsolete implementation-phase
+//                       references outside revision history, add task argument
+//                       inline comments, and split multi-signal declarations.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module ut_rdi_sm;
-  logic        lclk, lreset_n;
+  logic        lclk;
+  logic        lreset_n;
   logic [3:0]  rdi_lp_state_req;
   logic        adapter_active_req;
   logic        rdi_lp_stallack;
@@ -160,8 +164,10 @@ module ut_rdi_sm;
   logic        phy_retrain_req;
   logic        phy_train_error;
   logic        phy_inband_pres;
-  logic        cerror, nferror;
-  logic        stall_req, stall_ack;
+  logic        cerror;
+  logic        nferror;
+  logic        stall_req;
+  logic        stall_ack;
   logic        stall_complete;
   logic        local_active_req;
   int          errors;
@@ -175,7 +181,7 @@ module ut_rdi_sm;
   // was permanently strapped to a convenient value.
   //
   // The public adapter_active_req input remains connected but is intentionally
-  // ignored by Phase D policy. Active entry depends only on the request,
+// ignored by RDI policy. Active entry depends only on the request,
   // physical link, and completed LTSM Active Entry result.
   //
   // The status output under observation is rdi_pl_state_sts, compared against
@@ -241,8 +247,8 @@ module ut_rdi_sm;
   // Spec ref: UCIe 1.0, Table 114 - RDI Signal List (pl_state_sts encodings).
   // -------------------------------------------------------------------------
   task chk;
-    input [64*8-1:0] label;
-    input [3:0]     exp;
+    input [64*8-1:0] label; // Descriptive scenario label string
+    input [3:0]      exp;   // Expected rdi_pl_state_sts encoding
     begin
       if (rdi_pl_state_sts !== exp) begin
         $display("FAIL ut_rdi_sm: %s: got %01h want %01h", label,
@@ -259,8 +265,8 @@ module ut_rdi_sm;
   // produces the same failure message as a wrong encoding.
   // -------------------------------------------------------------------------
   task step_to;
-    input [64*8-1:0] label;
-    input [3:0]     exp;
+    input [64*8-1:0] label; // Descriptive scenario label string
+    input [3:0]      exp;   // Expected rdi_pl_state_sts encoding
     begin
       fork
         begin
@@ -278,14 +284,14 @@ module ut_rdi_sm;
   // -------------------------------------------------------------------------
   // task hold_to: prove a status encoding survives a fixed number of clocks
   //
-  // Used for the Phase D hold rules: LINKRESET and DISABLED must survive an
+// Used for the RDI hold rules: LINKRESET and DISABLED must survive an
   // adapter ACTIVE request, and the suppressed RETRAIN request must leave
   // ACTIVE published.
   // -------------------------------------------------------------------------
   task hold_to;
-    input [64*8-1:0] label;
-    input [3:0]     exp;
-    input int       cycles;
+    input [64*8-1:0] label;  // Descriptive scenario label string
+    input [3:0]      exp;    // Expected holding rdi_pl_state_sts encoding
+    input int        cycles; // Clock count to observe stable state
     begin
       repeat (cycles) @(posedge lclk);
       #0.1;
@@ -319,7 +325,7 @@ module ut_rdi_sm;
     end
 
     // =======================================================================
-    // Active Entry gate (spec 8.1.6, PLAN.md Phase D)
+    // Active Entry gate (spec 8.1.6, adapter policy)
     // =======================================================================
     // A trained link is not sufficient. The machine must wait for the private
     // LTSM Active Entry result before it publishes ACTIVE.
@@ -366,7 +372,7 @@ module ut_rdi_sm;
     step_to("active3", RDI_STS_ACTIVE);
 
     // =======================================================================
-    // RETRAIN is suppressed (PLAN.md Phase D)
+    // RETRAIN is suppressed (adapter policy)
     // =======================================================================
     // The fixed profile has no Retrain support: the RDI holds ACTIVE, never
     // publishes RETRAIN, and never asserts the recentering indication. The DUT
@@ -385,7 +391,7 @@ module ut_rdi_sm;
     chk("still active after retrain", RDI_STS_ACTIVE);
 
     // =======================================================================
-    // LINKRESET holds until the LTSM RESET result (PLAN.md Phase D)
+    // LINKRESET holds until the LTSM RESET result (adapter policy)
     // =======================================================================
     rdi_lp_state_req = RDI_REQ_LINKRESET;
     hold_to("linkreset blocked before stall", RDI_STS_ACTIVE, 4);
@@ -448,7 +454,7 @@ module ut_rdi_sm;
     step_to("active5", RDI_STS_ACTIVE);
 
     // =======================================================================
-    // DISABLED holds until the LTSM RESET result (PLAN.md Phase D)
+    // DISABLED holds until the LTSM RESET result (adapter policy)
     // =======================================================================
     rdi_lp_state_req = RDI_REQ_DISABLED;
     hold_to("disabled blocked before stall", RDI_STS_ACTIVE, 4);
@@ -477,7 +483,7 @@ module ut_rdi_sm;
     step_to("active6", RDI_STS_ACTIVE);
 
     // =======================================================================
-    // Registered four-phase stall handshake (spec 8.3.1, PLAN.md Phase D)
+    // Registered four-phase stall handshake (spec 8.3.1, adapter policy)
     // =======================================================================
     // Phase 1: the local request is asserted, the adapter has not yet
     // acknowledged, so stall_ack must stay low. This proves the path is
@@ -572,9 +578,9 @@ module ut_rdi_sm;
     phy_active_entry_done = 1'b1;
     step_to("active final", RDI_STS_ACTIVE);
 
-    // Phase F: export unit evidence JSON upon clean zero-error completion.
+    // Export unit evidence JSON upon clean zero-error completion.
     // Spec ref: UCIe 1.0 Section 8.1.5, Section 8.1.7, Table 114, and
-    // PLAN.md Section 15.9 Phase F.
+    // PLAN.md Section 15.9 coverage integration.
     if (errors == 0) begin
       integer fd;
       fd = $fopen("logs/rdi_sm_evidence.json", "w");

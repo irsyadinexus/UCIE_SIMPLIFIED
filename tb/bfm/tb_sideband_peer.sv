@@ -36,11 +36,13 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-28  -           Initial creation of scalar sideband peer TB.
-//   v0.0.2  2026-10-08  -           Documentation compliance pass: expand header
-//                                    and add per-construct comments.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-28  Initial creation of scalar sideband peer TB.
+//   v0.0.2  2026-10-08  Documentation compliance pass: expand header
+//                       and add per-construct comments.
+//   v0.0.3  2026-10-09  Cleanup pass: remove unused table column and add inline comments
+//                       for task input arguments.
 // TESTBENCH EXECUTION FLOW
 //   1. Assert sbreset_n and release once the codec is idle.
 //   2. Serially shift the literal MSG_NODATA golden header onto sb_rx_data with
@@ -105,10 +107,10 @@ module tb_sideband_peer;
   always #0.625 sbclk = ~sbclk;
 
   task automatic send_wire(
-    input logic [63:0] header,
-    input logic [63:0] payload,
-    input logic has_payload,
-    input logic corrupt_cp
+    input logic [63:0] header,      // 64-bit header word to serialize
+    input logic [63:0] payload,     // 64-bit data payload word to serialize
+    input logic        has_payload, // Flag indicating whether payload phase follows
+    input logic        corrupt_cp   // Flag to invert control parity bit 31
   );
     integer i;
     logic bit_value;
@@ -138,7 +140,9 @@ module tb_sideband_peer;
     end
   endtask
 
-  task automatic pop_and_check(input logic is_data64);
+  task automatic pop_and_check(
+    input logic is_data64           // 1 for 64-bit data packet, 0 for header-only
+  );
     begin
       wait (rx_valid);
       #0.05;

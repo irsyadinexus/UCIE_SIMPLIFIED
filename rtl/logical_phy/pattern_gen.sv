@@ -104,26 +104,25 @@
 //      of the LFSR pattern (LTSM Active Entry is governed by LinkMgmt.RDI).
 //
 // REVISION HISTORY
-//   Rev    Date        Author      Description
-//   -----  ----------  ----------  -------------------------------------------
-//   0.0.1  2026-09-22  -           First commit. Single-UI-per-cycle pattern
-//                                  engine.
-//   0.0.2  2026-09-23  -           Req.2: emit 8 true UIs (128 bits) per lclk
-//                                  cycle so the training patterns run at the
-//                                  4 GT/s physical rate (8 DDR UIs per
-//                                  500 MHz lclk cycle).
-//   0.0.3  2026-09-23  -           Documentation: expand header to full spec-
-//                                  referenced block with ASCII diagram, add
-//                                  per-construct comment blocks.
-//   0.0.4  2026-09-24  -           Phase A: correct VALTRAIN,
-//                                  Per-Lane-ID, and clock-repair equations.
-//   0.0.5  2026-09-24  -           Hoist the clock-repair modulo from the
-//                                  lane/UI generate array and preserve the
-//                                  16-high-then-8-low period.
-//   0.0.6  2026-09-24  -           Clarify the Phase A LINKINIT diagnostic
-//                                  ownership boundary with Phase C.
-//   0.0.7  2026-10-08  -           Documentation compliance pass: add detailed
-//                                  spec-referenced comment above generate bit multiplexer.
+// --------------------------------------------------------------------------
+//   v0.0.1  2026-09-22  First commit. Single-UI-per-cycle pattern engine.
+//   v0.0.2  2026-09-23  Req.2: emit 8 true UIs (128 bits) per lclk cycle so
+//                        the training patterns run at the 4 GT/s physical rate
+//                        (8 DDR UIs per 500 MHz lclk cycle).
+//   v0.0.3  2026-09-23  Documentation: expand header to full spec-referenced
+//                        block with ASCII diagram, add per-construct comment
+//                        blocks.
+//   v0.0.4  2026-09-24  Phase A: correct VALTRAIN, Per-Lane-ID, and clock-repair
+//                        equations.
+//   v0.0.5  2026-09-24  Hoist the clock-repair modulo from the lane/UI generate
+//                        array and preserve the 16-high-then-8-low period.
+//   v0.0.6  2026-09-24  Clarify the Phase A LINKINIT diagnostic ownership
+//                        boundary with Phase C.
+//   v0.0.7  2026-10-08  Documentation compliance pass: add detailed spec-referenced
+//                        comment above generate bit multiplexer.
+//   v0.0.8  2026-10-09  Documentation compliance pass: normalize revision columns from revision
+//                        history, remove obsolete implementation-phase references outside
+//                        revision history, and add per-port inline comments.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -137,14 +136,14 @@ import ucie_pkg::*;
 module pattern_gen #(
   parameter int unsigned NLANES = NLANES_MAX
 ) (
-  input  logic        lclk,
-  input  logic        lreset_n,
-  input  logic        enable,
-  input  pat_t        pattern,
-  input  logic        lfsr_reset,
-  input  logic        lfsr_enable,
-  output logic [NLANES*8-1:0] data,   // 8 UIs per lane = 128-bit word
-  output logic        pat_done
+  input  logic        lclk,             // Main link clock (500 MHz)
+  input  logic        lreset_n,         // Active-low asynchronous reset
+  input  logic        enable,           // Pattern generator enable
+  input  pat_t        pattern,          // Training pattern selector
+  input  logic        lfsr_reset,       // Synchronous LFSR re-seed trigger
+  input  logic        lfsr_enable,      // LFSR advance enable
+  output logic [NLANES*8-1:0] data,     // 8 UIs per lane = 128-bit word
+  output logic        pat_done          // LFSR pattern completion strobe
 );
 
   logic [15:0] ui_q;  // Tracks physical UIs (advances by 8 each lclk)
@@ -293,8 +292,8 @@ module pattern_gen #(
   // pattern == PAT_LFSR so it is inactive during other pattern types.
   //
   // The existing LTSM uses pat_done to complete its LINKINIT diagnostic
-  // interval. Phase C replaces that state-exit condition with the required
-  // LinkMgmt.RDI Active exchange.
+  // interval alongside the required LinkMgmt.RDI Active exchange for
+  // Active Entry.
   //
   // Spec ref: UCIe 1.0, Section 4.5.3.5 - LINKINIT;
   //           Section 4.4.1 - Scrambling and training pattern generation.

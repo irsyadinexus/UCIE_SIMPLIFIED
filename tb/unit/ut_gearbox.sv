@@ -57,7 +57,7 @@
 //       Any stray assertion is flagged as a framing error.
 //
 //   (e) Private framing-fault detection and stickiness (PLAN.md 6.2 and
-//       15.9 Phase E):
+//       15.9):
 //       The rx_gearbox framing_fault output must stay low for all legal
 //       loopback traffic and set for any window that is not 1100 or 0000:
 //       an early qualifier transition, a late qualifier transition, or a
@@ -68,7 +68,7 @@
 //       untouched, and a rejected window must produce no word strobe.
 //
 
-//   (f) Evidence export (Phase F):
+//   (f) Evidence export:
 //       On clean zero-error completion, the test exports a minimal JSON
 //       evidence fragment to logs/gearbox_evidence.json capturing proof of
 //       mainband framing fault detection and stickiness across legal and
@@ -174,19 +174,19 @@
 //     This testbench implements the clock relationship and DDR
 //     serialisation/deserialisation described therein.
 //
-//   PLAN.md, Section 15.9 Phase F - Coverage and Verification Integration
-//     Defines multi-source Phase F coverage aggregation and unit evidence
+//   PLAN.md, Section 15.9 - Coverage and Verification Integration
+//     Defines multi-source coverage aggregation and unit evidence
 //     export requirements.
 // --------------------------------------------------------------------------
 // Revision History
 // --------------------------------------------------------------------------
-//   Rev   Date        Author      Description
-//   ----- ----------  ----------  ------------------------------------------
-//   0.0.1 2025-XX-XX  -           Initial creation.
-//   0.0.2 2026-09-23  -           Documentation: expand header, add
-//                                 per-block comments throughout the
-//                                 testbench for improved readability
-//                                 and spec traceability.
+//   Rev   Date        Description
+//   ----- ----------  ------------------------------------------------------
+//   0.0.1 2025-XX-XX  Initial creation.
+//   0.0.2 2026-09-23  Documentation: expand header, add
+//                     per-block comments throughout the
+//                     testbench for improved readability
+//                     and spec traceability.
 //   0.0.3 2026-09-25  -           Phase E: connect the private rx_gearbox
 //                                 framing_fault output and add the
 //                                 mid-word valid violation, stickiness, and
@@ -214,6 +214,9 @@
 //                                 spec-referenced comment blocks above the
 //                                 framing-injection mux assigns and the
 //                                 mbclk sampling/monitor always blocks.
+//   0.0.9 2026-10-09  - Cleanup pass: remove unused table column, update comments
+//                     to remove obsolete implementation-phase references, add
+//                     task/function argument comments, and split declarations.
 // ============================================================================
 `include "ucie_pkg.sv"
 `timescale 1ns/1ps
@@ -221,9 +224,14 @@ module ut_gearbox;
   import ucie_pkg::*;
   localparam int unsigned W = NBYTES*8;
 
-  logic        lclk, mbclk, lreset_n;
-  logic [W-1:0] tx_word, rx_word;
-  logic        tx_load, tx_valid, rx_word_vld;
+  logic        lclk;
+  logic        mbclk;
+  logic        lreset_n;
+  logic [W-1:0] tx_word;
+  logic [W-1:0] rx_word;
+  logic        tx_load;
+  logic        tx_valid;
+  logic        rx_word_vld;
   wire [15:0] mb_tx_wire;
   wire        mb_tx_val_wire;
   wire [15:0] mb_rx_wire;
@@ -291,9 +299,8 @@ module ut_gearbox;
   // means one complete word whose window carried the legal 1100 pattern has
   // been reassembled and is ready to compare.
   //
-  // framing_fault is the private sticky fault output added for PLAN.md
-  // Sections 6.2 and 15.9 Phase E. It sets on any window that is not the
-  // legal 1100 or idle 0000 pattern and holds until lreset_n. It is
+// framing_fault is the private sticky fault output added for PLAN.md
+// Sections 6.2 and 15.9. It sets on any window that is not the
   // unconnected in production, so the unit test is the only place that
   // observes it directly.
   //
@@ -373,9 +380,13 @@ module ut_gearbox;
 
   localparam int N = 16;
   logic [W-1:0] q [0:N-1];
-  int q_head, q_tail, errors;
+  int q_head;
+  int q_tail;
+  int errors;
 
-  function automatic logic [W-1:0] mkword(input int idx);
+  function automatic logic [W-1:0] mkword(
+    input int idx // Word sequence index offset
+  );
     logic [W-1:0] w;
     begin
       w = '0;
@@ -403,7 +414,9 @@ module ut_gearbox;
   // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
   //           PLAN.md Section 6.2.
   // -------------------------------------------------------------------------
-  task inject_window(input logic [3:0] pat);
+  task inject_window(
+    input logic [3:0] pat // 4-cycle framing pattern to inject
+  );
     begin
       @(posedge mbclk);               // leave the current time step first
       inj_pat = pat;
@@ -428,10 +441,11 @@ module ut_gearbox;
   // reset on the same edge and stay phase aligned, which is what makes the
   // 1100 pattern legal end to end.
   //
-  // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
-  //           PLAN.md Sections 6.2, 15.6 and 15.9 Phase E.
-  // -------------------------------------------------------------------------
-  task check_malformed_framing(input logic [3:0] pat);
+//           PLAN.md Sections 6.2 and 15.6.
+// -------------------------------------------------------------------------
+  task check_malformed_framing(
+    input logic [3:0] pat // Malformed 4-cycle framing pattern to test
+  );
     begin
       if (framing_fault !== 1'b0) begin
         $display("FAIL ut_gearbox: framing_fault set before injecting %b4",
@@ -666,7 +680,7 @@ module ut_gearbox;
       errors = errors + 1;
     end
 
-    // ---- Phase E: legal 1100 framing -------------------------------
+    // ---- Framing verification: legal 1100 framing ------------------
     // Every word must leave the wire framed with the legal pattern, and the
     // whole stream must leave the private fault monitor clear.
     if (tx_valid_windows != N) begin
@@ -684,7 +698,7 @@ module ut_gearbox;
       $display("PASS ut_gearbox: legal framing left framing_fault clear");
     end
 
-    // ---- Phase E: malformed framing is rejected --------------------
+    // ---- Framing fault injection: malformed framing is rejected ----
     // Early and late qualifier transitions plus malformed windows must each
     // set the sticky private fault and suppress the word strobe. Every case
     // ends with a reset so the next one starts from a clean monitor.
@@ -693,8 +707,8 @@ module ut_gearbox;
     check_malformed_framing(PAT_SHIFTED);   // window off by one cycle
     check_malformed_framing(PAT_REASSERT);  // qualifier re-rises in the window
 
-    // Phase F: export unit evidence JSON upon clean zero-error completion.
-    // Spec ref: UCIe 1.0 Section 4.1.2 and PLAN.md Section 15.9 Phase F.
+    // Export unit evidence JSON upon clean zero-error completion.
+    // Spec ref: UCIe 1.0 Section 4.1.2 and PLAN.md Section 15.9.
     if (errors == 0) begin
       integer fd;
       fd = $fopen("logs/gearbox_evidence.json", "w");

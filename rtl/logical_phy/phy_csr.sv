@@ -60,7 +60,7 @@
 //
 //   A private input, clear_start_link_train, clears the sticky TRAIN_CTL bit
 //   0 value after a successful Active Entry. The clear has priority over a
-//   concurrent csr_wr (PLAN.md section 15.9 Phase C).
+//   concurrent csr_wr (LinkMgmt.RDI Active clear policy).
 //
 // --------------------------------------------------------------------------
 // Read path
@@ -78,7 +78,7 @@
 //   Output: start_link_train (from TRAIN_CTL bit 0).
 //   Private input: clear_start_link_train. Driven by logical_phy.sv, not a
 //                  public top-level port. Clears the sticky Start copy when
-//                  the LTSM completes Active Entry (PLAN.md 15.9 Phase C).
+//                  the LTSM completes LinkMgmt.RDI Active Entry.
 //
 // --------------------------------------------------------------------------
 // Implementation notes
@@ -124,6 +124,8 @@
 //                        - Preserve one-cycle read latency.
 //   v0.0.6  2026-10-08  Documentation compliance pass: adjust construct comments
 //                        for lint suppression block.
+//   v0.0.7  2026-10-09  Documentation compliance pass: remove obsolete implementation-phase
+//                        references outside revision history and add per-port inline comments.
 `ifndef PhyCsr_SV
 `define PhyCsr_SV
 `include "ucie_pkg.sv"
@@ -131,25 +133,25 @@ import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module phy_csr (
-  input  logic        lclk,
-  input  logic        lreset_n,
-  input  logic        csr_wr,
-  input  logic        csr_rd,
-  input  logic [26:0] csr_addr,
-  input  logic [63:0] csr_wdata,
-  input  logic [7:0]  csr_be,
-  output logic [63:0] csr_rdata,
-  output logic        csr_rdata_vld,
+  input  logic        lclk,                   // Link clock (500 MHz)
+  input  logic        lreset_n,               // Active-low asynchronous reset
+  input  logic        csr_wr,                 // CSR write strobe
+  input  logic        csr_rd,                 // CSR read strobe
+  input  logic [26:0] csr_addr,               // CSR register byte address
+  input  logic [63:0] csr_wdata,              // CSR write data word
+  input  logic [7:0]  csr_be,                 // CSR byte enable mask
+  output logic [63:0] csr_rdata,              // CSR read data word
+  output logic        csr_rdata_vld,          // CSR read data valid strobe
 
-  input  logic [7:0]  ltsm_state,
-  input  logic        lnk_is_x8,
-  input  logic [1:0]  degrade_lanes,
-  input  logic        train_error,
-  output logic        start_link_train,
+  input  logic [7:0]  ltsm_state,             // Current LTSM state vector
+  input  logic        lnk_is_x8,              // Negotiated x8 degraded width status
+  input  logic [1:0]  degrade_lanes,          // Negotiated degrade lane selection
+  input  logic        train_error,            // LTSM unrecoverable training error
+  output logic        start_link_train,       // Start link training command output
 
   // -----------------------------------------------------------------------
   // Private Active Entry clear input
-  // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5 - UCIe Registers)
+  // (LinkMgmt.RDI Active Entry clear; UCIe 1.0 section 7.5 - UCIe Registers)
   // -----------------------------------------------------------------------
   // clear_start_link_train is a private input driven by logical_phy.sv. It
   // is NOT a public top-level port: the parent module wires it internally.
@@ -157,13 +159,13 @@ module phy_csr (
   // The LTSM asserts this input after a successful Active Entry. The clear
   // retires the local sticky software Start copy, so a Start level that was
   // already accepted cannot request training a second time
-  // (PLAN.md section 15.9 Phase C, fresh-Start-event requirement).
+  // (LinkMgmt.RDI Active fresh-Start-event requirement).
   //
   // While clear_start_link_train is high, start_train_q is forced to 0 and
   // the TRAIN_CTL decode of bit 0 reads 0. The clear does not touch
   // elec_param_q or any status register. See the write-path block below.
   // -----------------------------------------------------------------------
-  input  logic        clear_start_link_train
+  input  logic        clear_start_link_train  // Active Entry clear strobe for start bit
 );
 
   // =========================================================================
@@ -196,7 +198,7 @@ module phy_csr (
   //                input clear_start_link_train. The bit is the single
   //                software Start copy owned by the logical PHY side of the
   //                link, and the LTSM clears it once training has reached
-  //                Active (PLAN.md section 15.9 Phase C).
+  //                Active via the LinkMgmt.RDI Active clear path.
   // =========================================================================
   logic [63:0] elec_param_q;
   logic        start_train_q;
@@ -213,7 +215,7 @@ module phy_csr (
   //
   // -------------------------------------------------------------------------
   // Private Active Entry clear and its priority
-  // (PLAN.md section 15.9 Phase C; UCIe 1.0 section 7.5 - UCIe Registers)
+  // (LinkMgmt.RDI Active Entry clear; UCIe 1.0 section 7.5 - UCIe Registers)
   // -------------------------------------------------------------------------
   // clear_start_link_train is tested FIRST in the if/else chain, so the
   // clear wins over a concurrent software write. Start Link Training is
@@ -265,7 +267,7 @@ module phy_csr (
   //
   // The value is the sticky storage start_train_q, so the output falls on
   // reset, on a TRAIN_CTL write of 0, or on the private Active Entry clear
-  // input clear_start_link_train (PLAN.md section 15.9 Phase C). The clear path
+  // input clear_start_link_train (LinkMgmt.RDI Active Entry clear). The clear path
   // means the LTSM consumes the Start level once, then sees a low level
   // after Active Entry instead of a held request.
   // Because the clear is registered in the write-path always_ff above, the

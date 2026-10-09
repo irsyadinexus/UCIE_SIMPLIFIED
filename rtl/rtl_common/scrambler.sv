@@ -75,24 +75,22 @@
 //      is its own inverse.
 //
 // REVISION HISTORY
-//   Rev    Date        Author      Description
-//   -----  ----------  ----------  -------------------------------------------
-//   0.0.1  2026-09-22  -           First commit. Single-bit-per-cycle LFSR
-//                                  scrambler.
-//   0.0.2  2026-09-23  -           Req.2: 8-deep combinational LFSR step
-//                                  chain so each 500 MHz lclk cycle advances
-//                                  the register by 8 bits, matching the
-//                                  4 GT/s physical UI rate (spec 4.4.1).
-//   0.0.3  2026-09-23  -           Documentation: expand header to full spec-
-//                                  referenced block, add per-construct comment
-//                                  blocks with spec citations.
-//   0.0.4  2026-09-23  -           Documentation: the lane seeding reference
-//                                  cited Table 47, which is the sideband
-//                                  opcode table. Re-cite to Section 4.4.1
-//                                  (Scrambling and training pattern
-//                                  generation).
-//   0.0.5  2026-10-08  -           Documentation compliance pass: add detailed
-//                                  per-step feedback and XOR scramble comments.
+//   Rev    Date        Description
+//   -----  ----------  -------------------------------------------------------
+//   0.0.1  2026-09-22  First commit. Single-bit-per-cycle LFSR scrambler.
+//   0.0.2  2026-09-23  Req.2: 8-deep combinational LFSR step chain so each
+//                      500 MHz lclk cycle advances the register by 8 bits,
+//                      matching the 4 GT/s physical UI rate (spec 4.4.1).
+//   0.0.3  2026-09-23  Documentation: expand header to full spec-referenced
+//                      block, add per-construct comment blocks with spec citations.
+//   0.0.4  2026-09-23  Documentation: the lane seeding reference cited Table 47,
+//                      which is the sideband opcode table. Re-cite to Section 4.4.1
+//                      (Scrambling and training pattern generation).
+//   0.0.5  2026-10-08  Documentation compliance pass: add detailed per-step
+//                      feedback and XOR scramble comments.
+//
+//   0.0.6  2026-10-09  Documentation and hygiene pass: remove Author column
+//                      and add per-port inline comments.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -105,13 +103,13 @@
 module scrambler #(
   parameter int unsigned LANE_ID = 0
 ) (
-  input  logic        lclk,
-  input  logic        lreset_n,
-  input  logic        lfsr_reset,
-  input  logic        enable,
+  input  logic        lclk,         // 500 MHz link clock
+  input  logic        lreset_n,     // Active-low asynchronous reset
+  input  logic        lfsr_reset,   // Synchronous LFSR re-seed trigger
+  input  logic        enable,       // Scrambler advance enable
   input  logic [7:0]  data_in,      // 8 raw transmit bits (one per UI)
   output logic [7:0]  data_out,     // 8 scrambled bits (one per UI)
-  output logic [22:0] state_obs
+  output logic [22:0] state_obs     // 23-bit LFSR state observability output
 );
 
   import ucie_pkg::*;

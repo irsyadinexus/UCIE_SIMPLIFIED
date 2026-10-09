@@ -37,11 +37,13 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-28  -           Initial creation of sb_codec loopback test.
-//   v0.0.2  2026-10-08  -           Documentation compliance pass: expand header
-//                                    and add per-construct comments.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-28  Initial creation of sb_codec loopback test.
+//   v0.0.2  2026-10-08  Documentation compliance pass: expand header
+//                       and add per-construct comments.
+//   v0.0.3  2026-10-09  Cleanup pass: remove unused table column and add inline comments
+//                       for task and function input arguments.
 // TESTBENCH EXECUTION FLOW
 //   1. Assert sbreset_n and release once both codec instances are idle.
 //   2. Load a message packet without data and wait for tx_ready acceptance.
@@ -145,7 +147,10 @@ module ut_sb_codec;
   // -------------------------------------------------------------------------
   always #0.625 sbclk = ~sbclk;
 
-  task automatic load_packet(input sb_packet_t packet, input logic corrupt);
+  task automatic load_packet(
+    input sb_packet_t packet,   // Sideband packet to serialize and transmit
+    input logic       corrupt   // Flag to enable intentional parity corruption
+  );
     begin
       @(negedge sbclk);
       tx_packet = packet;
@@ -158,7 +163,9 @@ module ut_sb_codec;
     end
   endtask
 
-  task automatic check_packet(input sb_packet_t expected);
+  task automatic check_packet(
+    input sb_packet_t expected  // Expected sideband packet to match against RX
+  );
     begin
       wait (rx_valid);
       #0.05;
@@ -181,11 +188,11 @@ module ut_sb_codec;
   endtask
 
   function automatic sb_packet_t make_message(
-    input logic [4:0] opcode,
-    input logic [15:0] info,
-    input logic [7:0] code,
-    input logic [7:0] subcode,
-    input logic [63:0] data
+    input logic [4:0]  opcode,  // Sideband packet opcode
+    input logic [15:0] info,    // Message info field
+    input logic [7:0]  code,    // Message code field
+    input logic [7:0]  subcode, // Message subcode field
+    input logic [63:0] data     // 64-bit payload data
   );
     sb_packet_t packet;
     begin

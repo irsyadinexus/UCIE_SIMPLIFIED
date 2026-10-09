@@ -1,7 +1,7 @@
 // ============================================================================
 // File        : ut_sb_cdc.sv
 // Project     : UCIe 1.0 Simplified Endpoint
-// Description : Unit test for the Phase A sideband asynchronous mailbox.
+// Description : Unit test for the sideband asynchronous mailbox.
 //
 // PURPOSE
 //   Proves that asynchronous mailbox transfers cross between the 500 MHz lclk
@@ -15,7 +15,7 @@
 //   3. Source payload stability while the mailbox is busy.
 //   4. Mailbox reuse after acknowledgement and reset clearing.
 //
-// Spec ref: UCIe 1.0 Section 6.1 packet transport; PLAN.md §15.2 Phase A.
+// Spec ref: UCIe 1.0 Section 6.1 packet transport; Section 6.1.2 toggle-handshake CDC.
 //
 // ASYNCHRONOUS CDC CROSSING ARCHITECTURE
 //
@@ -37,13 +37,15 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-23  -           Req.3: add asynchronous 500 MHz/800 MHz CDC test.
-//   v0.0.2  2026-09-24  -           Phase A: test the standalone 101-bit flat RX bundle,
-//                                    source busy retention, and one coherent event.
-//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
-//                                    and add per-construct comments.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-23  Req.3: add asynchronous 500 MHz/800 MHz CDC test.
+//   v0.0.2  2026-09-24  Phase A: test the standalone 101-bit flat RX bundle,
+//                       source busy retention, and one coherent event.
+//   v0.0.3  2026-10-08  Documentation compliance pass: expand header
+//                       and add per-construct comments.
+//   v0.0.4  2026-10-09  Cleanup pass: remove unused table column, remove obsolete
+//                       implementation-phase references, and split declarations.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // TESTBENCH EXECUTION FLOW
@@ -59,11 +61,20 @@
 // ============================================================================
 `timescale 1ns/1ps
 module ut_sb_cdc;
-  logic lclk, lreset_n, sbclk, sbreset_n;
-  logic [15:0] l2s_data, l2s_recv;
-  logic        l2s_send, l2s_busy, l2s_valid;
-  logic [100:0] s2l_data, s2l_recv;
-  logic         s2l_send, s2l_busy, s2l_valid;
+  logic         lclk;
+  logic         lreset_n;
+  logic         sbclk;
+  logic         sbreset_n;
+  logic [15:0]  l2s_data;
+  logic [15:0]  l2s_recv;
+  logic         l2s_send;
+  logic         l2s_busy;
+  logic         l2s_valid;
+  logic [100:0] s2l_data;
+  logic [100:0] s2l_recv;
+  logic         s2l_send;
+  logic         s2l_busy;
+  logic         s2l_valid;
   logic [100:0] expected_packet;
   int           s2l_valid_count;
   int           errors;

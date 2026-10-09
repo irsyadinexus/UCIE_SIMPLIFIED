@@ -20,7 +20,7 @@
 //   1.  Pattern-Triggered Training Walk
 //       After the true 4 ms RESET minimum, atomic match/mismatch results drive
 //       remote-pattern entry. Four tail events and explicit SBINIT packets
-//       then lead into the complete later training flow. Each Phase B state
+//       then lead into the complete later training flow. Each training state
 //       runs its full fixed-profile sequence of local request and matching
 //       peer response transactions, one transaction per sequence subcode:
 //         RESET → SBINIT → MBINIT.PARAM [00] → MBINIT.CAL [02] →
@@ -199,6 +199,9 @@
 //   v0.0.13 2026-10-08  Documentation compliance pass: repair the out-of-order
 //                        duplicate v0.0.9 history entry and add spec-cited comment
 //                        blocks above u_loc, u_rx_cdc, and u_par.
+//   v0.0.14 2026-10-09  Cleanup pass: remove obsolete implementation-phase
+//                        references outside revision history, add task/function
+//                        argument comments, and split multi-signal declarations.
 //
 // ============================================================================
 `include "ucie_pkg.sv"
@@ -208,60 +211,92 @@ import ucie_pkg::*;
 module ut_ltsm;
   import ucie_pkg::*;
   logic        rst_tmr_expired;
-  logic        lclk, lreset_n, sbclk, sbreset_n;
-  logic        start_link_train, adapter_active_req;
-  logic        link_trained, train_error, link_reset_out, phy_retrain_done;
+  logic        lclk;
+  logic        lreset_n;
+  logic        sbclk;
+  logic        sbreset_n;
+  logic        start_link_train;
+  logic        adapter_active_req;
+  logic        link_trained;
+  logic        train_error;
+  logic        link_reset_out;
+  logic        phy_retrain_done;
   logic [7:0]  ltsm_state;
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
-  logic        sb_msg_timeout, sb_stall_sent;
-  logic        pattern_run_enable, sbinit_raw_mode;
-  logic        sbinit_rx_iter_vld, sbinit_rx_iter_match;
-  logic        sbinit_tx_iter_done, sbinit_tx_idle;
-  logic        pat_enable, pat_lfsr_reset, pat_lfsr_enable, pat_done;
-  logic        tmr_start, tmr_run, rst_tmr_start, tmr_expired;
-  logic        le_tmr_start, le_tmr_expired_tb;
+  logic        sb_msg_timeout;
+  logic        sb_stall_sent;
+  logic        pattern_run_enable;
+  logic        sbinit_raw_mode;
+  logic        sbinit_rx_iter_vld;
+  logic        sbinit_rx_iter_match;
+  logic        sbinit_tx_iter_done;
+  logic        sbinit_tx_idle;
+  logic        pat_enable;
+  logic        pat_lfsr_reset;
+  logic        pat_lfsr_enable;
+  logic        pat_done;
+  logic        tmr_start;
+  logic        tmr_run;
+  logic        rst_tmr_start;
+  logic        tmr_expired;
+  logic        le_tmr_start;
+  logic        le_tmr_expired_tb;
   int          errors;
 
   // LTSM <-> local codec
-  logic        sb_tx_load, sb_tx_busy, sb_tx_accepted;
+  logic        sb_tx_load;
+  logic        sb_tx_busy;
+  logic        sb_tx_accepted;
   logic [4:0]  sb_tx_opcode;
-  logic [2:0]  sb_tx_srcid, sb_tx_dstid;
+  logic [2:0]  sb_tx_srcid;
+  logic [2:0]  sb_tx_dstid;
   logic [15:0] sb_tx_msginfo;
-  logic [7:0]  sb_tx_msgcode, sb_tx_msgsubcode;
+  logic [7:0]  sb_tx_msgcode;
+  logic [7:0]  sb_tx_msgsubcode;
   logic [7:0]  sb_tx_be;
   logic [4:0]  sb_tx_tag;
   logic        sb_tx_ep;
   logic [11:0] sb_tx_addr;
   logic [63:0] sb_tx_data_in;
   logic        sb_tx_has_data;
-  logic        loc_sb_clk, par_sb_clk;
-  logic        loc_sb_data, par_sb_data;
+  logic        loc_sb_clk;
+  logic        par_sb_clk;
+  logic        loc_sb_data;
+  logic        par_sb_data;
 
   // LTSM receive side (fed from the partner codec)
   logic        sb_rx_pkt_vld;
   logic [4:0]  sb_rx_opcode;
-  logic [2:0]  sb_rx_srcid, sb_rx_dstid;
+  logic [2:0]  sb_rx_srcid;
+  logic [2:0]  sb_rx_dstid;
   logic [15:0] sb_rx_msginfo;
-  logic [7:0]  sb_rx_msgcode, sb_rx_msgsubcode;
+  logic [7:0]  sb_rx_msgcode;
+  logic [7:0]  sb_rx_msgsubcode;
   logic [63:0] sb_rx_payload;
-  logic        sb_rx_cp_err, sb_rx_dp_err;
+  logic        sb_rx_cp_err;
+  logic        sb_rx_dp_err;
 
   // Direct packet injection is used only for deterministic SBINIT ordering
   // checks. Later training packets still traverse both codecs and mailboxes.
   logic        inject_rx_pkt_vld;
   logic [4:0]  inject_rx_opcode;
-  logic [2:0]  inject_rx_srcid, inject_rx_dstid;
+  logic [2:0]  inject_rx_srcid;
+  logic [2:0]  inject_rx_dstid;
   logic [15:0] inject_rx_msginfo;
   logic [7:0]  inject_rx_msgcode;
   logic [7:0]  inject_rx_msgsubcode;
-  logic        inject_rx_cp_err, inject_rx_dp_err;
+  logic        inject_rx_cp_err;
+  logic        inject_rx_dp_err;
   logic        cdc_rx_pkt_vld;
   logic [4:0]  cdc_rx_opcode;
-  logic [2:0]  cdc_rx_srcid, cdc_rx_dstid;
+  logic [2:0]  cdc_rx_srcid;
+  logic [2:0]  cdc_rx_dstid;
   logic [15:0] cdc_rx_msginfo;
-  logic [7:0]  cdc_rx_msgcode, cdc_rx_msgsubcode;
-  logic        cdc_rx_cp_err, cdc_rx_dp_err;
+  logic [7:0]  cdc_rx_msgcode;
+  logic [7:0]  cdc_rx_msgsubcode;
+  logic        cdc_rx_cp_err;
+  logic        cdc_rx_dp_err;
 
   // Req.3 CDC signals. The LTSM remains in lclk. The local codec remains in
   // sbclk, so complete sideband packets cross through the same mailboxes used
@@ -272,33 +307,43 @@ module ut_ltsm;
   logic               tx_cdc_busy;
   logic               loc_tx_load;
   logic [4:0]         loc_tx_opcode;
-  logic [2:0]         loc_tx_srcid, loc_tx_dstid;
+  logic [2:0]         loc_tx_srcid;
+  logic [2:0]         loc_tx_dstid;
   logic [15:0]        loc_tx_msginfo;
-  logic [7:0]         loc_tx_msgcode, loc_tx_msgsubcode;
+  logic [7:0]         loc_tx_msgcode;
+  logic [7:0]         loc_tx_msgsubcode;
   logic [7:0]         loc_tx_be;
   logic [4:0]         loc_tx_tag;
   logic               loc_tx_ep;
   logic [11:0]        loc_tx_addr;
   logic [63:0]        loc_tx_data_in;
-  logic               loc_tx_has_data, loc_tx_busy;
-  logic               loc_tx_busy_meta_q, loc_tx_busy_sync_q;
+  logic               loc_tx_has_data;
+  logic               loc_tx_busy;
+  logic               loc_tx_busy_meta_q;
+  logic               loc_tx_busy_sync_q;
   logic               loc_rx_pkt_vld;
   logic [4:0]         loc_rx_opcode;
-  logic [2:0]         loc_rx_srcid, loc_rx_dstid;
+  logic [2:0]         loc_rx_srcid;
+  logic [2:0]         loc_rx_dstid;
   logic [15:0]        loc_rx_msginfo;
-  logic [7:0]         loc_rx_msgcode, loc_rx_msgsubcode;
+  logic [7:0]         loc_rx_msgcode;
+  logic [7:0]         loc_rx_msgsubcode;
   logic [63:0]        loc_rx_data;
-  logic               loc_rx_cp_err, loc_rx_dp_err;
+  logic               loc_rx_cp_err;
+  logic               loc_rx_dp_err;
   logic [SB_RX_W-1:0] rx_cdc_data;
   logic               rx_cdc_busy;
   logic [63:0]        cdc_rx_data;
 
   // Partner codec transmit controls
-  logic        par_tx_load, par_tx_busy;
+  logic        par_tx_load;
+  logic        par_tx_busy;
   logic [4:0]  par_tx_opcode;
-  logic [2:0]  par_tx_srcid, par_tx_dstid;
+  logic [2:0]  par_tx_srcid;
+  logic [2:0]  par_tx_dstid;
   logic [15:0] par_tx_msginfo;
-  logic [7:0]  par_tx_msgcode, par_tx_msgsubcode;
+  logic [7:0]  par_tx_msgcode;
+  logic [7:0]  par_tx_msgsubcode;
   logic [7:0]  par_tx_be;
   logic [4:0]  par_tx_tag;
   logic        par_tx_ep;
@@ -308,11 +353,21 @@ module ut_ltsm;
 
   logic        par_rx_pkt_vld;
   logic [4:0]  par_rx_opcode;
-  logic [2:0]  par_rx_srcid, par_rx_dstid;
-  logic [7:0]  par_rx_msginfo, par_rx_msgcode, par_rx_msgsubcode;
-  logic        par_rx_cp_err, par_rx_dp_err;
-  logic        loc_tx_ready, loc_rx_valid, par_tx_ready, par_rx_valid;
-  sb_packet_t loc_tx_packet, loc_rx_packet, par_tx_packet, par_rx_packet;
+  logic [2:0]  par_rx_srcid;
+  logic [2:0]  par_rx_dstid;
+  logic [7:0]  par_rx_msginfo;
+  logic [7:0]  par_rx_msgcode;
+  logic [7:0]  par_rx_msgsubcode;
+  logic        par_rx_cp_err;
+  logic        par_rx_dp_err;
+  logic        loc_tx_ready;
+  logic        loc_rx_valid;
+  logic        par_tx_ready;
+  logic        par_rx_valid;
+  sb_packet_t  loc_tx_packet;
+  sb_packet_t  loc_rx_packet;
+  sb_packet_t  par_tx_packet;
+  sb_packet_t  par_rx_packet;
 
 // ---------------------------------------------------------------------------
 // DUT Instantiation: ltsm #(.NLANES(NLANES_MAX)) u_dut
@@ -340,7 +395,7 @@ module ut_ltsm;
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
     .degrade_lanes(degrade_lanes),
-    // Phase E private fatal source. This test proves the nominal walk, so
+    // Private framing fault fatal source. This test proves the nominal walk, so
     // the mainband framing fault stays inactive: the fatal-cause check for
     // the event is in ut_ltsm_policy.sv.
     .framing_fault_event(1'b0),
@@ -798,7 +853,10 @@ module ut_ltsm;
     end
   end
 
-  function automatic logic [7:0] rsp_code_for(input logic [7:0] code, input logic [7:0] subcode);
+  function automatic logic [7:0] rsp_code_for(
+    input logic [7:0] code,    // Sideband message code
+    input logic [7:0] subcode  // Sideband message subcode
+  );
     case (code)
       MC_SB_DONE_REQ:  rsp_code_for = MC_SB_DONE_RSP;
       MC_MBINIT_REQ:   rsp_code_for = MC_MBINIT_RSP;
@@ -810,7 +868,10 @@ module ut_ltsm;
     endcase
   endfunction
 
-  function automatic logic [7:0] rsp_subcode_for(input logic [7:0] code, input logic [7:0] subcode);
+  function automatic logic [7:0] rsp_subcode_for(
+    input logic [7:0] code,    // Sideband message code
+    input logic [7:0] subcode  // Sideband message subcode
+  );
     if ((code == 8'hBA) && (subcode == 8'h0E))
       rsp_subcode_for = 8'h0F;
     else
@@ -952,7 +1013,7 @@ module ut_ltsm;
 
   // Deliver one atomic remote-iteration result in the LTSM clock domain.
   task pulse_rx_iteration;
-    input logic match;
+    input logic match; // Iteration match indication flag
     begin
       @(negedge lclk);
       sbinit_rx_iter_match = match;
@@ -979,11 +1040,11 @@ module ut_ltsm;
   // Inject one complete sideband header at the direct lclk endpoint. The
   // caller controls the IDs and parity to exercise acceptance boundaries.
   task inject_sbinit_packet;
-    input logic [7:0] code;
-    input logic [7:0] subcode;
-    input logic [2:0] srcid;
-    input logic [2:0] dstid;
-    input logic       cp_err;
+    input logic [7:0] code;    // Message code byte
+    input logic [7:0] subcode; // Message subcode byte
+    input logic [2:0] srcid;   // Source ID field
+    input logic [2:0] dstid;   // Destination ID field
+    input logic       cp_err;  // Control parity error injection flag
     begin
       @(negedge lclk);
       inject_rx_opcode     = SB_OP_MSG_NODATA;
@@ -1003,7 +1064,7 @@ module ut_ltsm;
   endtask
 
   task expect_state;
-    input ltsm_state_t exp;
+    input ltsm_state_t exp; // Expected current LTSM state
     begin
       // Wait until the LTSM leaves this state or the deadline passes.
       fork
@@ -1287,7 +1348,7 @@ module ut_ltsm;
     end
 
     // Pipeline Stage 2 (Running Edges 1 .. C_RESIDENCY):
-    // The Phase C state-entry pulse reaches the timer after the state update,
+    // The state-entry pulse reaches the timer after the state update,
     // so the timer keeps tmr_expired low through these C_RESIDENCY edges.
     repeat (C_RESIDENCY) begin
       @(posedge lclk);

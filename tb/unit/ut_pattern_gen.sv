@@ -1,7 +1,7 @@
 // ============================================================================
 // File        : ut_pattern_gen.sv
 // Project     : UCIe 1.0 Simplified Endpoint
-// Description : Directed unit test for Phase A training pattern primitives.
+// Description : Directed unit test for training pattern primitives.
 //
 // This test drives pattern_gen directly. It verifies the digital primitives
 // that remain available in the simplified profile, even though the LTSM keeps
@@ -46,12 +46,14 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-24  -           Phase A initial directed pattern test.
-//   v0.0.2  2026-09-24  -           Remove clock-edge stimulus races between patterns.
-//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
-//                                    and add per-construct comments.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-24  Phase A initial directed pattern test.
+//   v0.0.2  2026-09-24  Remove clock-edge stimulus races between patterns.
+//   v0.0.3  2026-10-08  Documentation compliance pass: expand header
+//                       and add per-construct comments.
+//   v0.0.4  2026-10-09  Cleanup pass: remove unused table column, remove obsolete
+//                       implementation-phase references, and add task argument comments.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -71,7 +73,7 @@ module ut_pattern_gen;
   // The DUT produces one 8-UI word per lane each lclk cycle. The test samples
   // combinational output before each clock edge so ui_q identifies the first
   // UI in the checked word. The LFSR is disabled because this test covers only
-  // the fixed no-scramble primitives required by Phase A.
+// the fixed no-scramble primitives for training pattern generation.
   // Spec ref: UCIe 1.0 Table 21, Table 23, and Section 4.5.3.3.3.
   pattern_gen #(.NLANES(NLANES_MAX)) u_dut (
     .lclk(lclk),
@@ -95,9 +97,9 @@ module ut_pattern_gen;
   always #1 lclk = ~lclk;
 
   task automatic check_lane_byte(
-    input int unsigned lane,
-    input logic [7:0] expected,
-    input string name
+    input int unsigned lane,     // Main-band lane index to verify (0 to NLANES_MAX-1)
+    input logic [7:0]  expected, // Expected 8-UI pattern slice for this lane
+    input string       name      // Pattern name string for diagnostic logging
   );
     if (data[8*lane +: 8] !== expected) begin
       $display("FAIL ut_pattern_gen: %s lane %0d got %02h expected %02h",

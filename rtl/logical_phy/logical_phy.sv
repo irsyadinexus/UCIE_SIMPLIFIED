@@ -102,8 +102,9 @@
 //      training, and by the gated Active data path otherwise.
 //   2. The PHY CSR write/read path connects to the adapter's phy_csr_* channel,
 //      supporting byte-enabled accesses alongside csr_start_link_train.
-//   3. Static RDI outputs (pl_lnk_cfg, pl_speedmode, pl_stallreq) are tied
-//      to the reduced-capability defaults: x16, 4 GT/s, no stall.
+//   3. Static RDI outputs (pl_lnk_cfg, pl_speedmode) are tied to the
+//      reduced-capability defaults: x16, 4 GT/s. RDI pl_stallreq is driven
+//      by the registered four-phase stall request driver.
 //   4. User data flows only while the link is fully Active: the private gate
 //      requires the completed LTSM Active Entry result, the published RDI
 //      ACTIVE result, a settled LTSM ACTIVE level, and an inactive Adapter
@@ -212,6 +213,9 @@
 //                        construct comments (5-30 lines) with UCIe 1.0
 //                        spec citations across all always/assign/instantiation
 //                        blocks.
+//   v0.0.29 2026-10-09  Documentation compliance pass: remove obsolete implementation-phase
+//                        references outside revision history, correct stale stall driver comment,
+//                        add per-port inline comments, and split multi-signal declarations.
 `ifndef LogicalPhy_SV
 `define LogicalPhy_SV
 `include "ucie_pkg.sv"
@@ -223,69 +227,69 @@ module logical_phy #(
   parameter int unsigned NLANES   = NLANES_MAX,
   parameter bit          FAST_SIM = 1'b1
 ) (
-  input  logic        lclk,
-  input  logic        lreset_n,
-  input  logic        mbclk,        // 2 GHz forwarded clock fCK (Req.2)
-  input  logic        sbclk,
-  input  logic        sbreset_n,
-  input logic        adapter_start_link_train,
-  input  rdi_req_t   rdi_lp_state_req,
-  input  logic        rdi_lp_stallack,
-  input  logic        rdi_lp_linkerror = 1'b0,
-  output rdi_sts_t    rdi_pl_state_sts,
-  output logic        rdi_pl_inband_pres,
-  output logic        rdi_pl_linkerror,
-  output logic        rdi_pl_phyinrecenter,
-  output logic        rdi_pl_cerror,
-  output logic        rdi_pl_nferror,
-  output logic        rdi_pl_trainerror,
-  input  logic        rdi_lp_irdy,
-  input  logic        rdi_lp_valid,
-  input  logic [DATA_W-1:0] rdi_lp_data,
-  output logic        rdi_pl_trdy,
-  output logic        rdi_pl_valid,
-  output logic [DATA_W-1:0] rdi_pl_data,
-  output logic [2:0]  rdi_pl_lnk_cfg,
-  output logic [2:0]  rdi_pl_speedmode,
-  output logic        rdi_pl_stallreq,
-  output logic        clear_start_link_train,
-  input  logic        adapter_active_req,
+  input  logic        lclk,                     // Main link clock (500 MHz)
+  input  logic        lreset_n,                 // Active-low asynchronous lclk-domain reset
+  input  logic        mbclk,                    // 2 GHz forwarded clock fCK (Req.2)
+  input  logic        sbclk,                    // Sideband clock (800 MHz)
+  input  logic        sbreset_n,                // Active-low sideband reset
+  input  logic        adapter_start_link_train, // Start link training pulse from Adapter CSR
+  input  rdi_req_t    rdi_lp_state_req,         // RDI state request from Adapter
+  input  logic        rdi_lp_stallack,          // RDI stall acknowledge from Adapter
+  input  logic        rdi_lp_linkerror = 1'b0,  // RDI link error request from Adapter
+  output rdi_sts_t    rdi_pl_state_sts,         // RDI state status to Adapter
+  output logic        rdi_pl_inband_pres,       // In-band presence indication to Adapter
+  output logic        rdi_pl_linkerror,         // Link error status to Adapter
+  output logic        rdi_pl_phyinrecenter,     // PHY in retrain indication to Adapter
+  output logic        rdi_pl_cerror,            // Correctable error indication to Adapter
+  output logic        rdi_pl_nferror,           // Non-fatal error indication to Adapter
+  output logic        rdi_pl_trainerror,        // Training error indication to Adapter
+  input  logic        rdi_lp_irdy,              // RDI initiator ready for TX data
+  input  logic        rdi_lp_valid,             // RDI valid qualifier for TX data
+  input  logic [DATA_W-1:0] rdi_lp_data,        // RDI TX data bus from Adapter
+  output logic        rdi_pl_trdy,              // RDI target ready for TX data
+  output logic        rdi_pl_valid,             // RDI valid qualifier for RX data
+  output logic [DATA_W-1:0] rdi_pl_data,        // RDI RX data bus to Adapter
+  output logic [2:0]  rdi_pl_lnk_cfg,           // RDI link width status (x16)
+  output logic [2:0]  rdi_pl_speedmode,         // RDI link speed mode status (4 GT/s)
+  output logic        rdi_pl_stallreq,          // RDI stall request to Adapter
+  output logic        clear_start_link_train,   // Clear start link train command to CSR
+  input  logic        adapter_active_req,       // Adapter Active request (compatibility tie-off)
   // Public scalar physical sideband interface (UCIe 1.0 Section 4.1.5 and 5.13)
-  output logic        sb_tx_clk,
-  output logic        sb_tx_data,
-  input  logic        sb_rx_clk,
-  input  logic        sb_rx_data,
+  output logic        sb_tx_clk,                // Physical sideband TX clock strobe
+  output logic        sb_tx_data,               // Physical sideband TX serial data
+  input  logic        sb_rx_clk,                // Physical sideband RX clock strobe
+  input  logic        sb_rx_data,               // Physical sideband RX serial data
 
   // Private Adapter sideband packet client interface (UCIe 1.0 Section 6.1)
-  input  logic        adapter_sb_tx_valid,
-  output logic        adapter_sb_tx_ready,
-  input  sb_packet_t  adapter_sb_tx_packet,
-  output logic        adapter_sb_rx_valid,
-  input  logic        adapter_sb_rx_ready,
-  output sb_packet_t  adapter_sb_rx_packet,
-  output logic        adapter_sb_rx_cp_error,
-  output logic        adapter_sb_rx_dp_error,
-  output logic        adapter_sb_rx_format_error,
+  input  logic        adapter_sb_tx_valid,      // Adapter sideband packet TX request
+  output logic        adapter_sb_tx_ready,      // Adapter sideband packet TX grant
+  input  sb_packet_t  adapter_sb_tx_packet,     // Adapter sideband packet to transmit
+  output logic        adapter_sb_rx_valid,      // Adapter sideband received packet valid
+  input  logic        adapter_sb_rx_ready,      // Adapter sideband receive grant
+  output sb_packet_t  adapter_sb_rx_packet,     // Adapter sideband received packet data
+  output logic        adapter_sb_rx_cp_error,   // Adapter sideband header parity error
+  output logic        adapter_sb_rx_dp_error,   // Adapter sideband data parity error
+  output logic        adapter_sb_rx_format_error, // Adapter sideband packet format error
 
   // Separate PHY CSR Access Channel (from Adapter, Sections 6.1, 7.5)
-  input  logic        phy_csr_wr = 1'b0,
-  input  logic        phy_csr_rd = 1'b0,
-  input  logic [26:0] phy_csr_addr = 27'h0,
-  input  logic [63:0] phy_csr_wdata = 64'h0,
-  input  logic [7:0]  phy_csr_be = 8'h0,
-  output logic [63:0] phy_csr_rdata,
-  output logic        phy_csr_rdata_vld,
+  input  logic        phy_csr_wr = 1'b0,        // PHY CSR write strobe
+  input  logic        phy_csr_rd = 1'b0,        // PHY CSR read strobe
+  input  logic [26:0] phy_csr_addr = 27'h0,     // PHY CSR register byte address
+  input  logic [63:0] phy_csr_wdata = 64'h0,    // PHY CSR write data word
+  input  logic [7:0]  phy_csr_be = 8'h0,        // PHY CSR byte enable mask
+  output logic [63:0] phy_csr_rdata,            // PHY CSR read data word
+  output logic        phy_csr_rdata_vld,        // PHY CSR read data valid strobe
   // -------------------------------------------------- main band to partner
-  output logic [NLANES-1:0] mb_tx_data,
-  output logic        mb_tx_valid,  // main band framing valid (Req.2)
-  input  logic [NLANES-1:0] mb_rx_data,
-  input  logic        mb_rx_valid,  // main band framing valid (Req.2)
-  input  logic [NC-1:0]   lp_cfg,
-  input  logic            lp_cfg_vld,
-  input  logic            lp_cfg_crd,
-  output logic [NC-1:0]   pl_cfg,
-  output logic            pl_cfg_vld,
-  output logic            pl_cfg_crd
+  output logic [NLANES-1:0] mb_tx_data,         // Forwarded main band TX data pins
+  output logic        mb_tx_valid,              // Main band TX framing valid qualifier
+  input  logic [NLANES-1:0] mb_rx_data,         // Received main band RX data pins
+  input  logic        mb_rx_valid,              // Main band RX framing valid qualifier
+  input  logic [NC-1:0]   lp_cfg,               // FDI configuration credits (tie-off)
+  input  logic            lp_cfg_vld,           // FDI configuration valid (tie-off)
+  input  logic            lp_cfg_crd,           // FDI configuration credit return (tie-off)
+  output logic [NC-1:0]   pl_cfg,               // FDI configuration status (tie-off)
+  output logic            pl_cfg_vld,           // FDI configuration status valid (tie-off)
+  output logic            pl_cfg_crd            // FDI configuration credit grant (tie-off)
 );
   import ucie_pkg::*;
 
@@ -294,12 +298,12 @@ module logical_phy #(
   logic [NBYTES-1:0][7:0] tx_bytes;
   logic [NLANES-1:0][7:0] lane_bytes;
 
-  // ------------------------------------------- Active data path (Phase E)
+  // ------------------------------------------- Active data path
   // Private control of the gated Active data path and of the two independent
   // per-byte scrambler arrays. The construct blocks at the Active data path
   // section below own the behavior: these lines only fix the names.
   // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, 4.4.1, 8.1.6, and 8.3.1;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Section 8.1.6 Active-gated datapath.
   logic        ltsm_active_entry_q;      // Active Entry result, previous lclk
   logic        active_entry_seed_pulse;  // one-lclk scrambler seed strobe
   logic [7:0]  ltsm_state_q;             // LTSM state, previous lclk
@@ -316,12 +320,12 @@ module logical_phy #(
   logic [DATA_W-1:0] tx_user_word;       // scrambled 128-bit TX word
   logic [DATA_W-1:0] rx_user_word;       // descrambled 128-bit RX word
 
-  // --------------------------------------- mainband framing fault (Phase E)
+  // --------------------------------------- mainband framing fault
   // The RX gearbox owns detection. This module owns the clock-domain crossing
   // and the private event shape for the LTSM. The event path is re-armed per
   // epoch: see the framing-fault section at the Active data path.
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Section 4.1.2 mainband framing fault containment.
   logic        rx_framing_fault;         // rx_gearbox private fault (mbclk)
   logic        rx_framing_fault_meta_q;  // lclk synchronizer stage 1
   logic        rx_framing_fault_sync_q;  // lclk synchronizer stage 2
@@ -335,7 +339,7 @@ module logical_phy #(
   // Declared with the Active data path because the scramble stage reads the
   // RX word and drives the TX word before the gearbox instantiations appear.
   // Spec ref: UCIe 1.0 Sections 4.1.1 and 4.1.2;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Section 4.1.2 mainband gearbox word interface.
   logic [DATA_W-1:0] tx_gearbox_word;    // word presented to the TX gearbox
   logic              tx_gearbox_valid;   // framing valid for that word
   logic [DATA_W-1:0] rx_gearbox_word;    // word reassembled by the RX gearbox
@@ -494,7 +498,8 @@ module logical_phy #(
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
   logic        local_active_req;
-  logic        rdi_stall_req_q, rdi_stall_req_d;
+  logic        rdi_stall_req_q;
+  logic        rdi_stall_req_d;
   logic        rdi_stall_ack;
   logic        rdi_stall_complete;
 
@@ -1226,7 +1231,7 @@ module logical_phy #(
   // Samples the combined top-level, Adapter CSR, and PHY CSR Start level so
   // the LTSM receives one event for the aggregate low-to-high transition.
   // Held levels do not create a recovery trigger after RESET. The RDI request
-  // levels select the Active, LinkReset, and Disabled Phase C exchanges.
+  // levels select the Active, LinkReset, and Disabled LinkMgmt.RDI exchanges.
   //
   // Spec ref: UCIe 1.0 Sections 8.1.6 and 8.3.2.8;
   //           PLAN.md Sections 15.4 and 15.5.
@@ -1248,7 +1253,7 @@ module logical_phy #(
   //
   // These wires translate the combined Start edge and local RDI levels into
   // the LTSM private policy interface. The edge forms enforce fresh triggers.
-  // Adapter CSR Start routing is part of Phase D and does not alter public RDI.
+  // Adapter CSR Start routing is internal to logical_phy and does not alter public RDI.
   //
   // Spec ref: UCIe 1.0 Sections 8.1.6 and 8.3.2.8;
   //           PLAN.md Sections 15.4, 15.5, and 15.9.
@@ -1281,7 +1286,7 @@ module logical_phy #(
   // closes the Active user-data gate on the transition start.
   //
   // Spec ref: UCIe 1.0 Sections 8.1.6, 8.3.2.8, 4.5.3, and 4.5.3.8;
-  //           PLAN.md Sections 15.4, 15.5, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 8.1.6, 8.3.2.8, 4.5.3, and 4.5.3.8 Active entry policy.
   ltsm #(.NLANES(NLANES)) u_ltsm (
     .lclk            (lclk),
     .lreset_n        (lreset_n),
@@ -1453,7 +1458,7 @@ module logical_phy #(
   //     status output directly, so the Adapter observes the published state.
   //
   // Spec ref: UCIe 1.0 Sections 8.1.5, 8.1.6, and 8.3.1;
-  //           PLAN.md Sections 15.5 and 15.9 Phase D.
+  //           UCIe 1.0 Sections 8.1.5, 8.1.6, and 8.3.1 RDI state machine.
   // ---------------------------------------------------------------------------
   rdi_state_machine u_rdi_sm (
     .lclk            (lclk),
@@ -1631,7 +1636,7 @@ module logical_phy #(
   // always_ff: RDI Stall Request Registered Driver
   //
   // Flops the RDI pl_stallreq signal onto the interface per Section 8.3.1.
-  // Kept deasserted in this configuration.
+  // Registers the four-phase stall request driver driven by rdi_stall_req_d.
   //
   // Spec ref: UCIe 1.0 Specification, Section 8.3.1 - Stall Handshake.
   // ---------------------------------------------------------------------------
@@ -1742,7 +1747,7 @@ module logical_phy #(
   assign pl_cfg_crd = 1'b0;
 
   // ===========================================================================
-  // Active Data Path and Private Framing Fault  (PLAN.md 15.6, 15.9 Phase E)
+  // Active Data Path and Private Framing Fault  (Active-gated scrambler TX/RX path)
   // ===========================================================================
   // User data may reach the main band only while the link is fully up: the
   // LTSM completed Active Entry, the RDI state machine published ACTIVE, the
@@ -1760,7 +1765,7 @@ module logical_phy #(
   // a fresh entry.
   //
   // Spec ref: UCIe 1.0 Sections 4.5.3.6 and 8.1.6;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.5.3.6 and 8.1.6 Active entry tracking.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -1781,7 +1786,7 @@ module logical_phy #(
   // path.
   //
   // Spec ref: UCIe 1.0 Sections 4.4.1 and 8.1.6;
-  //           PLAN.md Sections 6.4, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.4.1 and 8.1.6 scrambler seed strobe.
   // ---------------------------------------------------------------------------
   assign active_entry_seed_pulse = ltsm_active_entry_done &&
                                    !ltsm_active_entry_q;
@@ -1793,7 +1798,7 @@ module logical_phy #(
   // opens only after an Active transition has settled and closes immediately
   // on any transition out of ACTIVE.
   //
-  // Spec ref: UCIe 1.0 Section 4.5.3.6; PLAN.md Sections 15.6 and 15.9 Phase E.
+  // Spec ref: UCIe 1.0 Sections 4.5.3.6 and 8.1.6 Active state stability check.
   // ---------------------------------------------------------------------------
   assign ltsm_active_state_stable = (ltsm_state == LT_ACTIVE) &&
                                     (ltsm_state_q == LT_ACTIVE);
@@ -1814,7 +1819,7 @@ module logical_phy #(
   // flowing into an aborted epoch for the whole exchange.
   //
   // Spec ref: UCIe 1.0 Sections 4.5.3.6, 8.1.6, and 8.3.1;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.5.3.6, 8.1.6, and 8.3.1 Active user data enable.
   // ---------------------------------------------------------------------------
   assign user_data_enable = ltsm_active_entry_done &&
                             local_active_req &&
@@ -1848,7 +1853,7 @@ module logical_phy #(
   // after the next Active Entry.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
-  //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2 and 4.4.1 Active TX transfer qualification.
   // ---------------------------------------------------------------------------
   // ---------------------------------------------------------------------------
   // assign: tx_user_transfer - Transmit Mainband Active Transfer Qualifier
@@ -1883,7 +1888,7 @@ module logical_phy #(
   // scrambler counts.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
-  //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2 and 4.4.1 TX/RX transfer valid pipeline.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -1905,7 +1910,7 @@ module logical_phy #(
   // qualifiers synchronously when the Active-data gate closes.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.4.1;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2 and 4.4.1 synchronous gate-close flush.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -1933,7 +1938,7 @@ module logical_phy #(
   // epoch.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2, 4.4.1, and 8.1.6;
-  //           PLAN.md Sections 6.2, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2, 4.4.1, and 8.1.6 gated user valid.
   // ---------------------------------------------------------------------------
   // ---------------------------------------------------------------------------
   // assign: tx_user_valid - Gated Transmit User Data Valid Driver
@@ -1964,7 +1969,7 @@ module logical_phy #(
   // while their enable is low, and advance only on an accepted valid transfer.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.1 and 4.4.1;
-  //           PLAN.md Sections 6.4, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.1 and 4.4.1 per-byte scrambling.
   // ---------------------------------------------------------------------------
   genvar b;
   generate
@@ -2020,7 +2025,7 @@ module logical_phy #(
   // into the policy clock domain, so the LTSM never samples an mbclk
   // transition. The second stage is the safe lclk-domain fault level.
   //
-  // Spec ref: UCIe 1.0 Section 4.1.2; PLAN.md Sections 15.6 and 15.9 Phase E.
+  // Spec ref: UCIe 1.0 Section 4.1.2; framing fault CDC synchronizer.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -2040,7 +2045,7 @@ module logical_phy #(
   // keeping the LTSM fatal policy asserted across recovery.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2 and 4.5.3.8 framing fault edge detection.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) rx_framing_fault_prev_q <= 1'b0;
@@ -2055,7 +2060,7 @@ module logical_phy #(
   // the recovered link when its gearbox bit remains high.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2 and 4.5.3.8;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2 and 4.5.3.8 framing fault rise detection.
   // ---------------------------------------------------------------------------
   assign rx_framing_fault_rise = rx_framing_fault_sync_q &&
                                  !rx_framing_fault_prev_q;
@@ -2068,7 +2073,7 @@ module logical_phy #(
   // public protocol or a second recovery state machine.
   //
   // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8;
-  //           PLAN.md Sections 15.4, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8 fatal policy arming.
   // ---------------------------------------------------------------------------
   assign ltsm_fatal_policy_armed = (ltsm_state != LT_RESET) &&
                                     (ltsm_state != LT_SBINIT);
@@ -2085,7 +2090,7 @@ module logical_phy #(
   // retrigger the recovered link.
   //
   // Spec ref: UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8;
-  //           PLAN.md Sections 15.4, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.5.3.1, 4.5.3.2, and 4.5.3.8 fatal fault hold register.
   // ---------------------------------------------------------------------------
   always_ff @(posedge lclk or negedge lreset_n) begin
     if (!lreset_n) begin
@@ -2106,7 +2111,7 @@ module logical_phy #(
   // existing TRAINERROR Entry and LinkReset policy.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2 link error edge detector.
   // ---------------------------------------------------------------------------
   logic rdi_lp_linkerror_q;
   // ---------------------------------------------------------------------------
@@ -2138,7 +2143,7 @@ module logical_phy #(
   // Also holds rx_framing_fault_pending_q if a fault arrived during RESET.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.2, 4.5.3.8, and 8.3.3.2 fatal framing fault event.
   // ---------------------------------------------------------------------------
   assign ltsm_framing_fault_event = ((rx_framing_fault_rise || codec_rx_overflow_rise || rdi_lp_linkerror_rise) &&
                                      ltsm_fatal_policy_armed) ||
@@ -2167,12 +2172,12 @@ module logical_phy #(
   // every other state drives a zero word with framing low, so no Adapter
   // traffic can reach the main band before the link is fully Active.
   //
-  // The training-pattern branch is unchanged by Phase E: patterns never enter
+  // The training-pattern branch is separate from the Active data path: patterns never enter
   // the data scramblers. The MBINIT/MBTRAIN guard is retained as an explicit
-  // Phase A guarantee even though the Active gate now blocks those states.
+  // MBINIT/MBTRAIN guarantee even though the Active gate now blocks those states.
   //
   // Spec ref: UCIe 1.0, Sections 4.1.2, 4.4.1, 4.5.3.3, 4.5.3.4, and 4.5.3.6;
-  //           PLAN.md Sections 15.2 Phase A, 15.6, and 15.9 Phase E.
+  //           UCIe 1.0, Sections 4.1.2, 4.4.1, 4.5.3.3, 4.5.3.4, and 4.5.3.6.
   // -------------------------------------------------------------------------
   always_comb begin
     if (pat_enable) begin
@@ -2200,7 +2205,7 @@ module logical_phy #(
   // never interleave within a word.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2;
-  //           PLAN.md Sections 15.2 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2 TX gearbox instantiation.
   // ---------------------------------------------------------------------------
   tx_gearbox #(
     .NBYTES(NBYTES),
@@ -2225,7 +2230,7 @@ module logical_phy #(
   // public error output.
   //
   // Spec ref: UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2;
-  //           PLAN.md Sections 15.6 and 15.9 Phase E.
+  //           UCIe 1.0 Sections 4.1.1, 4.1.2, and 5.2 RX gearbox instantiation.
   // ---------------------------------------------------------------------------
   rx_gearbox #(
     .NBYTES(NBYTES),
@@ -2271,7 +2276,7 @@ module logical_phy #(
   //
   // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing; Section 4.4.1 -
   // Scrambling; Section 8.1 - Raw Die-to-Die Interface (RDI);
-  // Table 114 - RDI Signal List. PLAN.md Sections 15.6 and 15.9 Phase E.
+  // Table 114 - RDI Signal List; Section 8.1.4 Handshake rules.
   // ---------------------------------------------------------------------------
   // ---------------------------------------------------------------------------
   // assign: rdi_pl_trdy - RDI Target Ready Handshake Pass-Through

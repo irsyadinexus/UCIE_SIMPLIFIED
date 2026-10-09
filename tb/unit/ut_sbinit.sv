@@ -29,13 +29,15 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-24  -           Add direct SBINIT waveform and event-mailbox checks.
-//   v0.0.2  2026-09-25  -           Connect the Phase D private Adapter Start input with
-//                                    a zero tie-off. Preserve this direct SBINIT proof.
-//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
-//                                    and add per-construct comments.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-24  Add direct SBINIT waveform and event-mailbox checks.
+//   v0.0.2  2026-09-25  Connect the Phase D private Adapter Start input with
+//                       a zero tie-off. Preserve this direct SBINIT proof.
+//   v0.0.3  2026-10-08  Documentation compliance pass: expand header
+//                       and add per-construct comments.
+//   v0.0.4  2026-10-09  Cleanup pass: remove unused table column and add inline
+//                       comment for task input argument.
 // TESTBENCH EXECUTION FLOW
 //   1. Assert lreset_n and sbreset_n, then release both.
 //   2. Enable pattern_run_enable and sbinit_raw_mode to start raw transmission.
@@ -242,7 +244,7 @@ module ut_sbinit;
   // produces a match. A nonnegative index flips exactly one active UI and
   // must produce one atomic mismatch result after the complete low boundary.
   task drive_rx_iteration;
-    input integer flip_ui;
+    input integer flip_ui; // Index of UI to invert (-1 for clean match)
     integer ui;
     logic value;
     begin

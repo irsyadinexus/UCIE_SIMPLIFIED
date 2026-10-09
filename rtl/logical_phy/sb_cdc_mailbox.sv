@@ -47,6 +47,7 @@
 //   v0.0.2  2026-09-23  Req.3: document the common-reset contract.
 //   v0.0.3  2026-10-08  Documentation compliance pass: expand header with ASCII
 //                        CDC architecture diagram and per-construct comment blocks.
+//   v0.0.4  2026-10-09  Documentation compliance pass: add per-port inline comments.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -58,16 +59,16 @@
 module sb_cdc_mailbox #(
   parameter int unsigned WIDTH = 1
 ) (
-  input  logic             src_clk,
-  input  logic             src_reset_n,
-  input  logic [WIDTH-1:0] src_data,
-  input  logic             src_send,
-  output logic             src_busy,
+  input  logic             src_clk,          // Source domain clock
+  input  logic             src_reset_n,      // Source domain active-low reset
+  input  logic [WIDTH-1:0] src_data,         // Source data payload to transfer
+  input  logic             src_send,         // Source send strobe (single cycle)
+  output logic             src_busy,         // Source busy (held high until destination acks)
 
-  input  logic             dst_clk,
-  input  logic             dst_reset_n,
-  output logic [WIDTH-1:0] dst_data,
-  output logic             dst_valid
+  input  logic             dst_clk,          // Destination domain clock
+  input  logic             dst_reset_n,      // Destination domain active-low reset
+  output logic [WIDTH-1:0] dst_data,         // Destination received data payload
+  output logic             dst_valid         // Destination valid pulse (single cycle)
 );
 
   // Source-domain request storage. src_data_q remains unchanged until the

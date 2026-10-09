@@ -96,8 +96,8 @@
 //               (500 MHz). The DUT is combinational, so the clock serves only
 //               as a synchronisation reference for the `repeat (2) @(posedge
 //               lclk)` settling delays.
-//   lreset_n  : Active-low synchronous reset. Asserted (low) at time 0,
-//               deasserted after 5 ns.
+//   lreset_n  : Active-low compatibility reset input unused by the combinational
+//               DUT; asserted (low) at time 0, deasserted after 5 ns.
 //
 // ----------------------------------------------------------------------------
 //
@@ -162,12 +162,13 @@
 // ----------------------------------------------------------------------------
 //
 // REVISION HISTORY
-//   Version   Date          Author          Description
-//   -------   ----------    -----------     ----------------------------------
-//   v0.0.1    2025-XX-XX    —               Initial creation.
-//   v0.0.2    2026-09-23    —               Documentation: expand header, add
-//                                           per-block comments.
-//
+//   Version   Date          Description
+//   -------   ----------    --------------------------------------------------
+//   v0.0.1    2025-XX-XX    Initial creation.
+//   v0.0.2    2026-09-23    Documentation: expand header, add
+//                           per-block comments.
+//   v0.0.3    2026-10-09    Cleanup pass: remove unused table column, add task argument
+//                           inline comments, and split multi-signal declarations.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -176,7 +177,8 @@ import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module ut_mapper;
-  logic        lclk, lreset_n;
+  logic        lclk;
+  logic        lreset_n;
   logic        enable;
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
@@ -231,9 +233,9 @@ module ut_mapper;
   always #1.0 lclk = ~lclk;
 
   task chk_lane;
-    input int        lane;
-    input [7:0]      exp;
-    input [64*8-1:0] label;
+    input int        lane;  // Logical lane index to verify
+    input [7:0]      exp;   // Expected byte data for this lane
+    input [64*8-1:0] label; // Descriptive scenario label string
     begin
       if (data_out[lane] !== exp) begin
         $display("FAIL ut_mapper: %s lane %0d: got %02h want %02h",

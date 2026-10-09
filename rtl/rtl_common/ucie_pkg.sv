@@ -95,30 +95,31 @@
 // --------------------------------------------------------------------------
 // Revision History
 // --------------------------------------------------------------------------
-//   Rev   Date        Author      Description
-//   ----- ----------  ----------  ------------------------------------------
-//   0.0.1 2026-09-22  -           First commit to git.
-//   0.0.2 2026-09-22  -           Re-anchor lclk to 500 MHz, recalibrate timers, and update spec refs.
-//   0.0.3 2026-09-24  -           Add the Section 4.5.3.2 SBINIT waveform,
-//                                timing, message-subcode, and PHY-ID constants.
-//   0.0.4 2026-09-24  -           Phase A: add immutable MBINIT.PARAM
-//                                request and response 64-bit payloads,
-//                                field masks, accepted Vswing range, and
-//                                named role constants.
-//   0.0.5 2026-09-24  -           Correct PARAM fields and payloads to
-//                                Table 56. Remove unrelated capability
-//                                fields and define request/response roles.
-//
-//   0.0.6 2026-09-28  -           Add Table 47 opcodes, Table 48 FDI IDs,
-//                                 Table 49 RDI IDs, UCIe Link IDs, packet-kind
-//                                 and completion-status types, sb_packet_t
-//                                 packed struct, Figure 100-103 encode/decode
-//                                 helpers, CP/DP rules, and structural decode
-//                                 error checking.
-//   0.0.7 2026-10-08  -           Add Section 8.3.2.7 LinkError minimum residency
-//                                 dwell constants (8 ms, C_RESIDENCY) and documentation.
-//   0.0.8 2026-10-08  -           Documentation compliance pass: expand the header and the
-//                                 constant-group comment blocks with UCIe 1.0 citations.
+//   Rev   Date        Description
+//   ----- ----------  ------------------------------------------------------
+//   0.0.1 2026-09-22  First commit to git.
+//   0.0.2 2026-09-22  Re-anchor lclk to 500 MHz, recalibrate timers, and update spec refs.
+//   0.0.3 2026-09-24  Add the Section 4.5.3.2 SBINIT waveform,
+//                     timing, message-subcode, and PHY-ID constants.
+//   0.0.4 2026-09-24  Phase A: add immutable MBINIT.PARAM
+//                     request and response 64-bit payloads,
+//                     field masks, accepted Vswing range, and
+//                     named role constants.
+//   0.0.5 2026-09-24  Correct PARAM fields and payloads to
+//                     Table 56. Remove unrelated capability
+//                     fields and define request/response roles.
+//   0.0.6 2026-09-28  Add Table 47 opcodes, Table 48 FDI IDs,
+//                     Table 49 RDI IDs, UCIe Link IDs, packet-kind
+//                     and completion-status types, sb_packet_t
+//                     packed struct, Figure 100-103 encode/decode
+//                     helpers, CP/DP rules, and structural decode
+//                     error checking.
+//   0.0.7 2026-10-08  Add Section 8.3.2.7 LinkError minimum residency
+//                     dwell constants (8 ms, C_RESIDENCY) and documentation.
+//   0.0.8 2026-10-08  Documentation compliance pass: expand the header and the
+//                     constant-group comment blocks with UCIe 1.0 citations.
+//   0.0.9 2026-10-09  Documentation and hygiene pass: remove Author column
+//                     and add per-port inline comments to all functions and tasks.
 // ============================================================================
 `ifndef UciePkg_SV
 `define UciePkg_SV
@@ -272,7 +273,7 @@ package ucie_pkg;
   // Icarus Verilog (≤ v12) does not support array assignment patterns in
   // localparam declarations, so the look-up is implemented as a function
   // instead of a constant array.
-  function automatic logic [LFSR_W-1:0] lfsr_seed(input int unsigned lane);
+  function automatic logic [LFSR_W-1:0] lfsr_seed(input int unsigned lane /* Lane index */);
     case (lane % 8)
       8'd0: lfsr_seed = 23'h1DBFBC;
       8'd1: lfsr_seed = 23'h0607BB;
@@ -498,7 +499,7 @@ package ucie_pkg;
   // ========================================================================
 
   // sb_packet_kind: maps Table 47 opcode to architectural format category.
-  function automatic sb_packet_kind_t sb_packet_kind(input logic [4:0] opcode);
+  function automatic sb_packet_kind_t sb_packet_kind(input logic [4:0] opcode /* Sideband opcode */);
     case (opcode)
       SB_OP_MEM_READ32,
       SB_OP_MEM_WRITE32,
@@ -519,7 +520,7 @@ package ucie_pkg;
 
   // sb_payload_bytes: returns payload byte count (0, 4, or 8) directly from opcode.
   // Read requests, Cpl-without-data, and Msg-without-data carry 0B payload.
-  function automatic int unsigned sb_payload_bytes(input logic [4:0] opcode);
+  function automatic int unsigned sb_payload_bytes(input logic [4:0] opcode /* Sideband opcode */);
     case (opcode)
       SB_OP_MEM_WRITE32,
       SB_OP_CFG_WRITE32,
@@ -533,7 +534,7 @@ package ucie_pkg;
   endfunction
 
   // sb_opcode_supported: returns 1'b1 for valid Table 47 opcodes; 1'b0 for reserved.
-  function automatic logic sb_opcode_supported(input logic [4:0] opcode);
+  function automatic logic sb_opcode_supported(input logic [4:0] opcode /* Sideband opcode */);
     case (opcode)
       SB_OP_MEM_READ32,
       SB_OP_MEM_WRITE32,
@@ -554,8 +555,8 @@ package ucie_pkg;
 
   // sb_pad_data: pads 32-bit payload upper bits [63:32] to zero; clears 0B payload.
   function automatic logic [63:0] sb_pad_data(
-    input logic [4:0]  opcode,
-    input logic [63:0] raw_data
+    input logic [4:0]  opcode,   // Sideband packet opcode
+    input logic [63:0] raw_data  // Raw unpadded data payload
   );
     case (sb_payload_bytes(opcode))
       4:       sb_pad_data = {32'h0, raw_data[31:0]};
@@ -567,8 +568,8 @@ package ucie_pkg;
   // sb_calc_dp: calculates Data Parity (even parity over payload; 0 if no payload).
   // Spec ref: Table 50 ("If there is no data payload, this bit is set to 0b").
   function automatic logic sb_calc_dp(
-    input logic [4:0]  opcode,
-    input logic [63:0] data
+    input logic [4:0]  opcode,   // Sideband packet opcode
+    input logic [63:0] data      // Data payload word
   );
     case (sb_payload_bytes(opcode))
       4:       sb_calc_dp = ^data[31:0];
@@ -579,22 +580,22 @@ package ucie_pkg;
 
   // sb_calc_cp: calculates Control Parity (even parity of header bits excluding DP).
   // Spec ref: Table 50, Table 52 ("even parity of all the header bits excluding DP").
-  function automatic logic sb_calc_cp(input logic [63:0] header);
+  function automatic logic sb_calc_cp(input logic [63:0] header /* 64-bit sideband header */);
     sb_calc_cp = ^({header[63:32], 1'b0, 1'b0, header[29:0]});
   endfunction
 
   // sb_check_dp_err: validates received DP bit against received payload.
   function automatic logic sb_check_dp_err(
-    input logic [4:0]  opcode,
-    input logic        dp_bit,
-    input logic [63:0] data
+    input logic [4:0]  opcode,   // Sideband packet opcode
+    input logic        dp_bit,   // Received DP parity bit
+    input logic [63:0] data      // Received data payload word
   );
     sb_check_dp_err = (dp_bit !== sb_calc_dp(opcode, data));
   endfunction
 
   // sb_encode_header: packs sb_packet_t into exact 64-bit header per Figures 100-103.
   // Handles 32-bit data padding and CP/DP calculation deterministically.
-  function automatic logic [63:0] sb_encode_header(input sb_packet_t packet);
+  function automatic logic [63:0] sb_encode_header(input sb_packet_t packet /* Semantic sideband packet */);
     logic [63:0] hdr;
 
     hdr = 64'h0;
@@ -655,7 +656,7 @@ package ucie_pkg;
   endfunction
 
   // sb_decode_header: unpacks 64-bit header into sb_packet_t per Figures 100-103.
-  function automatic sb_packet_t sb_decode_header(input logic [63:0] header);
+  function automatic sb_packet_t sb_decode_header(input logic [63:0] header /* 64-bit serialized header */);
     sb_packet_t pkt;
 
     pkt = '0;
@@ -716,14 +717,14 @@ package ucie_pkg;
 
   // sb_decode_header_task: output-argument helper for simulators requiring procedural output ports.
   task automatic sb_decode_header_task(
-    input  logic [63:0] header,
-    output sb_packet_t  packet
+    input  logic [63:0] header,  // 64-bit serialized header
+    output sb_packet_t  packet   // Decoded semantic packet
   );
     packet = sb_decode_header(header);
   endtask
 
   // sb_decode_error: evaluates reserved opcodes, reserved fields, illegal payload, and CP errors.
-  function automatic sb_decode_err_t sb_decode_error(input logic [63:0] header);
+  function automatic sb_decode_err_t sb_decode_error(input logic [63:0] header /* 64-bit serialized header */);
     sb_decode_err_t err;
     logic [4:0] op;
     logic       rsvd_f;
@@ -803,8 +804,8 @@ package ucie_pkg;
 
   // sb_decode_error_task: output-argument helper for decode error check.
   task automatic sb_decode_error_task(
-    input  logic [63:0]     header,
-    output sb_decode_err_t  err
+    input  logic [63:0]     header,  // 64-bit serialized header
+    output sb_decode_err_t  err      // Decoded packet error flags
   );
     err = sb_decode_error(header);
   endtask

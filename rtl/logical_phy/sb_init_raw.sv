@@ -39,24 +39,22 @@
 //
 // REVISION HISTORY
 // --------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ----------------------------------------
-//   v0.0.1  2026-09-24  -           Extract raw waveform primitive from
-//                                    logical_phy. Preserve LTSM policy and
-//                                    logical_phy CDC ownership.
-//   v0.0.2  2026-09-28  -           Migrate to scalar physical pins sb_tx_clk /
-//                                    sb_tx_data and sb_rx_clk / sb_rx_data per
-//                                    UCIe 1.0 Sections 4.1.5, 4.5.3.2, 5.13, and
-//                                    6.1. Add negedge sb_rx_clk sampling front-end
-//                                    for 64-UI alternating data, missing-strobe
-//                                    drift tolerance (>16 sbclk cycles) in sbclk,
-//                                    and 32-UI low gap validation with parked
-//                                    clock/data check.
-//   v0.0.3  2026-10-08  -           Documentation compliance pass: expand header
-//                                    waveform diagram and add comprehensive
-//                                    spec-referenced construct comments.
-//   v0.0.4  2026-10-08  -           Header expansion: add detailed theory of
-//                                    operation and formal revision history table.
+//   v0.0.1  2026-09-24  Extract raw waveform primitive from logical_phy.
+//                        Preserve LTSM policy and logical_phy CDC ownership.
+//   v0.0.2  2026-09-28  Migrate to scalar physical pins sb_tx_clk / sb_tx_data
+//                        and sb_rx_clk / sb_rx_data per UCIe 1.0 Sections
+//                        4.1.5, 4.5.3.2, 5.13, and 6.1. Add negedge sb_rx_clk
+//                        sampling front-end for 64-UI alternating data,
+//                        missing-strobe drift tolerance (>16 sbclk cycles) in
+//                        sbclk, and 32-UI low gap validation with parked
+//                        clock/data check.
+//   v0.0.3  2026-10-08  Documentation compliance pass: expand header waveform
+//                        diagram and add comprehensive spec-referenced construct
+//                        comments.
+//   v0.0.4  2026-10-08  Header expansion: add detailed theory of operation
+//                        and formal revision history table.
+//   v0.0.5  2026-10-09  Documentation compliance pass: normalize revision columns from revision
+//                        history and add per-port inline comments.
 // ============================================================================
 `ifndef SbInitRaw_SV
 `define SbInitRaw_SV
@@ -64,21 +62,21 @@
 
 `timescale 1ns/1ps
 module sb_init_raw (
-  input  logic        sbclk,
-  input  logic        sbreset_n,
-  input  logic        pattern_run_enable,
-  input  logic        sbinit_raw_mode,
-  input  logic        sb_rx_clk,
-  input  logic        sb_rx_data,
-  input  logic        raw_rx_result_busy,
-  output logic        sb_tx_clk,
-  output logic        sb_tx_data,
-  output logic        raw_mode_active,
-  output logic        raw_rx_low_sample,
-  output logic        raw_tx_idle,
-  output logic        raw_tx_iter_done,
-  output logic        raw_rx_iter_vld,
-  output logic        raw_rx_iter_match
+  input  logic        sbclk,              // Sideband clock (800 MHz)
+  input  logic        sbreset_n,          // Active-low sideband reset
+  input  logic        pattern_run_enable, // Enable SBINIT pattern generation
+  input  logic        sbinit_raw_mode,    // Active during SBINIT raw waveform phase
+  input  logic        sb_rx_clk,          // Incoming sideband RX clock strobe
+  input  logic        sb_rx_data,         // Incoming sideband RX serial data
+  input  logic        raw_rx_result_busy, // CDC busy indicator for RX result mailbox
+  output logic        sb_tx_clk,          // Outgoing sideband TX clock strobe
+  output logic        sb_tx_data,         // Outgoing sideband TX serial data
+  output logic        raw_mode_active,    // Status indicating raw SDR mode active
+  output logic        raw_rx_low_sample,  // Sampled RX data during low separation gap
+  output logic        raw_tx_idle,        // TX state machine idle indicator
+  output logic        raw_tx_iter_done,   // Single raw TX pattern iteration complete pulse
+  output logic        raw_rx_iter_vld,    // Single raw RX pattern iteration complete pulse
+  output logic        raw_rx_iter_match   // RX iteration matched expected alternating pattern
 );
   import ucie_pkg::*;
 

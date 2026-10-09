@@ -154,14 +154,16 @@
 //
 // REVISION HISTORY
 // ~~~~~~~~~~~~~~~~
-//   Rev    Date        Author      Description
-//   -----  ----------  ----------  ------------------------------------------
-//   0.0.1  2025-XX-XX  -           Initial creation.
-//   0.0.2  2026-09-23  -           Documentation: expand header, add
-//                                  per-block comments.
-//   0.0.3  2026-09-23  -           Documentation: correct lane-3 LFSR seed
-//                                  citations from Table 47 to Table 20 and
-//                                  use the real Section 4.5 title.
+//   Rev    Date        Description
+//   -----  ----------  ------------------------------------------------------
+//   0.0.1  2025-XX-XX  Initial creation.
+//   0.0.2  2026-09-23  Documentation: expand header, add
+//                      per-block comments.
+//   0.0.3  2026-09-23  Documentation: correct lane-3 LFSR seed
+//                      citations from Table 47 to Table 20 and
+//                      use the real Section 4.5 title.
+//   0.0.4  2026-10-09  Cleanup pass: remove unused table column and split multi-signal
+//                      declarations into individual declarations.
 //
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
@@ -171,12 +173,18 @@ import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module ut_lfsr;
-  logic        lclk, lreset_n;
+  logic        lclk;
+  logic        lreset_n;
   logic [7:0]  data_out;
   logic [22:0] state_obs;
-  logic        lfsr_reset, enable;
+  logic        lfsr_reset;
+  logic        enable;
 
-  logic        tclk, treset_n, tstart, trun, texpired;
+  logic        tclk;
+  logic        treset_n;
+  logic        tstart;
+  logic        trun;
+  logic        texpired;
   int          errors;
   logic [22:0] ref_state;
   logic        ref_bit;

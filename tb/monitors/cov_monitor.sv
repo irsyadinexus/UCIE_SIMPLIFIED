@@ -53,10 +53,10 @@
 //      Spec ref: Section 4.5 - Link Initialization and Training (events),
 //                Section 8.1.5 - RDI State Status Machine (link_active).
 //
-//   5. Phase F functional event counters – Explicit event counters for the
-//      Phase F coverage model covering:
+//   5. Functional event counters – Explicit event counters for the
+//      functional coverage model covering:
 //        - MBINIT.PARAM request and response roles (Section 4.5.3.3.1, Table 56)
-//        - Phase B training and Phase C management transaction classes
+//        - Training and management transaction classes
 //          (Section 4.5.3, Table 53, Table 56; PLAN.md Section 15.3)
 //        - Transmit priority arbitration (Section 6.1.3; PLAN.md Section 15.3)
 //        - Fatal causes and triggers (Section 4.5.3.8; PLAN.md Section 15.4)
@@ -120,9 +120,9 @@
 //     raw_mode_adv              – Raw Mode bit set in advertised caps.
 //     crc_off_adv               – No-CRC advertisement observed.
 //
-//   Phase F event observables:
+//   Functional event observables:
 //     param_roles               – PARAM request and response roles exercised.
-//     transaction_classes       – Phase B training and Phase C management seen.
+//     transaction_classes       – Training and management transaction classes seen.
 //     arbitration               – Transmit priority arbitration observed.
 //     fatal_causes              – Fatal error trigger event observed.
 //     trainerror                – TRAINERROR state or exchange observed.
@@ -189,36 +189,39 @@
 // -------------------------------------------------------------------------
 // Revision History
 // -------------------------------------------------------------------------
-//   Rev   Date        Author      Description
-//   ----- ----------  ----------  ------------------------------------------
-//   0.0.1 2025-XX-XX  -           Initial creation.
-//   0.0.2 2026-09-23  -           Documentation: expand header, add
-//                                 per-block comments.
-//   0.0.3 2026-09-23  -           Documentation: correct citations. 6.1.1 is
-//                                 Packet Types, so the msgcode reference no
-//                                 longer claims a "Message Codes" section.
-//                                 8.2.3.2 is the pl_clk_req/lp_clk_ack
-//                                 handshake, not the RDI Active state, so the
-//                                 link_active events now cite 8.1.5 (RDI
-//                                 State Status Machine) and 4.5.
-//   0.0.4 2026-09-23  -           Documentation: correct the Section 8.1
-//                                 title to Raw Die-to-Die Interface (RDI).
-//   0.0.5 2026-09-23  -           Req.3: sample mailbox-delivered sideband
-//                                 packet fields and valid strobes on lclk.
-//   0.0.6 2026-09-23  -           Req.3: remove stale sbclk-domain coverage
-//                                 sampling text from the port documentation.
-//   0.0.7 2026-09-24  -           Add per-die SBINIT phase/order and received
-//                                 message-subcode evidence.
-//   0.0.8 2026-09-25  -           Phase F: add explicit event inputs and
-//                                 counters for Phase F contract keys
-//                                 (param_roles, transaction_classes, arbitration,
-//                                 fatal_causes, trainerror, linkreset, disabled,
-//                                 pmnak, active_entry, pre_active_block,
-//                                 one-shot lclk sampling and export all keys
-//                                 to coverage JSON.
+//   Rev   Date        Description
+//   ----- ----------  ------------------------------------------------------
+//   0.0.1 2025-XX-XX  Initial creation.
+//   0.0.2 2026-09-23  Documentation: expand header, add
+//                     per-block comments.
+//   0.0.3 2026-09-23  Documentation: correct citations. 6.1.1 is
+//                     Packet Types, so the msgcode reference no
+//                     longer claims a "Message Codes" section.
+//                     8.2.3.2 is the pl_clk_req/lp_clk_ack
+//                     handshake, not the RDI Active state, so the
+//                     link_active events now cite 8.1.5 (RDI
+//                     State Status Machine) and 4.5.
+//   0.0.4 2026-09-23  Documentation: correct the Section 8.1
+//                     title to Raw Die-to-Die Interface (RDI).
+//   0.0.5 2026-09-23  Req.3: sample mailbox-delivered sideband
+//                     packet fields and valid strobes on lclk.
+//   0.0.6 2026-09-23  Req.3: remove stale sbclk-domain coverage
+//                     sampling text from the port documentation.
+//   0.0.7 2026-09-24  Add per-die SBINIT phase/order and received
+//                     message-subcode evidence.
+//   0.0.8 2026-09-25  Phase F: add explicit event inputs and
+//                     counters for Phase F contract keys
+//                     (param_roles, transaction_classes, arbitration,
+//                     fatal_causes, trainerror, linkreset, disabled,
+//                     pmnak, active_entry, pre_active_block,
+//                     one-shot lclk sampling and export all keys
+//                     to coverage JSON.
 //   0.0.9 2026-09-28  Keep packet coverage on coherent lclk mailbox fields
-//                                 while the public sideband crossing uses
-//                                 scalar clock/data pins.
+//                     while the public sideband crossing uses
+//                     scalar clock/data pins.
+//   0.0.10 2026-10-09  Remove unused table column, update coverage descriptions to
+//                     remove obsolete implementation-phase references, and
+//                     add per-port inline comments.
 // ============================================================================
 `ifndef CovMonitor_SV
 `define CovMonitor_SV
@@ -229,29 +232,29 @@ import ucie_pkg::*;
 module cov_monitor #(
   parameter int unsigned NSTATES = LT_NUM_STATES
 ) (
-  input logic        lclk,
-  input logic        lreset_n,
-  input logic        sbclk,
+  input logic        lclk,               // Primary link clock (500 MHz)
+  input logic        lreset_n,           // Active-low synchronous link reset
+  input logic        sbclk,              // Sideband clock (800 MHz)
 
   // Die 0 observables
-  input logic [7:0]  ltsm_state_0,
-  input logic [1:0]  sbinit_phase_0,
-  input logic        link_active_0,
-  input logic [4:0]  sb_rx_opcode_0,
-  input logic [7:0]  sb_rx_msgcode_0,
-  input logic [7:0]  sb_rx_msgsubcode_0,
-  input logic        sb_rx_pkt_vld_0,
-  input logic [3:0]  rdi_state_sts_0,
+  input logic [7:0]  ltsm_state_0,       // Die 0 LTSM state observation
+  input logic [1:0]  sbinit_phase_0,     // Die 0 SBINIT sub-phase observation
+  input logic        link_active_0,      // Die 0 link active status
+  input logic [4:0]  sb_rx_opcode_0,     // Die 0 sideband receive opcode
+  input logic [7:0]  sb_rx_msgcode_0,    // Die 0 sideband receive message code
+  input logic [7:0]  sb_rx_msgsubcode_0, // Die 0 sideband receive message subcode
+  input logic        sb_rx_pkt_vld_0,    // Die 0 sideband receive packet valid
+  input logic [3:0]  rdi_state_sts_0,    // Die 0 RDI state status
 
   // Die 1 observables
-  input logic [7:0]  ltsm_state_1,
-  input logic [1:0]  sbinit_phase_1,
-  input logic        link_active_1,
-  input logic [4:0]  sb_rx_opcode_1,
-  input logic [7:0]  sb_rx_msgcode_1,
-  input logic [7:0]  sb_rx_msgsubcode_1,
-  input logic        sb_rx_pkt_vld_1,
-  input logic [3:0]  rdi_state_sts_1,
+  input logic [7:0]  ltsm_state_1,       // Die 1 LTSM state observation
+  input logic [1:0]  sbinit_phase_1,     // Die 1 SBINIT sub-phase observation
+  input logic        link_active_1,      // Die 1 link active status
+  input logic [4:0]  sb_rx_opcode_1,     // Die 1 sideband receive opcode
+  input logic [7:0]  sb_rx_msgcode_1,    // Die 1 sideband receive message code
+  input logic [7:0]  sb_rx_msgsubcode_1, // Die 1 sideband receive message subcode
+  input logic        sb_rx_pkt_vld_1,    // Die 1 sideband receive packet valid
+  input logic [3:0]  rdi_state_sts_1,    // Die 1 RDI state status
 
   // Directional data observables
   input logic        xfer_done_0,   // streaming block completed on die 0
@@ -262,9 +265,9 @@ module cov_monitor #(
   input logic        raw_mode_adv,  // Raw_Mode bit seen in advertised caps
   input logic        crc_off_adv,   // no-CRC advertisement seen
 
-  // Phase F event observables (spec 4.4.1, 4.5.3, 6.1.3, 8.1.5, 8.1.6; PLAN.md 15.7, 15.9)
+  // Functional event observables (spec 4.4.1, 4.5.3, 6.1.3, 8.1.5, 8.1.6; PLAN.md 15.7, 15.9)
   input logic        param_roles,         // PARAM request and response roles seen
-  input logic        transaction_classes, // Phase B and Phase C transaction classes seen
+  input logic        transaction_classes, // Training and management transaction classes seen
   input logic        arbitration,         // Response-over-request arbitration seen
   input logic        fatal_causes,        // Fatal error trigger event seen
   input logic        trainerror,          // TRAINERROR state/exchange seen
@@ -498,10 +501,10 @@ module cov_monitor #(
   end
 
 // -----------------------------------------------------------------------
-// Phase F Functional Event Coverage Sampling
+// Functional Event Coverage Sampling
 // -----------------------------------------------------------------------
 // This always block runs on the positive edge of lclk (500 MHz) and samples
-// the Phase F event observables using robust one-shot (rising-edge) behavior.
+// the functional event observables using robust one-shot (rising-edge) behavior.
 // Edge detection prevents level-sensitive signals (such as sticky recovery
 // evidence or persistent holds) from incrementing continuously on every
 // clock cycle, ensuring each verified functional event registers as a
@@ -511,7 +514,7 @@ module cov_monitor #(
 //           Section 4.5.3.3.1 (MBINIT.PARAM), Section 4.5.3.8 (TRAINERROR),
 //           Section 6.1.3 (Arbitration), Section 8.1.5 (RDI States & PMNAK),
 //           Section 8.1.6 (Active Entry & Gating);
-//           PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9 Phase F.
+//           PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9 coverage integration.
 // -----------------------------------------------------------------------
   always @(posedge lclk) begin
     param_roles_q         <= param_roles;
@@ -556,7 +559,7 @@ module cov_monitor #(
   // ------------------------------------------------------- JSON export
   // Written once, when the testbench decides to stop.
   task export_json;
-    input [1024*8-1:0] path;
+    input [1024*8-1:0] path; // File system path to destination JSON file
     integer fd;
     int i;
     begin

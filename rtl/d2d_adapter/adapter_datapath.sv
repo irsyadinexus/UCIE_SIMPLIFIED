@@ -89,6 +89,9 @@
 //   v0.0.8  2026-10-08  Documentation compliance pass: expand construct comment
 //                        blocks for elastic registers, multiplexing, and lint
 //                        suppression assigns with spec subsection references.
+//   v0.0.9  2026-10-09  Documentation and hygiene pass: remove Author column,
+//                        add per-port inline comments, and split multi-signal
+//                        declarations into one declaration per line.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -100,30 +103,30 @@
 module adapter_datapath #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES
 ) (
-  input  logic                  lclk,
-  input  logic                  lreset_n,
+  input  logic                  lclk,                  // 500 MHz main link clock
+  input  logic                  lreset_n,              // Active-low asynchronous reset
 
   // Protocol Layer side (FDI)
-  input  logic                  lp_irdy,
-  input  logic                  lp_valid,
-  input  logic [NBYTES*8-1:0]   lp_data,
-  input  logic [7:0]            lp_stream,
-  input  logic                  lp_stallack,
-  input  logic                  lp_rx_active_sts,
-  output logic                  pl_trdy,
-  output logic                  pl_valid,
-  output logic [NBYTES*8-1:0]   pl_data,
-  output logic [7:0]            pl_stream,
+  input  logic                  lp_irdy,               // Protocol Layer initiator ready (FDI)
+  input  logic                  lp_valid,              // Protocol Layer transmit valid (FDI)
+  input  logic [NBYTES*8-1:0]   lp_data,               // Protocol Layer transmit data bus (FDI)
+  input  logic [7:0]            lp_stream,             // Protocol Layer transmit stream ID (FDI)
+  input  logic                  lp_stallack,           // Protocol Layer stall acknowledge (FDI)
+  input  logic                  lp_rx_active_sts,      // Protocol Layer RX active status (FDI)
+  output logic                  pl_trdy,               // Adapter target ready to Protocol Layer (FDI)
+  output logic                  pl_valid,              // Adapter receive valid to Protocol Layer (FDI)
+  output logic [NBYTES*8-1:0]   pl_data,               // Adapter receive data bus to Protocol Layer (FDI)
+  output logic [7:0]            pl_stream,             // Adapter receive stream ID to Protocol Layer (FDI)
 
   // Physical Layer side (RDI)
-  output logic                  rdi_lp_irdy,
-  output logic                  rdi_lp_valid,
-  output logic [NBYTES*8-1:0]   rdi_lp_data,
-  input  logic                  rdi_pl_trdy,
-  input  logic                  rdi_pl_valid,
-  input  logic [NBYTES*8-1:0]   rdi_pl_data,
-  input  logic                  rdi_lnk_is_x8,
-  input  logic                  stall_active
+  output logic                  rdi_lp_irdy,           // Adapter initiator ready to Physical Layer (RDI)
+  output logic                  rdi_lp_valid,          // Adapter transmit valid to Physical Layer (RDI)
+  output logic [NBYTES*8-1:0]   rdi_lp_data,           // Adapter transmit data bus to Physical Layer (RDI)
+  input  logic                  rdi_pl_trdy,           // Physical Layer target ready (RDI)
+  input  logic                  rdi_pl_valid,          // Physical Layer receive valid (RDI)
+  input  logic [NBYTES*8-1:0]   rdi_pl_data,           // Physical Layer receive data bus (RDI)
+  input  logic                  rdi_lnk_is_x8,         // Degraded x8 width configuration indicator
+  input  logic                  stall_active           // Active stall gating indicator from adapter wrapper
 );
 
   import ucie_pkg::*;

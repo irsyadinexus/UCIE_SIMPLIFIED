@@ -42,28 +42,28 @@
 // --------------------------------------------------------------------------
 // Revision History
 // --------------------------------------------------------------------------
-//   Rev   Date        Author      Description
-//   ----- ----------  ----------  ------------------------------------------
-//   0.0.1 2025-XX-XX  -           Initial PoC sideband codec.
-//   0.0.2 2026-09-23  -           Documentation pass on parity rules.
-//   0.0.3 2026-09-23  -           Document sbclk-only operation.
-//   0.0.4 2026-09-24  -           Phase A: validate DATA64 DP parity for both values.
-//   0.0.5 2026-09-28  -           Rewrite as self-contained scalar physical sideband
-//                                 codec. Added scalar sb_tx_clk / sb_tx_data and
-//                                 sb_rx_clk / sb_rx_data physical pins with SDR
-//                                 strobe clocking per UCIe 1.0 Section 4.1.5 and 5.13.
-//                                 Adopted sb_packet_t handshake (tx_valid/tx_ready,
-//                                 rx_valid/rx_ready) with a 2-entry packet-event
-//                                 queue, deterministic 64 UI packet / 32 UI low
-//                                 gap timing, strict header/payload gap validation,
-//                                 sb_rx_clk sampling, opcode-driven payload handling,
-//                                 detection of early strobe loss, unexpected gap
-//                                 strobes, reserved opcodes/fields, CP/DP parity,
-//                                 upper 32-bit payload validation, and sticky overflow.
-//   0.0.6 2026-10-08  -           Documentation compliance pass: add detailed
-//                                 construct comments (5-30 lines) with UCIe 1.0
-//                                 spec citations across all always/assign/
-//                                 instantiation blocks.
+//   v0.0.1  2025-XX-XX  Initial PoC sideband codec.
+//   v0.0.2  2026-09-23  Documentation pass on parity rules.
+//   v0.0.3  2026-09-23  Document sbclk-only operation.
+//   v0.0.4  2026-09-24  Phase A: validate DATA64 DP parity for both values.
+//   v0.0.5  2026-09-28  Rewrite as self-contained scalar physical sideband
+//                        codec. Added scalar sb_tx_clk / sb_tx_data and
+//                        sb_rx_clk / sb_rx_data physical pins with SDR
+//                        strobe clocking per UCIe 1.0 Section 4.1.5 and 5.13.
+//                        Adopted sb_packet_t handshake (tx_valid/tx_ready,
+//                        rx_valid/rx_ready) with a 2-entry packet-event
+//                        queue, deterministic 64 UI packet / 32 UI low
+//                        gap timing, strict header/payload gap validation,
+//                        sb_rx_clk sampling, opcode-driven payload handling,
+//                        detection of early strobe loss, unexpected gap
+//                        strobes, reserved opcodes/fields, CP/DP parity,
+//                        upper 32-bit payload validation, and sticky overflow.
+//   v0.0.6  2026-10-08  Documentation compliance pass: add detailed
+//                        construct comments (5-30 lines) with UCIe 1.0
+//                        spec citations across all always/assign/
+//                        instantiation blocks.
+//   v0.0.7  2026-10-09  Documentation compliance pass: normalize revision columns from revision
+//                        history and split multi-signal declarations.
 // ============================================================================
 `ifndef SbCodec_SV
 `define SbCodec_SV
@@ -726,10 +726,14 @@ module sb_codec (
   // until acknowledged and popped by rx_ready.
   // Asserts sticky rx_overflow if an incoming event arrives when full.
   // =========================================================================
-  sb_packet_t rx_packet0_q, rx_packet1_q;
-  logic       rx_format0_q, rx_format1_q;
-  logic       rx_cp0_q, rx_cp1_q;
-  logic       rx_dp0_q, rx_dp1_q;
+  sb_packet_t rx_packet0_q;
+  sb_packet_t rx_packet1_q;
+  logic       rx_format0_q;
+  logic       rx_format1_q;
+  logic       rx_cp0_q;
+  logic       rx_cp1_q;
+  logic       rx_dp0_q;
+  logic       rx_dp1_q;
   logic [1:0] rx_q_count_q;
   logic       rx_q_rd_ptr_q;
   logic       rx_q_wr_ptr_q;

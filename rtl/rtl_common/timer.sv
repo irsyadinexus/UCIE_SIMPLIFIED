@@ -66,10 +66,13 @@
 // --------------------------------------------------------------------------
 // Revision History
 // --------------------------------------------------------------------------
-//   Rev   Date        Author      Description
-//   ----- ----------  ----------  ------------------------------------------
-//   0.0.1 2026-09-22  -           First commit to git.
-//   0.0.2 2026-09-22  -           Remove DIV; enforce pure unprescaled true-to-spec cycle counts.
+//   Rev   Date        Description
+//   ----- ----------  ------------------------------------------------------
+//   0.0.1 2026-09-22  First commit to git.
+//   0.0.2 2026-09-22  Remove DIV; enforce pure unprescaled true-to-spec cycle counts.
+//
+//   0.0.3 2026-10-09  Documentation and hygiene pass: remove Author column
+//                     and add per-port inline comments.
 //
 // ============================================================================
 `ifndef UcieTimer_SV
@@ -80,8 +83,8 @@
 module ucie_timer #(
   parameter int unsigned LIMIT_CYCLES = ucie_pkg::C_RESIDENCY  // 8 ms
 ) (
-  input  logic   clk,
-  input  logic   reset_n,
+  input  logic   clk,        // Timer clock (500 MHz lclk)
+  input  logic   reset_n,    // Active-low asynchronous reset
   input  logic   start,      // (re)start the interval
   input  logic   running,    // 1 while the interval is active
   output logic   expired     // 1 in the cycle LIMIT_CYCLES elapses

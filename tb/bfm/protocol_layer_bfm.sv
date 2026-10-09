@@ -97,6 +97,8 @@
 //   v0.0.2  2026-09-23  Documentation: expand header, add per-block comments.
 //   v0.0.3  2026-09-23  Documentation: use the canonical Section 8.3.1 title,
 //                        Stallreq/Ack Mechanism, in both citations.
+//   v0.0.4  2026-10-09  Cleanup pass: document per-port inline comments and
+//                        task argument comments per repository guidelines.
 //
 // ============================================================================
 `ifndef ProtLayerBfm_SV
@@ -108,21 +110,21 @@ import ucie_pkg::*;
 module protocol_layer_bfm #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES
 ) (
-  input  logic                  lclk,
-  input  logic                  lreset_n,
-  input  logic [3:0]            pl_state_sts,
-  output logic                  lp_irdy,
-  output logic                  lp_valid,
-  output logic [NBYTES*8-1:0]   lp_data,
-  output logic [7:0]            lp_stream,
-  input  logic                  pl_trdy,
-  input  logic                  pl_valid,
-  input  logic [NBYTES*8-1:0]   pl_data,
-  input  logic                  pl_stallreq,
-  output logic                  lp_stallack,
-  input  logic                  lp_state_req,
-  input  logic [3:0]            lp_state_req_value,
-  output logic                  done
+  input  logic                  lclk,               // Primary link clock (500 MHz)
+  input  logic                  lreset_n,           // Active-low asynchronous link reset
+  input  logic [3:0]            pl_state_sts,       // Protocol layer state status from adapter
+  output logic                  lp_irdy,            // Link partner initiator ready
+  output logic                  lp_valid,           // Link partner data valid
+  output logic [NBYTES*8-1:0]   lp_data,            // Link partner transmit data
+  output logic [7:0]            lp_stream,          // Link partner stream identifier
+  input  logic                  pl_trdy,            // Protocol layer target ready
+  input  logic                  pl_valid,           // Protocol layer receive valid
+  input  logic [NBYTES*8-1:0]   pl_data,            // Protocol layer receive data
+  input  logic                  pl_stallreq,        // Adapter stall request
+  output logic                  lp_stallack,        // Stall acknowledgement to adapter
+  input  logic                  lp_state_req,       // Link partner state transition request
+  input  logic [3:0]            lp_state_req_value, // Requested link state value
+  output logic                  done                // BFM test sequence completion flag
 );
 
   localparam logic [7:0] STREAM_ID = 8'h04;   // Stack 0, Streaming
@@ -160,8 +162,8 @@ module protocol_layer_bfm #(
   // The task blocks until the UI is accepted, so the caller can treat a
   // completed call as one transferred unit of data.
   task send;
-    input [NBYTES*8-1:0] data;
-    input [7:0]          stream;
+    input logic [NBYTES*8-1:0] data;    // User data word to transmit
+    input logic [7:0]          stream;  // Stream identifier tag
     begin
       @(negedge lclk);
       while (pl_stallreq !== 1'b0) @(negedge lclk);
@@ -192,7 +194,7 @@ module protocol_layer_bfm #(
   // ------------------------------------------------------- expect engine
   // Blocks until one valid UI appears on the receive side, returns its data.
   task expect_ui;
-    output [NBYTES*8-1:0] data;
+    output logic [NBYTES*8-1:0] data;   // Received user data word
     begin
       @(posedge lclk);
       while (!(pl_valid === 1'b1)) @(posedge lclk);

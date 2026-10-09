@@ -191,8 +191,8 @@
 //                 the adapter and the PHY's data-path logic.  Spec 8.1.2.
 //   sbclk      -- 800 MHz sideband clock.  Drives only the sideband codec
 //                 inside the Logical PHY.  Spec 5.13.
-//   lreset_n   -- active-low synchronous reset on lclk.
-//   sbreset_n  -- active-low synchronous reset on sbclk.
+//   lreset_n   -- active-low asynchronous reset for downstream lclk-domain state.
+//   sbreset_n  -- active-low asynchronous reset for downstream sbclk-domain state.
 //
 // ============================================================================
 //
@@ -212,56 +212,49 @@
 //                        REVISION HISTORY
 // ============================================================================
 //
-//   Version   Date          Author          Description
-//   -------   ----------    -----------     ----------------------------------
-//   v0.0.1    2026-09-22    (initial)       First commit to git.  Contains the
-//                                           complete two-block topology with
-//                                           full RDI wiring between the D2D
-//                                           Adapter and the Logical PHY,
-//                                           FDI pin-out toward the protocol
-//                                           layer, and sideband + main-band
-//                                           pin-out toward the partner die.
-//                                           Reduced capability set: single
-//                                           module, single adapter, Streaming
-//                                           Raw Mode, x16 Standard Package,
-//                                           4 GT/s, no retimer, no analog PHY,
-//                                           no CXL/PCIe protocol layer.
-//   v0.0.2    2026-09-22    -               Update lclk documentation to 500 MHz.
-//   v0.0.3    2026-09-23    -               Add 2 GHz mbclk and DDR main-band framing (Req.2).
-//   v0.0.4    2026-09-23    -               Req.2: thread mb_tx_valid /
-//                                           mb_rx_valid framing to both dies.
-//   v0.0.5    2026-09-23    -               Documentation: replace the
-//                                           fabricated "Table 68 - Sideband
-//                                           and Configuration signal list"
-//                                           citation. Table 68 is the UCIe
-//                                           Link DVSEC - Error Notification
-//                                           Control. The configuration
-//                                           sideband signals are now cited to
-//                                           Table 115 and Section 5.13.
-//   v0.0.6    2026-09-25    Phase C: wire the private LTSM Active-entry Start
-//                           clear from logical_phy to the
-//                           Adapter register copy.
-//   v0.0.7    2026-09-25    Phase D: route Adapter Start as a private event
-//                           and remove stale peer-Active feedback.
-//   v0.0.8    2026-09-25    Preserve the public adapter_active_req input
-//                           with a low policy-inert tie-off.
-//   v0.0.9    2026-09-28    Sideband protocol remediation:
-//                           Expose scalar sb_tx_clk/sb_tx_data and
-//                           sb_rx_clk/sb_rx_data (Sections 4.1.5, 5.13).
-//                           Expose public FDI cfg sideband (lp_cfg/pl_cfg)
-//                           and Stage 3 clock/wake/protocol ports
-//                           (Sections 6.1, 7.5, 8.2). Make lp_linkerror
-//                           an input (Section 8.2). Cross-connect typed
-//                           Adapter packet channels and PHY CSR channel
-//                           between u_adapter and u_lphy (Sections 6.1, 7.5, 8.1).
-//   v0.0.10   2026-10-08    UCIe 1.0 Section 8.3.2.7 LinkError remediation:
-//                           Implement unscaled 8 ms LinkError residency dwell,
-//                           sideband LinkError handshake dwell bypass, and direct
-//                           transition to RESET without LinkReset per Figures 111,
-//                           119, and 126.
-//   v0.0.11   2026-10-08    Documentation compliance pass: expand the header and the
-//                           per-construct comment blocks, including every module
-//                           instantiation.
+//   Version   Date        Description
+//   -------   ----------  ----------------------------------------------------
+//   v0.0.1    2026-09-22  First commit to git. Contains the complete two-block
+//                         topology with full RDI wiring between the D2D
+//                         Adapter and the Logical PHY, FDI pin-out toward the
+//                         protocol layer, and sideband + main-band pin-out
+//                         toward the partner die. Reduced capability set:
+//                         single module, single adapter, Streaming Raw Mode,
+//                         x16 Standard Package, 4 GT/s, no retimer, no analog
+//                         PHY, no CXL/PCIe protocol layer.
+//   v0.0.2    2026-09-22  Update lclk documentation to 500 MHz.
+//   v0.0.3    2026-09-23  Add 2 GHz mbclk and DDR main-band framing (Req.2).
+//   v0.0.4    2026-09-23  Req.2: thread mb_tx_valid / mb_rx_valid framing to both dies.
+//   v0.0.5    2026-09-23  Documentation: replace the fabricated "Table 68 - Sideband
+//                         and Configuration signal list" citation. Table 68 is the
+//                         UCIe Link DVSEC - Error Notification Control. The
+//                         configuration sideband signals are now cited to
+//                         Table 115 and Section 5.13.
+//   v0.0.6    2026-09-25  Phase C: wire the private LTSM Active-entry Start
+//                         clear from logical_phy to the Adapter register copy.
+//   v0.0.7    2026-09-25  Phase D: route Adapter Start as a private event
+//                         and remove stale peer-Active feedback.
+//   v0.0.8    2026-09-25  Preserve the public adapter_active_req input
+//                         with a low policy-inert tie-off.
+//   v0.0.9    2026-09-28  Sideband protocol remediation:
+//                         Expose scalar sb_tx_clk/sb_tx_data and
+//                         sb_rx_clk/sb_rx_data (Sections 4.1.5, 5.13).
+//                         Expose public FDI cfg sideband (lp_cfg/pl_cfg)
+//                         and Stage 3 clock/wake/protocol ports
+//                         (Sections 6.1, 7.5, 8.2). Make lp_linkerror
+//                         an input (Section 8.2). Cross-connect typed
+//                         Adapter packet channels and PHY CSR channel
+//                         between u_adapter and u_lphy (Sections 6.1, 7.5, 8.1).
+//   v0.0.10   2026-10-08  UCIe 1.0 Section 8.3.2.7 LinkError remediation:
+//                         Implement unscaled 8 ms LinkError residency dwell,
+//                         sideband LinkError handshake dwell bypass, and direct
+//                         transition to RESET without LinkReset per Figures 111,
+//                         119, and 126.
+//   v0.0.11   2026-10-08  Documentation compliance pass: expand the header and the
+//                         per-construct comment blocks, including every module
+//                         instantiation.
+//   v0.0.12   2026-10-09  Documentation and hygiene pass: remove Author column
+//                         and add per-port inline comments.
 `ifndef UcieMain_SV
 `define UcieMain_SV
 `include "ucie_pkg.sv"
@@ -273,63 +266,63 @@ module ucie_main #(
   parameter int unsigned NC       = ucie_pkg::NC,
   parameter bit          FAST_SIM = 1'b1
 ) (
-  input  logic        lclk,
-  input  logic        lreset_n,
-  input  logic        mbclk,        // 2 GHz forwarded clock fCK (Req.2)
-  input  logic        sbclk,
-  input  logic        sbreset_n,
+  input  logic        lclk,                 // 500 MHz main link clock
+  input  logic        lreset_n,             // Active-low asynchronous reset for downstream lclk-domain state
+  input  logic        mbclk,                // 2 GHz forwarded clock fCK (Req.2)
+  input  logic        sbclk,                // 800 MHz sideband clock
+  input  logic        sbreset_n,            // Active-low sideband reset
   // ---------------------------------------------------------- FDI (Table 115)
-  input  logic        lp_irdy,
-  input  logic        lp_valid,
-  input  logic [DATA_W-1:0] lp_data,
-  input  logic [7:0]  lp_stream,
-  input  logic        lp_stallack,
-  input  logic        lp_rx_active_sts,
-  output logic        pl_trdy,
-  output logic        pl_valid,
-  output logic [DATA_W-1:0] pl_data,
-  output logic [7:0]  pl_stream,
-  output logic        pl_error,
-  output logic        pl_cerror,
-  output logic        pl_nferror,
-  output logic        pl_trainerror,
-  output logic        pl_phyinrecenter,
-  output logic [2:0]  pl_protocol,
-  output logic [3:0]  pl_protocol_flitfmt,
-  output logic        pl_rx_active_req,
-  input  logic [3:0]  lp_state_req,
-  output logic [3:0]  pl_state_sts,
-  output logic        pl_inband_pres,
-  output logic        pl_stallreq,
-  input  logic        lp_linkerror = 1'b0,
+  input  logic        lp_irdy,              // Protocol Layer initiator ready (FDI)
+  input  logic        lp_valid,             // Protocol Layer transmit valid (FDI)
+  input  logic [DATA_W-1:0] lp_data,        // Protocol Layer transmit data bus (FDI)
+  input  logic [7:0]  lp_stream,            // Protocol Layer transmit stream ID (FDI)
+  input  logic        lp_stallack,          // Protocol Layer stall acknowledge (FDI)
+  input  logic        lp_rx_active_sts,     // Protocol Layer RX active status indication (FDI)
+  output logic        pl_trdy,              // Adapter target ready to Protocol Layer (FDI)
+  output logic        pl_valid,             // Adapter receive valid to Protocol Layer (FDI)
+  output logic [DATA_W-1:0] pl_data,        // Adapter receive data bus to Protocol Layer (FDI)
+  output logic [7:0]  pl_stream,            // Adapter receive stream ID to Protocol Layer (FDI)
+  output logic        pl_error,             // Link error status to Protocol Layer (FDI)
+  output logic        pl_cerror,            // Correctable error status to Protocol Layer (FDI)
+  output logic        pl_nferror,           // Non-fatal error status to Protocol Layer (FDI)
+  output logic        pl_trainerror,        // Training error status to Protocol Layer (FDI)
+  output logic        pl_phyinrecenter,     // PHY in recenter status to Protocol Layer (FDI)
+  output logic [2:0]  pl_protocol,          // Negotiated protocol mode (fixed Streaming)
+  output logic [3:0]  pl_protocol_flitfmt,  // Negotiated flit format (fixed Raw Mode Format 1)
+  output logic        pl_rx_active_req,     // Adapter receiver active request to Protocol Layer (FDI)
+  input  logic [3:0]  lp_state_req,         // FDI link state request from Protocol Layer
+  output logic [3:0]  pl_state_sts,         // FDI link state status to Protocol Layer
+  output logic        pl_inband_pres,       // In-band presence indication to Protocol Layer
+  output logic        pl_stallreq,          // Adapter stall request to Protocol Layer (FDI)
+  input  logic        lp_linkerror = 1'b0,  // Protocol Layer LinkError request trigger (FDI)
 
   // FDI Configuration Sideband (UCIe 1.0 Section 8.2.3, Table 115)
-  input  logic [NC-1:0] lp_cfg = '0,
-  input  logic        lp_cfg_vld = 1'b0,
-  input  logic        lp_cfg_crd = 1'b0,
-  output logic [NC-1:0] pl_cfg,
-  output logic        pl_cfg_vld,
-  output logic        pl_cfg_crd,
+  input  logic [NC-1:0] lp_cfg = '0,        // Inbound FDI configuration byte from Protocol Layer
+  input  logic        lp_cfg_vld = 1'b0,    // Inbound FDI configuration valid qualifier
+  input  logic        lp_cfg_crd = 1'b0,    // Inbound FDI configuration credit return
+  output logic [NC-1:0] pl_cfg,             // Outbound FDI configuration byte to Protocol Layer
+  output logic        pl_cfg_vld,           // Outbound FDI configuration valid qualifier
+  output logic        pl_cfg_crd,           // Outbound FDI configuration credit return
 
   // FDI Stage 3 Clock / Wake / Protocol Status (UCIe 1.0 Section 8.2, Table 115)
-  output logic        pl_protocol_vld,
-  output logic        pl_clk_req,
-  input  logic        lp_clk_ack = 1'b1,
-  input  logic        lp_wake_req = 1'b0,
-  output logic        pl_wake_ack,
-  output logic [2:0]  pl_speedmode,
-  output logic [2:0]  pl_lnk_cfg,
+  output logic        pl_protocol_vld,      // Protocol identification valid qualifier
+  output logic        pl_clk_req,           // Main clock request to Protocol Layer
+  input  logic        lp_clk_ack = 1'b1,    // Main clock acknowledge from Protocol Layer
+  input  logic        lp_wake_req = 1'b0,   // Wake request from Protocol Layer
+  output logic        pl_wake_ack,          // Wake acknowledge to Protocol Layer
+  output logic [2:0]  pl_speedmode,         // Current negotiated speed mode (4 GT/s)
+  output logic [2:0]  pl_lnk_cfg,           // Link width configuration status (x16 / x8)
 
   // ------------------------------------------------- sideband to partner (scalar)
-  output logic        sb_tx_clk,
-  output logic        sb_tx_data,
-  input  logic        sb_rx_clk,
-  input  logic        sb_rx_data,
+  output logic        sb_tx_clk,            // Physical sideband forwarded clock/strobe to peer die
+  output logic        sb_tx_data,           // Physical sideband serialized data to peer die
+  input  logic        sb_rx_clk,            // Physical sideband forwarded clock/strobe from peer die
+  input  logic        sb_rx_data,           // Physical sideband serialized data from peer die
   // ------------------------------------------------- main band to partner
-  output logic [NLANES-1:0] mb_tx_data,
-  output logic        mb_tx_valid,  // main band framing valid (Req.2)
-  input  logic [NLANES-1:0] mb_rx_data,
-  input  logic        mb_rx_valid   // main band framing valid (Req.2)
+  output logic [NLANES-1:0] mb_tx_data,     // Physical main-band transmit data lanes to peer die
+  output logic        mb_tx_valid,          // Main-band transmit framing valid (Req.2)
+  input  logic [NLANES-1:0] mb_rx_data,     // Physical main-band receive data lanes from peer die
+  input  logic        mb_rx_valid           // Main-band receive framing valid (Req.2)
 );
 
   // ==========================================================================

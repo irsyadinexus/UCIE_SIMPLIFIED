@@ -78,7 +78,7 @@
 //     Both directions (die 0 -> die 1 "forward" and die 1 -> die 0 "reverse")
 //     are exercised.
 //
-//   POST-ACTIVE SCENARIOS (PHASE F PMNAK & PHASE E LINK RECOVERY)
+//   POST-ACTIVE SCENARIOS (PMNAK & LINK RECOVERY)
 //     After the first Active Entry and data phase, the test verifies the
 //     unsupported power-management PMNAK scenario, followed by three recovery cases:
 //       1. LinkReset from Active: the protocol layer requests LinkReset on
@@ -109,11 +109,11 @@
 //   COVERAGE MONITOR FEEDING
 //     The `cov_monitor` instance (`u_cov`) observes both dies' LTSM state,
 //     RDI state, sideband packet fields, link-active indicators, the
-//     `xfer_done_0` / `xfer_done_1` pulses, and the Phase F functional event
+//     `xfer_done_0` / `xfer_done_1` pulses, and the functional event
 //     observables. Each `xfer_done` pulse is a one-lclk-cycle high emitted
 //     by `push_one` after the scoreboard has verified a round-trip beat.
-//     The Phase F event observables capture PARAM request/response roles,
-//     Phase B/C transaction classes, priority arbitration, fatal causes,
+//     The functional event observables capture PARAM request/response roles,
+//     training and management transaction classes, priority arbitration, fatal causes,
 //     TRAINERROR state/exchange, LinkReset recovery, Disabled recovery,
 //     PMNAK status, Active Entry completion, pre-Active data blocking,
 //     Active-data scrambling, and mainband framing boundary faults.
@@ -260,6 +260,9 @@
 //   v0.0.18 2026-10-08  Documentation compliance pass: expand the per-construct
 //                        comment blocks and move the module-scope declarations
 //                        above the DUT comment so no declaration interrupts it.
+//   v0.0.19 2026-10-09  Cleanup pass: remove obsolete implementation-phase
+//                        references outside revision history, add task argument
+//                        inline comments, and split multi-signal declarations.
 // ============================================================================
 `ifndef TbLoopbackTop_SV
 `define TbLoopbackTop_SV
@@ -378,18 +381,26 @@ module tb_loopback_top;
   end
 
   // ------------------------------------------------------- die crossing
-  logic                 sb_a2b_clk, sb_b2a_clk;
-  logic                 sb_a2b_data, sb_b2a_data;
-  logic [NLANES_MAX-1:0] mb_a2b_data, mb_b2a_data;
-  logic                 mb_a2b_valid, mb_b2a_valid;
-  wire  [NLANES_MAX-1:0] mb_a2b_wire, mb_b2a_wire;
-  wire                  mb_a2b_val_wire, mb_b2a_val_wire;
-  // Phase E framing-fault injection override. Each mainband framing valid is
+  logic                  sb_a2b_clk;
+  logic                  sb_b2a_clk;
+  logic                  sb_a2b_data;
+  logic                  sb_b2a_data;
+  logic [NLANES_MAX-1:0] mb_a2b_data;
+  logic [NLANES_MAX-1:0] mb_b2a_data;
+  logic                  mb_a2b_valid;
+  logic                  mb_b2a_valid;
+  wire  [NLANES_MAX-1:0] mb_a2b_wire;
+  wire  [NLANES_MAX-1:0] mb_b2a_wire;
+  wire                   mb_a2b_val_wire;
+  wire                   mb_b2a_val_wire;
+  // Framing-fault injection override. Each mainband framing valid is
   // selected through a test-only mux so one deliberate mid-word violation can
   // reach the receive gearbox. Outside an injection window the mux selects the
   // transmit framing bit unchanged, so legal traffic is not disturbed.
-  logic                 mb_a2b_val_inject_en, mb_a2b_val_inject;
-  logic                 mb_b2a_val_inject_en, mb_b2a_val_inject;
+  logic                 mb_a2b_val_inject_en;
+  logic                 mb_a2b_val_inject;
+  logic                 mb_b2a_val_inject_en;
+  logic                 mb_b2a_val_inject;
 
   // Main-band DDR wires across die boundary (instantaneous, zero overhead)
   // -------------------------------------------------------------------------
@@ -465,21 +476,33 @@ module tb_loopback_top;
     mb_b2a_val_inject    = 1'b0;
   end
   // ------------------------------------------------------- die 0
-  logic [NC-1:0] d0_lp_cfg, d1_lp_cfg;
-  logic        d0_lp_cfg_vld, d1_lp_cfg_vld;
-  logic        d0_lp_cfg_crd, d1_lp_cfg_crd;
-  logic [NC-1:0] d0_pl_cfg, d1_pl_cfg;
-  logic        d0_pl_cfg_vld, d1_pl_cfg_vld;
-  logic        d0_pl_cfg_crd, d1_pl_cfg_crd;
-  logic        d0_lp_irdy, d0_lp_valid;
+  logic [NC-1:0] d0_lp_cfg;
+  logic [NC-1:0] d1_lp_cfg;
+  logic        d0_lp_cfg_vld;
+  logic        d1_lp_cfg_vld;
+  logic        d0_lp_cfg_crd;
+  logic        d1_lp_cfg_crd;
+  logic [NC-1:0] d0_pl_cfg;
+  logic [NC-1:0] d1_pl_cfg;
+  logic        d0_pl_cfg_vld;
+  logic        d1_pl_cfg_vld;
+  logic        d0_pl_cfg_crd;
+  logic        d1_pl_cfg_crd;
+  logic        d0_lp_irdy;
+  logic        d0_lp_valid;
   logic [DATA_W-1:0] d0_lp_data;
   logic [7:0]  d0_lp_stream;
-  logic        d0_lp_stallack, d0_lp_rx_active_sts;
-  logic        d0_pl_rx_active_req, d0_pl_protocol_vld, d0_pl_inband_pres;
-  logic        d0_pl_trdy, d0_pl_valid;
+  logic        d0_lp_stallack;
+  logic        d0_lp_rx_active_sts;
+  logic        d0_pl_rx_active_req;
+  logic        d0_pl_protocol_vld;
+  logic        d0_pl_inband_pres;
+  logic        d0_pl_trdy;
+  logic        d0_pl_valid;
   logic [DATA_W-1:0] d0_pl_data;
   logic [7:0]  d0_pl_stream;
-  logic [3:0]  d0_lp_state_req, d0_pl_state_sts;
+  logic [3:0]  d0_lp_state_req;
+  logic [3:0]  d0_pl_state_sts;
   logic        d0_link_active_obs;
   logic        d0_pl_stallreq;
   logic [7:0]  d0_ltsm_state;
@@ -491,15 +514,21 @@ module tb_loopback_top;
   logic        d0_sb_rx_pkt_vld;
 
   // ------------------------------------------------------- die 1
-  logic        d1_lp_irdy, d1_lp_valid;
+  logic        d1_lp_irdy;
+  logic        d1_lp_valid;
   logic [DATA_W-1:0] d1_lp_data;
   logic [7:0]  d1_lp_stream;
-  logic        d1_lp_stallack, d1_lp_rx_active_sts;
-  logic        d1_pl_trdy, d1_pl_valid;
-  logic        d1_pl_rx_active_req, d1_pl_protocol_vld, d1_pl_inband_pres;
+  logic        d1_lp_stallack;
+  logic        d1_lp_rx_active_sts;
+  logic        d1_pl_trdy;
+  logic        d1_pl_valid;
+  logic        d1_pl_rx_active_req;
+  logic        d1_pl_protocol_vld;
+  logic        d1_pl_inband_pres;
   logic [DATA_W-1:0] d1_pl_data;
   logic [7:0]  d1_pl_stream;
-  logic [3:0]  d1_lp_state_req, d1_pl_state_sts;
+  logic [3:0]  d1_lp_state_req;
+  logic [3:0]  d1_pl_state_sts;
   logic        d1_link_active_obs;
   logic        d1_pl_stallreq;
   logic [7:0]  d1_ltsm_state;
@@ -867,7 +896,9 @@ module tb_loopback_top;
       d1_lp_rx_active_sts <= 1'b0;
   end
 
-  task automatic fdi_cfg_write_link_control(input int die_sel);
+  task automatic fdi_cfg_write_link_control(
+    input int die_sel // Target die index selector (0 for Die 0, 1 for Die 1)
+  );
     ucie_pkg::sb_packet_t req;
     logic [63:0] hdr;
     logic [63:0] pld;
@@ -951,7 +982,8 @@ module tb_loopback_top;
   // A completed and scoreboard-checked streaming beat. push_one pulses the
   // matching line for one lclk cycle once the round trip has been verified,
   // which is what the coverage monitor counts as a raw transfer.
-  logic xfer_done_0, xfer_done_1;
+  logic xfer_done_0;
+  logic xfer_done_1;
 
   initial begin
     xfer_done_0 = 1'b0;
@@ -961,7 +993,9 @@ module tb_loopback_top;
   // ------------------------------------------------------- stall detector
   // A four-phase stall is req -> ack -> valid and irdy low -> both low.
   logic stall_4phase;
-  logic stall_seen_req, stall_seen_ack, stall_seen_stop;
+  logic stall_seen_req;
+  logic stall_seen_ack;
+  logic stall_seen_stop;
 
   // -------------------------------------------------------------------------
   // always: Stall Four-Phase Handshake Detector
@@ -998,7 +1032,7 @@ module tb_loopback_top;
 
   // ------------------------------------------------------- width / reversal
 //   The x16-only PoC never degrades, so these stay observation-only and are
-//   exercised by the mapper unit test instead. They are wired so the Phase F
+//   exercised by the mapper unit test instead. They are wired so the coverage
 //   multi-source coverage model is complete, and held at the never-degraded value.
   logic width_degrade;
   logic lane_reversal;
@@ -1011,16 +1045,17 @@ module tb_loopback_top;
   // AdvCap.Adapter advertises Raw_Mode (bit 0), Streaming (bit 4) and
   // Stack0_Enable (bit 7). No-CRC is not a bit in AdvCap; it is implied by
   // 4 GT/s. The advertisement appears on the sideband during MBINIT.PARAM.
-  logic raw_mode_adv, crc_off_adv;
+  logic raw_mode_adv;
+  logic crc_off_adv;
   initial begin
     raw_mode_adv = 1'b1;
     crc_off_adv  = 1'b1;
   end
 
-  // ------------------------------------------------------- Phase F coverage evidence
-  // Sticky evidence flags and latches for Phase F functional coverage
+  // ------------------------------------------------------- Functional coverage evidence
+  // Sticky evidence flags and latches for functional event coverage
   // (spec 4.4.1, 4.5.3, 4.5.3.3.1, 4.5.3.8, 6.1.3, 8.1.5, 8.1.6;
-  // PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9 Phase F).
+  // PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9).
   logic   link_up_seen;
   logic   d0_trainerror_seen;
   logic   d1_trainerror_seen;
@@ -1030,21 +1065,31 @@ module tb_loopback_top;
   logic   d1_linkreset_status_seen;
   logic   d0_linkreset_exchange_seen;
   logic   d1_linkreset_exchange_seen;
-  logic   d0_lr_req_tx_seen, d0_lr_req_rx_seen;
-  logic   d0_lr_rsp_tx_seen, d0_lr_rsp_rx_seen;
-  logic   d1_lr_req_tx_seen, d1_lr_req_rx_seen;
-  logic   d1_lr_rsp_tx_seen, d1_lr_rsp_rx_seen;
-  logic   d0_dis_req_tx_seen, d0_dis_req_rx_seen;
-  logic   d0_dis_rsp_tx_seen, d0_dis_rsp_rx_seen;
-  logic   d1_dis_req_tx_seen, d1_dis_req_rx_seen;
-  logic   d1_dis_rsp_tx_seen, d1_dis_rsp_rx_seen;
+  logic   d0_lr_req_tx_seen;
+  logic   d0_lr_req_rx_seen;
+  logic   d0_lr_rsp_tx_seen;
+  logic   d0_lr_rsp_rx_seen;
+  logic   d1_lr_req_tx_seen;
+  logic   d1_lr_req_rx_seen;
+  logic   d1_lr_rsp_tx_seen;
+  logic   d1_lr_rsp_rx_seen;
+  logic   d0_dis_req_tx_seen;
+  logic   d0_dis_req_rx_seen;
+  logic   d0_dis_rsp_tx_seen;
+  logic   d0_dis_rsp_rx_seen;
+  logic   d1_dis_req_tx_seen;
+  logic   d1_dis_req_rx_seen;
+  logic   d1_dis_rsp_tx_seen;
+  logic   d1_dis_rsp_rx_seen;
   logic   d0_gate_violation_seen;
   logic   d1_gate_violation_seen;
   logic   pre_active_block_violation_seen;
   logic   pre_active_block_success_seen;
 
-  logic   d0_param_req_seen, d0_param_rsp_seen;
-  logic   d1_param_req_seen, d1_param_rsp_seen;
+  logic   d0_param_req_seen;
+  logic   d0_param_rsp_seen;
+  logic   d1_param_req_seen;
+  logic   d1_param_rsp_seen;
   logic   cov_param_roles_seen;
   logic   cov_phase_b_seen;
   logic   cov_phase_c_seen;
@@ -1062,8 +1107,8 @@ module tb_loopback_top;
   // The coverage monitor collects functional coverage from both dies. It
   // is fed the LTSM state, RDI state, sideband packet fields, link-active
   // status, transfer-done pulses, stall completion toggle, width-degrade
-  // and lane-reversal flags, capability advertisement bits, and the Phase F
-  // event observables (PARAM request/response roles, Phase B/C transaction
+  // and lane-reversal flags, capability advertisement bits, and the functional
+  // event observables (PARAM request/response roles, training and management transaction
   // classes, priority arbitration, fatal causes, TRAINERROR, LinkReset,
   // Disabled, PMNAK, Active Entry, pre-Active data blocking, scrambling,
   // and framing faults). At the end of simulation, `export_json` writes
@@ -1073,7 +1118,7 @@ module tb_loopback_top;
   //           Section 4.5.3.3.1 (MBINIT.PARAM), Section 4.5.3.8 (TRAINERROR),
   //           Section 6.1.3 (Arbitration), Section 8.0 (Interfaces),
   //           Section 8.1.5 (RDI States & PMNAK), Section 8.1.6 (Active Entry);
-  //           PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9 Phase F.
+  //           PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9.
   // -------------------------------------------------------------------------
   cov_monitor u_cov (
     .lclk              (lclk),
@@ -1137,18 +1182,18 @@ module tb_loopback_top;
   logic [DATA_W-1:0] exp_data;
   logic [DATA_W-1:0] got_data;
 
-  // ---- Phase E & F observations ---------------------------------------
+  // ---- Link recovery and functional event observations ----------------
   // The initial delayed-start contract and the SBINIT ordering checks apply
   // to the first bring-up epoch only. Later epochs are the approved
   // recovery walks, and their ordering follows the same LTSM sequence that
   // the unit tests already prove. `link_up_seen` freezes the initial-epoch
   // checks once both dies first report FDI Active.
   //
-  // Evidence flags and Phase F latches are declared above before `u_cov`
+  // Evidence flags and coverage latches are declared above before `u_cov`
   // and sampled by the continuous gate and role monitoring block below.
   // ---- Approved Active-gate predicates --------------------------------
   // The logical PHY may open the user-data gate only while every approved
-  // predicate holds (PLAN.md Sections 15.6 and 15.9 Phase E): the LTSM
+  // predicate holds (PLAN.md Sections 15.6 and 15.9): the LTSM
   // completed Active Entry and holds a settled ACTIVE level, the public FDI
   // and RDI status report ACTIVE, no private transition indication is
   // pending, no private stall (data-block) handshake is active, and no
@@ -1185,7 +1230,7 @@ module tb_loopback_top;
                             d1_gate_no_stall && d1_gate_no_fault;
 
   // -------------------------------------------------------------------------
-  // always: Phase E Gate Invariants and Phase F Functional Event Sampling
+  // always: Gate Invariants and Functional Event Sampling
   //
   // A receive valid may be presented only while the complete approved Active
   // gate is open. The check requires every gate predicate at once, so a leak
@@ -1200,9 +1245,9 @@ module tb_loopback_top;
   // leaves ACTIVE; that one-cycle lag is legal and is why the invariant
   // watches the PHY output rather than the adapter output.
   //
-  // The same block samples the sideband exchanges and Phase F observables:
-  // PARAM request and response roles (spec 4.5.3.3.1, Table 56), Phase B
-  // training and Phase C management transaction classes (spec 4.5.3, Table 53),
+  // The same block samples the sideband exchanges and coverage observables:
+  // PARAM request and response roles (spec 4.5.3.3.1, Table 56), training
+  // and management transaction classes (spec 4.5.3, Table 53),
   // transmit priority arbitration (spec 6.1.3), fatal cause trigger events
   // (spec 4.5.3.8), PMNAK status (spec 8.1.5, Table 114), Active-data
   // scrambler advancement (spec 4.4.1), and mainband framing boundary fault
@@ -1210,7 +1255,7 @@ module tb_loopback_top;
   //
   // Spec ref: UCIe 1.0 Sections 4.1.2, 4.4.1, 4.5.3, 4.5.3.3.1, 4.5.3.8,
   //           6.1.3, 8.1.5, 8.1.6, Table 56, Table 114;
-  //           PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9 Phase E & Phase F.
+  //           PLAN.md Sections 15.3, 15.4, 15.6, 15.7, 15.9.
   // -------------------------------------------------------------------------
   always @(posedge lclk) begin
     if (d0_lreset_n && dut_a.u_lphy.rdi_pl_valid && !d0_gate_ok &&
@@ -1276,7 +1321,7 @@ module tb_loopback_top;
     if (dut_b.u_lphy.u_ltsm.rx_disabled_rsp ||
         dut_b.u_lphy.u_ltsm.disabled_rsp_received_q)   d1_dis_rsp_rx_seen = 1'b1;
 
-    // Phase F: PARAM request and response roles (Table 56, spec 4.5.3.3.1)
+    // Event: PARAM request and response roles (Table 56, spec 4.5.3.3.1)
     if ((d0_ltsm_state == LT_MBINIT_PARAM) &&
         (dut_a.u_lphy.u_ltsm.tx_local_req || dut_a.u_lphy.u_ltsm.param_req_valid))
       d0_param_req_seen = 1'b1;
@@ -1295,7 +1340,7 @@ module tb_loopback_top;
     if (dut_a.u_lphy.u_ltsm.tx_param_send || dut_b.u_lphy.u_ltsm.tx_param_send)
       cov_param_roles_seen = 1'b1;
 
-    // Phase F: Phase B training and Phase C management transaction classes (PLAN.md 15.3, 15.9)
+    // Event: Training and management transaction classes (PLAN.md 15.3, 15.9)
     if ((dut_a.u_lphy.u_ltsm.phase_b_active &&
          (dut_a.u_lphy.u_ltsm.tx_local_req || dut_a.u_lphy.u_ltsm.tx_peer_resp)) ||
         (dut_b.u_lphy.u_ltsm.phase_b_active &&
@@ -1307,14 +1352,14 @@ module tb_loopback_top;
     if (cov_phase_b_seen && cov_phase_c_seen)
       cov_txn_classes_seen = 1'b1;
 
-    // Phase F: Transmit priority arbitration (spec 6.1.3; PLAN.md 15.3)
+    // Event: Transmit priority arbitration (spec 6.1.3; PLAN.md 15.3)
     if ((dut_a.u_lphy.u_ltsm.higher_response_tx && dut_a.u_lphy.sb_tx_load) ||
         (dut_b.u_lphy.u_ltsm.higher_response_tx && dut_b.u_lphy.sb_tx_load) ||
         dut_a.u_lphy.u_ltsm.high_priority_response_tx ||
         dut_b.u_lphy.u_ltsm.high_priority_response_tx)
       cov_arbitration_seen = 1'b1;
 
-    // Phase F: Fatal cause trigger events (spec 4.5.3.8; PLAN.md 15.4, 15.9)
+    // Event: Fatal cause trigger events (spec 4.5.3.8; PLAN.md 15.4, 15.9)
     if (dut_a.u_lphy.u_ltsm.fatal_trigger_event ||
         dut_b.u_lphy.u_ltsm.fatal_trigger_event ||
         dut_a.u_lphy.u_ltsm.internal_fatal_event ||
@@ -1323,17 +1368,17 @@ module tb_loopback_top;
         dut_b.u_lphy.ltsm_framing_fault_event)
       cov_fatal_causes_seen = 1'b1;
 
-    // Phase F: PMNAK status on unsupported PM requests (spec 8.1.5, Table 114)
+    // Event: PMNAK status on unsupported PM requests (spec 8.1.5, Table 114)
     if ((d0_rdi_state_sts == RDI_STS_PMNAK) || (d1_rdi_state_sts == RDI_STS_PMNAK) ||
         (d0_pl_state_sts == FDI_STS_PMNAK)  || (d1_pl_state_sts == FDI_STS_PMNAK))
       cov_pmnak_seen = 1'b1;
 
-    // Phase F: Scrambler / descrambler advance (spec 4.4.1; PLAN.md 15.6)
+    // Event: Scrambler / descrambler advance (spec 4.4.1; PLAN.md 15.6)
     if (dut_a.u_lphy.tx_user_transfer || dut_a.u_lphy.rx_user_transfer ||
         dut_b.u_lphy.tx_user_transfer || dut_b.u_lphy.rx_user_transfer)
       cov_scrambling_seen = 1'b1;
 
-    // Phase F: Mainband framing boundary fault on either receive path
+    // Event: Mainband framing boundary fault on either receive path
     // (spec 4.1.2; PLAN.md 15.6). The injected fault crosses into Die 1,
     // so both logical-PHY RX gearbox paths must feed the coverage latch.
     if (dut_a.u_lphy.ltsm_framing_fault_event ||
@@ -1520,9 +1565,9 @@ module tb_loopback_top;
   // `which` selects the direction: 0 = Die 0 transmits, 1 = Die 1 transmits.
   // -------------------------------------------------------------------------
   task push_one;
-    input [64*8-1:0] label;
-    input integer    which;      // 0 = die 0 forward, 1 = die 1 reverse
-    input [DATA_W-1:0] data;
+    input [64*8-1:0]   label; // Transaction diagnostic label
+    input integer      which; // 0 = die 0 forward, 1 = die 1 reverse
+    input [DATA_W-1:0] data;  // User data payload word
     begin
       if (which == 0) begin
         // Die 0 TX -> cross main-band DDR pins -> Die 1 RX
@@ -1586,7 +1631,7 @@ module tb_loopback_top;
   endtask
 
   // =========================================================================
-  // Phase E link-recovery helpers
+  // Link-recovery helper tasks
   //
   // Every wait is bounded so a stuck link reports a failure instead of
   // hanging the simulation. C_RECOVERY_MAX equals one RESET dwell, which is
@@ -1733,17 +1778,17 @@ module tb_loopback_top;
 //
 // Runs while Die 0 trains in SBINIT and Die 1 still sits in RESET. One
 // full user-data beat is offered on Die 0's RDI for sixteen lclk cycles.
-// The Phase E gate must keep the partner receive interface quiet: the
+// The active gating policy must keep the partner receive interface quiet: the
 // partner pl_valid must never assert, and the beat data observed with any
 // such assertion is reported. This proves that lp_irdy/lp_valid alone
 // cannot move data before Active Entry completes, which is stronger than
 // an empty-interface check.
 //
-// On success, pre_active_block_success_seen is latched to feed the Phase F
+// On success, pre_active_block_success_seen is latched to feed the coverage
 // pre_active_block coverage monitor input.
 //
 // Spec ref: UCIe 1.0 Section 8.1.6 (RDI Bring-up Flow); PLAN.md Section 15.6,
-//           15.9 Phase E & Phase F.
+//           15.9.
 // -------------------------------------------------------------------------
   task check_pre_active_block;
     logic              saw_valid;
@@ -2001,7 +2046,7 @@ module tb_loopback_top;
       errors = errors + 1;
     end
 
-    // ---- Phase E: pre-Active user-data block --------------------------
+    // ---- Pre-Active user-data block verification ---------------------
     // Die 0 leaves RESET and enters SBINIT about 4 ms after its reset
     // release, while Die 1 stays in RESET until 6.5 ms. Offer one user-data
     // beat in that window: the partner receive interface must stay quiet.
@@ -2067,7 +2112,7 @@ module tb_loopback_top;
     push_one("burst die1", 1, {8{8'h88}});
 
     // =====================================================================
-    // Phase F: PMNAK on unsupported power-management request
+    // PMNAK on unsupported power-management request
     // =====================================================================
     // UCIe 1.0 Section 8.1.5 (RDI State Status Machine) and Section 8.1.6
     // (RDI Bring-up Flow): In the simplified raw-mode profile, low-power
@@ -2112,7 +2157,7 @@ module tb_loopback_top;
     end
 
     // =====================================================================
-    // Phase E scenario 1: LinkReset recovery from Active
+    // LinkReset recovery from Active
     // =====================================================================
     // The protocol layer requests LinkReset on both dies at the same time.
     // Both must publish the LinkReset report, complete the private exchange,
@@ -2173,7 +2218,7 @@ module tb_loopback_top;
     push_one("RECOVERED TRANSFER OK (die1->die0)", 1, {8{8'hAA}});
 
     // =====================================================================
-    // Phase E scenario 2: Disabled recovery from Active
+    // Disabled recovery from Active
     // =====================================================================
     $display("PHASE E: Disabled recovery from Active");
     // Clear the per-role evidence first, so the assertion below can only be
@@ -2226,7 +2271,7 @@ module tb_loopback_top;
     push_one("DISABLED RECOVERY OK (die1->die0)", 1, {8{8'hCC}});
 
     // =====================================================================
-    // Phase E scenario 3: private mainband framing fault
+    // Private mainband framing fault
     // =====================================================================
     // One mid-word valid change on Die 0's receive path must be fatal: both
     // dies enter TRAINERROR, Die 0 publishes LinkError, LinkReset is the only
@@ -2289,7 +2334,7 @@ module tb_loopback_top;
     push_one("FRAMING FAULT RECOVERY OK (die0->die1)", 0, {8{8'hDD}});
     push_one("FRAMING FAULT RECOVERY OK (die1->die0)", 1, {8{8'hEE}});
 
-    // ---- Phase E summary: no user data outside the approved Active gate --
+    // ---- Recovery summary: no user data outside the approved Active gate --
     if (pre_active_block_violation_seen || d0_gate_violation_seen ||
         d1_gate_violation_seen) begin
       $display("FAIL tb_loopback_top: user data appeared outside the approved Active gate");
@@ -2314,7 +2359,7 @@ module tb_loopback_top;
     cov_path = "logs/coverage.json";
     void'($value$plusargs("covfile=%s", cov_path));
     // The initial delayed reset (2.5 ms), the true 4 ms RESET dwell of the
-    // bring-up, and the three Phase E recovery dwells (LinkReset, Disabled,
+    // bring-up, and the three link recovery dwells (LinkReset, Disabled,
     // framing fault) each add a full 4 ms epoch plus a training walk. This
     // gate is the single integration deadline for the complete sequence.
     #(120_000_000);

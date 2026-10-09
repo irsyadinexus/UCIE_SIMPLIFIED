@@ -41,11 +41,13 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-28  -           Initial creation of adapter sideband test.
-//   v0.0.2  2026-10-08  -           Documentation compliance pass: expand header
-//                                    and add per-construct comments.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-28  Initial creation of adapter sideband test.
+//   v0.0.2  2026-10-08  Documentation compliance pass: expand header
+//                       and add per-construct comments.
+//   v0.0.3  2026-10-09  Cleanup pass: remove unused table column and split multi-signal
+//                       declarations into individual declarations.
 // TESTBENCH EXECUTION FLOW
 //   1. Assert lreset_n and wait for the adapter sideband FSM to leave reset.
 //   2. Drive an incoming FDI 32-bit configuration write across 8 header phases
@@ -86,25 +88,33 @@ module tb_adapter_sideband;
   logic [3:0] lp_state_req;
   logic adapter_state_req_vld;
   logic [3:0] adapter_state_req;
-  logic csr_wr, csr_rd;
+  logic csr_wr;
+  logic csr_rd;
   logic [26:0] csr_addr;
   logic [63:0] csr_wdata;
   logic [7:0] csr_be;
   logic [63:0] csr_rdata;
   logic csr_rdata_vld;
   logic csr_target;
-  logic phy_csr_wr, phy_csr_rd;
+  logic phy_csr_wr;
+  logic phy_csr_rd;
   logic [26:0] phy_csr_addr;
   logic [63:0] phy_csr_wdata;
   logic [7:0] phy_csr_be;
   logic [63:0] phy_csr_rdata;
   logic phy_csr_rdata_vld;
-  logic rem_req_vld, rem_req_rdy;
+  logic rem_req_vld;
+  logic rem_req_rdy;
   sb_packet_t rem_req_pkt;
   logic rem_cpl_vld;
   sb_packet_t rem_cpl_pkt;
-  logic adapter_fatal, adapter_linkerror, stage3_done;
-  logic protocol_error, fdi_format_error, sb_credit_returned, sb_stall_sent;
+  logic adapter_fatal;
+  logic adapter_linkerror;
+  logic stage3_done;
+  logic protocol_error;
+  logic fdi_format_error;
+  logic sb_credit_returned;
+  logic sb_stall_sent;
   logic sb_msg_timeout;
   integer errors;
 

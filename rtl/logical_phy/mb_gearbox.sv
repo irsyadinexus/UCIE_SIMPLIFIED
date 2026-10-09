@@ -96,33 +96,30 @@
 // --------------------------------------------------------------------------
 // Revision History
 // --------------------------------------------------------------------------
-//   Rev   Date        Author      Description
-//   ---------------  ----------  -------------------------------------------
-//   0.0.1 2026-09-23  -           First commit to git. TX/RX DDR gearboxes
-//                                     for the 4 GT/s main band with the
-//   0.0.2 2026-09-23  Req.2: collapse the per-lane phase gather into one
-//                                    always @* with a case on cyc_q, and use
-//                                    an NBA on the DDR pin mux, so Icarus
-//                                    keeps the 2 GHz event queue small.
-//   0.0.3 2026-09-23  -           Documentation: add per-construct comment
-//                                    blocks with spec references.
-//   0.0.4 2026-09-25  Phase E: add the private sticky `framing_fault`
-//                                    output to rx_gearbox and its four-cycle
-//                                    valid-framing boundary monitor. No
-//                                    public port changes.
-//   0.0.5 2026-09-25  Phase E: assert mb_tx_valid in mbclk cycles 0 and 1
-//                                    only, that is the first four UI of the
-//                                    eight-UI transfer (PLAN.md 6.2), and
-//                                    require the same 1100 pattern in the
-//                                    rx boundary monitor. The monitor now
-//                                    rejects early, late, or malformed
-//                                    framing, suppresses the word strobe for
-//                                    a rejected window, and keeps the fault
-//                                    sticky until lreset_n. No public port
-//                                    changes.
-//   0.0.6 2026-10-08  Documentation compliance pass: adjust signal declarations
-//                                    and add dedicated construct comments for framing
-//                                    expectation and boundary monitoring.
+//   v0.0.1  2026-09-23  First commit to git. TX/RX DDR gearboxes for the 4 GT/s
+//                        main band with the 2 GHz forwarded clock.
+//   v0.0.2  2026-09-23  Req.2: collapse the per-lane phase gather into one
+//                        always @* with a case on cyc_q, and use an NBA on the
+//                        DDR pin mux, so Icarus keeps the 2 GHz event queue small.
+//   v0.0.3  2026-09-23  Documentation: add per-construct comment blocks with spec
+//                        references.
+//   v0.0.4  2026-09-25  Phase E: add the private sticky `framing_fault` output
+//                        to rx_gearbox and its four-cycle valid-framing boundary
+//                        monitor. No public port changes.
+//   v0.0.5  2026-09-25  Phase E: assert mb_tx_valid in mbclk cycles 0 and 1 only,
+//                        that is the first four UI of the eight-UI transfer
+//                        (PLAN.md 6.2), and require the same 1100 pattern in the
+//                        rx boundary monitor. The monitor now rejects early, late,
+//                        or malformed framing, suppresses the word strobe for a
+//                        rejected window, and keeps the fault sticky until
+//                        lreset_n. No public port changes.
+//   v0.0.6  2026-10-08  Documentation compliance pass: adjust signal declarations
+//                        and add dedicated construct comments for framing
+//                        expectation and boundary monitoring.
+//   v0.0.7  2026-10-09  Documentation compliance pass: normalize revision columns from revision
+//                        history, remove obsolete implementation-phase references outside
+//                        revision history, add per-port inline comments, and split multi-signal
+//                        declarations.
 // ============================================================================
 `ifndef MbGearbox_SV
 `define MbGearbox_SV
@@ -138,8 +135,8 @@ module tx_gearbox #(
   parameter int unsigned NLANES = ucie_pkg::NLANES_MAX, // 16 lanes
   parameter int unsigned NSLICE = 8                  // UI slices per word
 ) (
-  input  logic                 lclk,
-  input  logic                 lreset_n,
+  input  logic                 lclk,        // Link clock (500 MHz)
+  input  logic                 lreset_n,    // Active-low asynchronous reset
   input  logic                 mbclk,       // 2 GHz forwarded clock (fCK)
   input  logic [NBYTES*8-1:0]  tx_word,     // one word per lclk
   input  logic                 tx_valid,    // current word is a real beat
@@ -225,7 +222,8 @@ module tx_gearbox #(
     end
   end
 
-  logic [NLANES-1:0] hi_w, lo_w;
+  logic [NLANES-1:0] hi_w;
+  logic [NLANES-1:0] lo_w;
 
   // -------------------------------------------------------------------------
   // always @*: Per-Lane Phase-Gather Combinational Mux
@@ -338,9 +336,9 @@ module rx_gearbox #(
   parameter int unsigned NLANES = ucie_pkg::NLANES_MAX,
   parameter int unsigned NSLICE = 8
 ) (
-  input  logic                 lclk,
-  input  logic                 lreset_n,
-  input  logic                 mbclk,
+  input  logic                 lclk,        // Link clock (500 MHz)
+  input  logic                 lreset_n,    // Active-low asynchronous reset
+  input  logic                 mbclk,       // 2 GHz forwarded clock (fCK)
   input  logic [NLANES-1:0]    mb_rx_data,  // DDR input, 1 bit/lane/edge
   input  logic                 mb_rx_valid, // framing qualifier: 1,1,0,0 per
                                             // eight-UI transfer window
@@ -487,7 +485,7 @@ module rx_gearbox #(
   // fatal policy.
   //
   // Spec ref: UCIe 1.0, Section 4.1.2 - Valid Framing;
-  //           PLAN.md Sections 6.2, 15.6 and 15.9 Phase E.
+  //           Active-gated mainband framing monitoring.
   // -------------------------------------------------------------------------
   logic frame_ref_q;    // cycle-0 qualifier level of the window in progress
   logic frame_ok_q;     // window matches the legal pattern so far

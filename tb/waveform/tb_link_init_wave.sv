@@ -82,6 +82,8 @@
 //                       Section 8.3.2.6/8.3.2.8 Disabled flow: Die 0 requests
 //                       DISABLED via lp_state_req, Die 1 enters via the remote
 //                       sideband request, both recover to ACTIVE.
+//   v0.0.7  2026-10-09  Cleanup pass: add inline comments for task/function
+//                       arguments and split multi-signal declarations.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -551,7 +553,9 @@ module tb_link_init_wave;
   // Task: Protocol Layer Configuration Write to UCIe Link Control (Offset 0x00)
   // Sends a standard 64-bit sideband configuration header followed by 64-bit payload
   // over the FDI lp_cfg bus.
-  task automatic fdi_cfg_write_link_control(input int die_sel);
+  task automatic fdi_cfg_write_link_control(
+    input int die_sel // Target die index selector (0 for Die 0, 1 for Die 1)
+  );
     sb_packet_t req;
     logic [63:0] hdr;
     logic [63:0] pld;
@@ -653,7 +657,8 @@ module tb_link_init_wave;
   // ==========================================================================
   // LTSM State Transition Logging & Verification
   // ==========================================================================
-  logic [7:0] d0_prev_state, d1_prev_state;
+  logic [7:0] d0_prev_state;
+  logic [7:0] d1_prev_state;
   initial begin
     d0_prev_state = LT_RESET;
     d1_prev_state = LT_RESET;
@@ -682,7 +687,9 @@ module tb_link_init_wave;
   end
 
   // Helper function to decode state names
-  function automatic string ltsm_state_name(input logic [7:0] st);
+  function automatic string ltsm_state_name(
+    input logic [7:0] st // 8-bit LTSM state encoding
+  );
     case (st)
       LT_RESET:        return "RESET";
       LT_SBINIT:       return "SBINIT";
@@ -744,9 +751,11 @@ module tb_link_init_wave;
   //           transfer). Raw Mode Format 1 is a direct pass-through with no
   //           flit headers or sequencing.
   // --------------------------------------------------------------------------
-  task automatic bidir_stream(input int unsigned nbeats,
-                              input int unsigned pattern,
-                              output int unsigned err_count);
+  task automatic bidir_stream(
+    input  int unsigned nbeats,    // Number of DATA_W-wide beats to transfer (16 bytes per beat at the default 128-bit width)
+    input  int unsigned pattern,   // Deterministic data pattern selector (0=inc, 1=dec, 2=all-ones)
+    output int unsigned err_count  // Total mismatch errors detected across both dies
+  );
     logic [DATA_W-1:0] words [0:MAX_STREAM_BEATS-1];
     begin
       // Generate the deterministic payload pattern

@@ -135,52 +135,81 @@
 //   v0.0.1  2025-XX-XX  Initial creation.
 //   v0.0.3  2026-09-25  Phase D: add integrated Adapter four-phase request,
 //                        acknowledgement, release, and data-gate checks.
+//   v0.0.4  2026-10-09  Cleanup pass: split multi-signal declarations into
+//                       individual declarations.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
 
 `timescale 1ns/1ps
 module ut_stall;
-  logic        lclk, lreset_n;
-  logic        lp_irdy, lp_valid;
+  logic        lclk;
+  logic        lreset_n;
+  logic        lp_irdy;
+  logic        lp_valid;
   logic [NBYTES*8-1:0] lp_data;
   logic [7:0]  lp_stream;
-  logic        lp_stallack, lp_rx_active_sts;
-  logic        pl_trdy, pl_valid;
+  logic        lp_stallack;
+  logic        lp_rx_active_sts;
+  logic        pl_trdy;
+  logic        pl_valid;
   logic [NBYTES*8-1:0] pl_data;
   logic [7:0]  pl_stream;
-  logic        rdi_lp_irdy, rdi_lp_valid;
+  logic        rdi_lp_irdy;
+  logic        rdi_lp_valid;
   logic [NBYTES*8-1:0] rdi_lp_data;
-  logic        rdi_pl_trdy, rdi_pl_valid;
+  logic        rdi_pl_trdy;
+  logic        rdi_pl_valid;
   logic [NBYTES*8-1:0] rdi_pl_data;
   logic        rdi_lnk_is_x8;
   logic        stall_active;
   // Integrated Adapter stall path signals.
-  logic        ad_lp_irdy, ad_lp_valid, ad_lp_stallack, ad_lp_rx_active_sts;
+  logic        ad_lp_irdy;
+  logic        ad_lp_valid;
+  logic        ad_lp_stallack;
+  logic        ad_lp_rx_active_sts;
   logic [NBYTES*8-1:0] ad_lp_data;
   logic [7:0]  ad_lp_stream;
-  logic        ad_pl_trdy, ad_pl_valid, ad_pl_stallreq;
+  logic        ad_pl_trdy;
+  logic        ad_pl_valid;
+  logic        ad_pl_stallreq;
   logic [NBYTES*8-1:0] ad_pl_data;
   logic [7:0]  ad_pl_stream;
   logic [3:0]  ad_pl_state_sts;
-  logic        ad_pl_inband_pres, ad_pl_error, ad_pl_cerror;
-  logic        ad_pl_nferror, ad_pl_trainerror, ad_pl_phyinrecenter;
+  logic        ad_pl_inband_pres;
+  logic        ad_pl_error;
+  logic        ad_pl_cerror;
+  logic        ad_pl_nferror;
+  logic        ad_pl_trainerror;
+  logic        ad_pl_phyinrecenter;
   logic        ad_pl_rx_active_req;
   logic [2:0]  ad_pl_protocol;
   logic [3:0]  ad_pl_protocol_flitfmt;
-  logic [NC-1:0] ad_lp_cfg, ad_pl_cfg;
-  logic        ad_lp_cfg_vld, ad_lp_cfg_crd, ad_pl_cfg_vld, ad_pl_cfg_crd;
+  logic [NC-1:0] ad_lp_cfg;
+  logic [NC-1:0] ad_pl_cfg;
+  logic        ad_lp_cfg_vld;
+  logic        ad_lp_cfg_crd;
+  logic        ad_pl_cfg_vld;
+  logic        ad_pl_cfg_crd;
   logic        ad_lp_linkerror;
-  logic        ad_rdi_lp_irdy, ad_rdi_lp_valid, ad_rdi_lp_stallack;
+  logic        ad_rdi_lp_irdy;
+  logic        ad_rdi_lp_valid;
+  logic        ad_rdi_lp_stallack;
   logic [NBYTES*8-1:0] ad_rdi_lp_data;
   logic [3:0]  ad_rdi_lp_state_req;
-  logic        ad_rdi_pl_valid, ad_rdi_pl_error, ad_rdi_pl_cerror;
-  logic        ad_rdi_pl_nferror, ad_rdi_pl_trainerror;
-  logic        ad_rdi_pl_phyinrecenter, ad_rdi_pl_stallreq;
+  logic        ad_rdi_pl_valid;
+  logic        ad_rdi_pl_error;
+  logic        ad_rdi_pl_cerror;
+  logic        ad_rdi_pl_nferror;
+  logic        ad_rdi_pl_trainerror;
+  logic        ad_rdi_pl_phyinrecenter;
+  logic        ad_rdi_pl_stallreq;
   logic [NBYTES*8-1:0] ad_rdi_pl_data;
   logic [3:0]  ad_rdi_pl_state_sts;
-  logic        ad_rdi_pl_inband_pres, ad_rdi_pl_trdy;
-  logic [2:0]  ad_rdi_pl_lnk_cfg, ad_rdi_pl_speedmode;
+  logic        ad_rdi_pl_inband_pres;
+  logic        ad_rdi_pl_trdy;
+  logic [2:0]  ad_rdi_pl_lnk_cfg;
+  logic [2:0]  ad_rdi_pl_speedmode;
   logic        ad_clear_start_link_train;
   logic        ad_adapter_start_link_train;
   logic [7:0]  ad_ltsm_state_obs;
@@ -281,7 +310,8 @@ module ut_stall;
 // (#0.1) to allow combinational outputs to settle.
 // ---------------------------------------------------------------------------
   always #1.0 lclk = ~lclk;
-  logic [7:0] k_byte, prev_k_byte;
+  logic [7:0] k_byte;
+  logic [7:0] prev_k_byte;
 
   initial begin
     errors = 0;

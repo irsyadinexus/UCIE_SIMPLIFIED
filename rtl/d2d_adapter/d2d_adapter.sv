@@ -107,8 +107,7 @@
 //
 // CLOCK / RESET
 //   lclk      - Main link clock, 500 MHz (16 B @ 500 MHz = 64 Gbps for x16 @ 4 GT/s).
-//   lreset_n  - Active-low synchronous reset, deasserted synchronously to
-//               lclk by the reset controller upstream.
+//   lreset_n  - Active-low asynchronous reset.
 //
 // DESIGN NOTES
 //   - The stall handshake (spec 8.3.1 four-phase) is implemented inline in
@@ -167,6 +166,9 @@
 //   v0.0.11 2026-10-08  Documentation compliance pass: expand construct comment
 //                        blocks for Stage 3 status assigns, protocol registers,
 //                        and lint suppression blocks with spec references.
+//   v0.0.12 2026-10-09  Documentation and hygiene pass: remove Author column,
+//                        add per-port inline comments, and split multi-signal
+//                        declarations into one declaration per line.
 // LICENSE
 //   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
@@ -180,90 +182,91 @@ module d2d_adapter #(
   parameter int unsigned NBYTES = ucie_pkg::NBYTES,
   parameter int unsigned NC     = ucie_pkg::NC
 ) (
-  input  logic                  lclk,
-  input  logic                  lreset_n,
+  input  logic                  lclk,                  // 500 MHz main link clock
+  input  logic                  lreset_n,              // Active-low asynchronous reset
 
   // ---------------------------------------------------------- FDI (Table 115)
-  input  logic                  lp_irdy,
-  input  logic                  lp_valid,
-  input  logic [NBYTES*8-1:0]   lp_data,
-  output logic                  pl_trdy,
-  output logic                  pl_valid,
-  output logic [NBYTES*8-1:0]   pl_data,
-  input  logic [3:0]            lp_state_req,
-  output logic [3:0]            pl_state_sts,
-  output logic                  pl_inband_pres,
-  output logic                  pl_error,
-  output logic                  pl_cerror,
-  output logic                  pl_nferror,
-  output logic                  pl_trainerror,
-  output logic                  pl_phyinrecenter,
-  output logic                  pl_stallreq,
-  input  logic                  lp_stallack,
-  output logic                  pl_rx_active_req,
-  input  logic                  lp_rx_active_sts,
-  input  logic [7:0]            lp_stream,
-  output logic [7:0]            pl_stream,
-  output logic [2:0]            pl_protocol,
-  output logic [3:0]            pl_protocol_flitfmt,
-  output logic                  pl_protocol_vld,
-  output logic                  pl_clk_req,
-  input  logic                  lp_clk_ack = 1'b1,
-  input  logic                  lp_wake_req = 1'b0,
-  output logic                  pl_wake_ack,
-  output logic [2:0]            pl_speedmode,
-  output logic [2:0]            pl_lnk_cfg,
-  input  logic [NC-1:0]         lp_cfg = '0,
-  input  logic                  lp_cfg_vld = 1'b0,
-  input  logic                  lp_cfg_crd = 1'b0,
-  output logic [NC-1:0]         pl_cfg,
-  output logic                  pl_cfg_vld,
-  output logic                  pl_cfg_crd,
-  input  logic                  lp_linkerror = 1'b0,
+  input  logic                  lp_irdy,               // Protocol Layer initiator ready (FDI)
+  input  logic                  lp_valid,              // Protocol Layer transmit valid (FDI)
+  input  logic [NBYTES*8-1:0]   lp_data,               // Protocol Layer transmit data bus (FDI)
+  output logic                  pl_trdy,               // Adapter target ready to Protocol Layer (FDI)
+  output logic                  pl_valid,              // Adapter receive valid to Protocol Layer (FDI)
+  output logic [NBYTES*8-1:0]   pl_data,               // Adapter receive data bus to Protocol Layer (FDI)
+  input  logic [3:0]            lp_state_req,          // FDI link state request from Protocol Layer
+  output logic [3:0]            pl_state_sts,          // FDI link state status to Protocol Layer
+  output logic                  pl_inband_pres,        // In-band presence indication to Protocol Layer
+  output logic                  pl_error,              // Link error status to Protocol Layer
+  output logic                  pl_cerror,             // Correctable error status to Protocol Layer
+  output logic                  pl_nferror,            // Non-fatal error status to Protocol Layer
+  output logic                  pl_trainerror,         // Training error status to Protocol Layer
+  output logic                  pl_phyinrecenter,      // PHY in recenter status to Protocol Layer
+  output logic                  pl_stallreq,           // Adapter stall request to Protocol Layer
+  input  logic                  lp_stallack,           // Protocol Layer stall acknowledge (FDI)
+  output logic                  pl_rx_active_req,      // Adapter receiver active request to Protocol Layer
+  input  logic                  lp_rx_active_sts,      // Protocol Layer receiver active status indication
+  input  logic [7:0]            lp_stream,             // Protocol Layer stream identifier input
+  output logic [7:0]            pl_stream,             // Adapter stream identifier output
+  output logic [2:0]            pl_protocol,           // Negotiated protocol mode (fixed Streaming)
+  output logic [3:0]            pl_protocol_flitfmt,   // Negotiated flit format (fixed Raw Mode Format 1)
+  output logic                  pl_protocol_vld,       // Protocol identification valid qualifier
+  output logic                  pl_clk_req,            // Main clock request to Protocol Layer
+  input  logic                  lp_clk_ack = 1'b1,     // Main clock acknowledge from Protocol Layer
+  input  logic                  lp_wake_req = 1'b0,    // Wake request from Protocol Layer
+  output logic                  pl_wake_ack,           // Wake acknowledge to Protocol Layer
+  output logic [2:0]            pl_speedmode,          // Current negotiated speed mode (4 GT/s)
+  output logic [2:0]            pl_lnk_cfg,            // Link width configuration status (x16 / x8)
+  input  logic [NC-1:0]         lp_cfg = '0,           // Inbound FDI configuration byte from Protocol Layer
+  input  logic                  lp_cfg_vld = 1'b0,     // Inbound FDI configuration valid qualifier
+  input  logic                  lp_cfg_crd = 1'b0,     // Inbound FDI configuration credit return
+  output logic [NC-1:0]         pl_cfg,                // Outbound FDI configuration byte to Protocol Layer
+  output logic                  pl_cfg_vld,            // Outbound FDI configuration valid qualifier
+  output logic                  pl_cfg_crd,            // Outbound FDI configuration credit return
+  input  logic                  lp_linkerror = 1'b0,   // Protocol Layer LinkError request trigger
+
   // ---------------------------------------------------------- RDI (Table 114)
-  output logic                  rdi_lp_irdy,
-  output logic                  rdi_lp_valid,
-  output logic [NBYTES*8-1:0]   rdi_lp_data,
-  input  logic                  rdi_pl_trdy,
-  input  logic                  rdi_pl_valid,
-  input  logic [NBYTES*8-1:0]   rdi_pl_data,
-  output logic [3:0]            rdi_lp_state_req,
-  input  logic [3:0]            rdi_pl_state_sts,
-  input  logic                  rdi_pl_inband_pres,
-  input  logic                  rdi_pl_error,
-  input  logic                  rdi_pl_cerror,
-  input  logic                  rdi_pl_nferror,
-  input  logic                  rdi_pl_trainerror,
-  input  logic                  rdi_pl_phyinrecenter,
-  input  logic                  rdi_pl_stallreq,
-  output logic                  rdi_lp_stallack,
-  output logic                  rdi_lp_linkerror,
-  input  logic [2:0]            rdi_pl_lnk_cfg,
-  input  logic [2:0]            rdi_pl_speedmode,
+  output logic                  rdi_lp_irdy,           // Adapter initiator ready to Physical Layer (RDI)
+  output logic                  rdi_lp_valid,          // Adapter transmit valid to Physical Layer (RDI)
+  output logic [NBYTES*8-1:0]   rdi_lp_data,           // Adapter transmit data bus to Physical Layer (RDI)
+  input  logic                  rdi_pl_trdy,           // Physical Layer target ready (RDI)
+  input  logic                  rdi_pl_valid,          // Physical Layer receive valid (RDI)
+  input  logic [NBYTES*8-1:0]   rdi_pl_data,           // Physical Layer receive data bus (RDI)
+  output logic [3:0]            rdi_lp_state_req,      // Forwarded state request to Physical Layer (RDI)
+  input  logic [3:0]            rdi_pl_state_sts,      // Physical Layer link state status (RDI)
+  input  logic                  rdi_pl_inband_pres,    // Physical Layer in-band presence indication (RDI)
+  input  logic                  rdi_pl_error,          // Physical Layer link error indicator (RDI)
+  input  logic                  rdi_pl_cerror,         // Physical Layer correctable error indicator (RDI)
+  input  logic                  rdi_pl_nferror,        // Physical Layer non-fatal error indicator (RDI)
+  input  logic                  rdi_pl_trainerror,     // Physical Layer training error indicator (RDI)
+  input  logic                  rdi_pl_phyinrecenter,  // Physical Layer PHY in recenter indicator (RDI)
+  input  logic                  rdi_pl_stallreq,       // Physical Layer stall request (RDI)
+  output logic                  rdi_lp_stallack,       // Adapter stall acknowledge to Physical Layer (RDI)
+  output logic                  rdi_lp_linkerror,      // Combined fatal error / LinkError trigger to Physical Layer (RDI)
+  input  logic [2:0]            rdi_pl_lnk_cfg,        // Physical Layer link width configuration (RDI)
+  input  logic [2:0]            rdi_pl_speedmode,      // Physical Layer speed mode status (RDI)
 
   // ---------------------------------------------------------- Private Adapter sideband packet client interface (<-> logical_phy, Section 6.1)
-  output logic                  adapter_sb_tx_valid,
-  input  logic                  adapter_sb_tx_ready,
-  output sb_packet_t            adapter_sb_tx_packet,
-  input  logic                  adapter_sb_rx_valid,
-  output logic                  adapter_sb_rx_ready,
-  input  sb_packet_t            adapter_sb_rx_packet,
-  input  logic                  adapter_sb_rx_cp_error,
-  input  logic                  adapter_sb_rx_dp_error,
-  input  logic                  adapter_sb_rx_format_error,
+  output logic                  adapter_sb_tx_valid,   // Outbound sideband packet transmit valid to PHY arbiter
+  input  logic                  adapter_sb_tx_ready,   // Outbound sideband packet transmit ready from PHY arbiter
+  output sb_packet_t            adapter_sb_tx_packet,  // Outbound typed sideband packet to PHY arbiter
+  input  logic                  adapter_sb_rx_valid,   // Inbound sideband packet valid from PHY router
+  output logic                  adapter_sb_rx_ready,   // Inbound sideband packet acknowledge/pop to PHY router
+  input  sb_packet_t            adapter_sb_rx_packet,  // Inbound typed sideband packet from PHY router
+  input  logic                  adapter_sb_rx_cp_error,// Control Parity error flag for inbound packet
+  input  logic                  adapter_sb_rx_dp_error,// Data Parity error flag for inbound packet
+  input  logic                  adapter_sb_rx_format_error,// Format error flag for inbound packet
 
   // ---------------------------------------------------------- Separate PHY CSR Access Channel (<-> logical_phy, Section 7.5)
-  output logic                  phy_csr_wr,
-  output logic                  phy_csr_rd,
-  output logic [26:0]           phy_csr_addr,
-  output logic [63:0]           phy_csr_wdata,
-  output logic [7:0]            phy_csr_be,
-  input  logic [63:0]           phy_csr_rdata,
-  input  logic                  phy_csr_rdata_vld,
-  input  logic                  clear_start_link_train,
-  output logic                  adapter_start_link_train,
-  output logic [7:0]            ltsm_state_obs,
-  output logic                  link_active_obs
+  output logic                  phy_csr_wr,            // Dedicated PHY CSR write strobe to logical_phy
+  output logic                  phy_csr_rd,            // Dedicated PHY CSR read strobe to logical_phy
+  output logic [26:0]           phy_csr_addr,          // 27-bit PHY CSR byte address
+  output logic [63:0]           phy_csr_wdata,         // 64-bit PHY CSR write data
+  output logic [7:0]            phy_csr_be,            // 8-bit PHY CSR write byte enables
+  input  logic [63:0]           phy_csr_rdata,         // 64-bit PHY CSR read data from logical_phy
+  input  logic                  phy_csr_rdata_vld,     // Dedicated PHY CSR read data valid indication
+  input  logic                  clear_start_link_train,// Private Active Entry clear for Link Control bit 0
+  output logic                  adapter_start_link_train,// Decoded Link Control bit 0 training trigger
+  output logic [7:0]            ltsm_state_obs,        // LTSM state observability bus for debug
+  output logic                  link_active_obs        // Link active observability status flag
 );
 
   import ucie_pkg::*;
@@ -293,14 +296,19 @@ module d2d_adapter #(
   logic        fdi_state_req_vld;
   logic        stall_active;
   logic        lnk_is_x8;
-  logic        csr_wr, csr_rd;
+  logic        csr_wr;
+  logic        csr_rd;
   logic [26:0] csr_addr;
-  logic [63:0] csr_wdata, csr_rdata;
+  logic [63:0] csr_wdata;
+  logic [63:0] csr_rdata;
   logic [7:0]  csr_be;
   logic        csr_rdata_vld;
-  logic        sb_credit_returned, sb_stall_sent, sb_msg_timeout;
+  logic        sb_credit_returned;
+  logic        sb_stall_sent;
+  logic        sb_msg_timeout;
   logic        link_status_active;
-  logic        adapter_fatal, adapter_linkerror;
+  logic        adapter_fatal;
+  logic        adapter_linkerror;
   logic        stage3_done;
   logic        adapter_capability_done;
   logic        adapter_stage3_ready;
@@ -314,8 +322,10 @@ module d2d_adapter #(
   // Spec ref: UCIe 1.0 Specification, Section 8.2.7 - FDI Bring up flow.
   // -------------------------------------------------------------------------
   assign adapter_stage3_ready = adapter_capability_done && stage3_done;
-  logic        protocol_error, fdi_format_error;
-  logic        rem_req_vld, rem_req_rdy;
+  logic        protocol_error;
+  logic        fdi_format_error;
+  logic        rem_req_vld;
+  logic        rem_req_rdy;
   sb_packet_t  rem_req_pkt;
   logic        rem_cpl_vld;
   sb_packet_t  rem_cpl_pkt;
@@ -339,7 +349,8 @@ module d2d_adapter #(
     STALL_ACKED     = 2'd2,
     STALL_RELEASED  = 2'd3
   } stall_phase_t;
-  stall_phase_t stall_phase_q, stall_phase_d;
+  stall_phase_t stall_phase_q;
+  stall_phase_t stall_phase_d;
 
   // -------------------------------------------------------------------------
   // always_ff: Registered four-phase stall tracker
@@ -439,7 +450,7 @@ module d2d_adapter #(
   // Active, LinkReset, and Disabled requests. Legacy adapter request inputs
   // remain structurally present but do not own Active policy.
   //
-  // Spec ref: UCIe 1.0 Section 8.2, Table 115; PLAN.md Section 15.5.
+  // Spec ref: UCIe 1.0 Section 8.2, Table 115.
   // -------------------------------------------------------------------------
   fdi_state_machine u_fdi_sm (
     .lclk(lclk),
@@ -519,7 +530,7 @@ module d2d_adapter #(
   // typed packet transport (adapter_sb_*), credit accounting, and monitor timers.
   // LinkMgmt.RDI Active policy remains in the Logical PHY LTSM.
   //
-  // Spec ref: UCIe 1.0 Sections 4.1.5 and 6.1; PLAN.md Section 15.5.
+  // Spec ref: UCIe 1.0 Sections 4.1.5 and 6.1.
   // -------------------------------------------------------------------------
   adapter_sb_if #(.NC(NC)) u_sb_if (
     .lclk                      (lclk),

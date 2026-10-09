@@ -144,17 +144,21 @@
 //                        so the FDI cannot stay stuck in PMNAK.
 //   v0.0.6  2026-09-25  Keep the public adapter_active_req port unchanged
 //                        while documenting and enforcing its policy-inert
-//                        Phase D behavior.
+//                        behavior (Active entry managed independently without peer-Active feedback).
 //   v0.0.7  2026-10-08  Update LinkError transitions per UCIe 1.0 Section 8.2.5
 //                        (Figure 119) and Section 8.3.2.7: LinkError exits
 //                        directly to Reset (never LinkReset). Add comprehensive
 //                        per-construct block comments.
-//
-// LICENSE
-//   SPDX-License-Identifier: Apache-2.0
 //   v0.0.8  2026-10-08  Documentation compliance pass: expand the state-diagram
 //                        header and the per-construct comment blocks with UCIe
 //                        1.0 citations.
+//   v0.0.9  2026-10-09  Documentation and hygiene pass: remove obsolete
+//                        implementation-phase references outside revision history,
+//                        remove Author column, add per-port inline comments,
+//                        split multi-signal declarations, and correct stale comments.
+//
+// LICENSE
+//   SPDX-License-Identifier: Apache-2.0
 // ============================================================================
 `ifndef FdiStateMachine_SV
 `define FdiStateMachine_SV
@@ -162,42 +166,42 @@
 
 `timescale 1ns/1ps
 module fdi_state_machine (
-  input  logic        lclk,
-  input  logic        lreset_n,
+  input  logic        lclk,                        // 500 MHz link clock
+  input  logic        lreset_n,                    // Active-low asynchronous reset
 
   // Protocol Layer side (FDI, Table 115)
-  input  logic [3:0]  lp_state_req,
-  output logic [3:0]  pl_state_sts,
-  output logic        pl_inband_pres,
-  output logic        pl_error,
-  output logic        pl_cerror,
-  output logic        pl_nferror,
-  output logic        pl_trainerror,
-  output logic        pl_phyinrecenter,
-  output logic [2:0]  pl_protocol,
-  output logic [3:0]  pl_protocol_flitfmt,
-  output logic        pl_rx_active_req,
-  input  logic        lp_rx_active_sts,
-  input  logic [7:0]  lp_stream,
-  output logic [7:0]  pl_stream,
+  input  logic [3:0]  lp_state_req,                // FDI link state request from Protocol Layer
+  output logic [3:0]  pl_state_sts,                // FDI link state status to Protocol Layer
+  output logic        pl_inband_pres,              // In-band presence indication to Protocol Layer
+  output logic        pl_error,                    // Link error status to Protocol Layer
+  output logic        pl_cerror,                   // Correctable error status to Protocol Layer
+  output logic        pl_nferror,                  // Non-fatal error status to Protocol Layer
+  output logic        pl_trainerror,               // Training error status to Protocol Layer
+  output logic        pl_phyinrecenter,            // PHY in recenter status to Protocol Layer
+  output logic [2:0]  pl_protocol,                 // Negotiated protocol mode (fixed Streaming)
+  output logic [3:0]  pl_protocol_flitfmt,         // Negotiated flit format (fixed Raw Mode Format 1)
+  output logic        pl_rx_active_req,            // Adapter receiver active request to Protocol Layer
+  input  logic        lp_rx_active_sts,            // Protocol Layer receiver active status indication
+  input  logic [7:0]  lp_stream,                   // Protocol Layer stream identifier input
+  output logic [7:0]  pl_stream,                   // Adapter stream identifier output
 
   // RDI side: the adapter observes the PHY result.
-  input  logic [3:0]  rdi_state_sts,
-  input  logic        rdi_inband_pres,
-  input  logic        rdi_trainerror,
-  input  logic        rdi_phyinrecenter,
-  input  logic        rdi_cerror,
-  input  logic        rdi_nferror,
+  input  logic [3:0]  rdi_state_sts,               // Current RDI state status from Logical PHY
+  input  logic        rdi_inband_pres,             // RDI in-band presence indication from Logical PHY
+  input  logic        rdi_trainerror,              // RDI training error indicator from Logical PHY
+  input  logic        rdi_phyinrecenter,           // RDI PHY in recenter indicator from Logical PHY
+  input  logic        rdi_cerror,                  // RDI correctable error indicator from Logical PHY
+  input  logic        rdi_nferror,                 // RDI non-fatal error indicator from Logical PHY
 
-  // Peer-Active compatibility input. Phase D removes it from policy logic,
-  // but the public module interface remains unchanged per PLAN.md §15.1.
-  input  logic        adapter_active_req,
-  input  logic        adapter_state_req_vld,
-  input  logic [3:0]  adapter_state_req,
-  input  logic        adapter_stage3_ready = 1'b1,
-  output logic        fdi_active_req,
-  output logic [3:0]  fdi_state_req_out,
-  output logic        fdi_state_req_vld
+  // Peer-Active compatibility input. Retained as policy-inert compatibility input;
+  // Active entry is managed by the LTSM/RDI state machines without peer-Active policy.
+  input  logic        adapter_active_req,          // Policy-inert compatibility input (Active entry managed by LTSM)
+  input  logic        adapter_state_req_vld,       // Adapter-initiated state request valid qualifier
+  input  logic [3:0]  adapter_state_req,           // Adapter-initiated state request encoding
+  input  logic        adapter_stage3_ready = 1'b1, // Adapter Stage 3 initialization readiness indicator
+  output logic        fdi_active_req,              // Active request indicator to top-level adapter logic
+  output logic [3:0]  fdi_state_req_out,           // Forwarded state request to RDI interface
+  output logic        fdi_state_req_vld            // Forwarded state request valid qualifier
 );
 
   import ucie_pkg::*;
@@ -223,7 +227,8 @@ module fdi_state_machine (
     F_DISABLED = 4'hC
   } fdi_state_t;
 
-  fdi_state_t fdi_q, fdi_d;
+  fdi_state_t fdi_q;
+  fdi_state_t fdi_d;
   logic       inband_pres_q;
   logic       local_active_req;   // Protocol Layer asked for Active
   logic       pl_inband_pres_d;

@@ -1,13 +1,13 @@
 // ============================================================================
 // File        : ut_ltsm_policy.sv
 // Project     : UCIe Simplified RTL
-// Module      : Unit Test — LTSM Policy (Phase B)
+// Module      : Unit Test — LTSM Policy
 // DUT         : ltsm #(.NLANES(NLANES_MAX))
 // ============================================================================
 //
 // DESCRIPTION
 // -----------
-// This unit test directly proves Phase B LTSM transaction policy. It
+// This unit test directly proves LTSM transaction policy. It
 // verifies that the role-aware sideband engine correctly separates local
 // requests from peer responses, treats invalid packets as fatal, replays
 // duplicate requests idempotently, retains peer responses across TX busy
@@ -73,7 +73,7 @@
 //       before le_tmr expiry, unsolicited TE_RSP is rejected, and expiry of
 //       le_tmr satisfies the dwell to allow direct exit to RESET (§8.3.2.7).
 
-// Phase F Evidence Export
+// Functional Evidence Export
 // -----------------------
 // Upon clean, zero-error completion of all scenarios, the test exports a minimal
 // JSON evidence fragment to logs/ltsm_policy_evidence.json. This fragment proves
@@ -124,7 +124,7 @@
 //     Section 8.3.2   — State Request and Status
 //     Table 47        — Sideband Packet Types
 //     Table 56        — MBINIT.PARAM DATA64 request and response
-//     PLAN.md         — Section 15.9 Phase F (Evidence Export)
+//     PLAN.md         — Section 15.9 (Evidence Export)
 // ----------------------------------------------------------------------------
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
@@ -168,6 +168,9 @@
 //                        per Figure 126.
 //   v0.0.9  2026-10-08  Documentation compliance pass: add spec-cited comment
 //                        blocks above u_dut, u_rst_tmr, and u_le_tmr.
+//   v0.0.10 2026-10-09  Cleanup pass: remove obsolete implementation-phase
+//                        references outside revision history, add task/function
+//                        argument comments, and split multi-signal declarations.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -177,27 +180,47 @@ module ut_ltsm_policy;
   import ucie_pkg::*;
 
   // ---- clocks and reset
-  logic        lclk, lreset_n;
-  logic        start_link_train, adapter_active_req;
-  logic        rdi_linkreset_req, rdi_disabled_req;
-  logic        link_trained, train_error, link_reset_out, phy_retrain_done;
+  logic        lclk;
+  logic        lreset_n;
+  logic        start_link_train;
+  logic        adapter_active_req;
+  logic        rdi_linkreset_req;
+  logic        rdi_disabled_req;
+  logic        link_trained;
+  logic        train_error;
+  logic        link_reset_out;
+  logic        phy_retrain_done;
   logic [7:0]  ltsm_state;
   logic        lnk_is_x8;
   logic [1:0]  degrade_lanes;
-  logic        sb_msg_timeout, sb_stall_sent;
-  logic        pattern_run_enable, sbinit_raw_mode;
-  logic        sbinit_rx_iter_vld, sbinit_rx_iter_match;
-  logic        sbinit_tx_iter_done, sbinit_tx_idle;
-  logic        pat_enable, pat_lfsr_reset, pat_lfsr_enable, pat_done;
-  logic        tmr_start, tmr_run, rst_tmr_start, tmr_expired;
+  logic        sb_msg_timeout;
+  logic        sb_stall_sent;
+  logic        pattern_run_enable;
+  logic        sbinit_raw_mode;
+  logic        sbinit_rx_iter_vld;
+  logic        sbinit_rx_iter_match;
+  logic        sbinit_tx_iter_done;
+  logic        sbinit_tx_idle;
+  logic        pat_enable;
+  logic        pat_lfsr_reset;
+  logic        pat_lfsr_enable;
+  logic        pat_done;
+  logic        tmr_start;
+  logic        tmr_run;
+  logic        rst_tmr_start;
+  logic        tmr_expired;
   logic        rst_tmr_expired;
 
   // ---- sideband TX from LTSM
-  logic        sb_tx_load, sb_tx_busy, sb_tx_accepted;
+  logic        sb_tx_load;
+  logic        sb_tx_busy;
+  logic        sb_tx_accepted;
   logic [4:0]  sb_tx_opcode;
-  logic [2:0]  sb_tx_srcid, sb_tx_dstid;
+  logic [2:0]  sb_tx_srcid;
+  logic [2:0]  sb_tx_dstid;
   logic [15:0] sb_tx_msginfo;
-  logic [7:0]  sb_tx_msgcode, sb_tx_msgsubcode;
+  logic [7:0]  sb_tx_msgcode;
+  logic [7:0]  sb_tx_msgsubcode;
   logic [7:0]  sb_tx_be;
   logic [4:0]  sb_tx_tag;
   logic        sb_tx_ep;
@@ -208,11 +231,14 @@ module ut_ltsm_policy;
   // ---- sideband RX to LTSM
   logic        sb_rx_pkt_vld;
   logic [4:0]  sb_rx_opcode;
-  logic [2:0]  sb_rx_srcid, sb_rx_dstid;
+  logic [2:0]  sb_rx_srcid;
+  logic [2:0]  sb_rx_dstid;
   logic [15:0] sb_rx_msginfo;
-  logic [7:0]  sb_rx_msgcode, sb_rx_msgsubcode;
+  logic [7:0]  sb_rx_msgcode;
+  logic [7:0]  sb_rx_msgsubcode;
   logic [63:0] sb_rx_payload;
-  logic        sb_rx_cp_err, sb_rx_dp_err;
+  logic        sb_rx_cp_err;
+  logic        sb_rx_dp_err;
 
   // ---- test controls
   // tx_grant models the mailbox accept qualifier. While it is low the
@@ -221,7 +247,7 @@ module ut_ltsm_policy;
   // unaccepted without suppressing the request itself.
   logic        tx_grant;
 
-  // Phase E private fatal source. It is a one-lclk pulse, so the test drives
+  // Private framing fault fatal source. It is a one-lclk pulse, so the test drives
   // it for a single cycle and then clears it again.
   logic        framing_fault_event;
 
@@ -244,11 +270,13 @@ module ut_ltsm_policy;
   // numbers the transmissions, so a task can wait for the next one even
   // when the pulse already fired. cap_* hold the most recent capture.
   logic [4:0]  tx_op_q;
-  logic [7:0]  tx_code_q, tx_sub_q;
+  logic [7:0]  tx_code_q;
+  logic [7:0]  tx_sub_q;
   logic [63:0] tx_data_q;
   int          tx_version;
   logic [4:0]  cap_op;
-  logic [7:0]  cap_code, cap_sub;
+  logic [7:0]  cap_code;
+  logic [7:0]  cap_sub;
   logic [63:0] cap_data;
   int          param_rsp_count;
 
@@ -308,7 +336,7 @@ module ut_ltsm_policy;
     .link_reset_out(link_reset_out), .phy_retrain_done(phy_retrain_done),
     .ltsm_state(ltsm_state), .lnk_is_x8(lnk_is_x8),
     .degrade_lanes(degrade_lanes),
-    // Phase E private fatal source: the mainband framing fault event.
+    // Private fatal source: the mainband framing fault event.
     .framing_fault_event(framing_fault_event),
     .sb_tx_load(sb_tx_load), .sb_tx_opcode(sb_tx_opcode),
     .sb_tx_srcid(sb_tx_srcid), .sb_tx_dstid(sb_tx_dstid),
@@ -415,15 +443,15 @@ module ut_ltsm_policy;
   // Helper: drive one RX packet for one lclk cycle
   // =========================================================================
   task drive_rx;
-    input logic [4:0]  opcode;
-    input logic [2:0]  srcid;
-    input logic [2:0]  dstid;
-    input logic [15:0] msginfo;
-    input logic [7:0]  msgcode;
-    input logic [7:0]  msgsubcode;
-    input logic [63:0] payload;
-    input logic        cp_err;
-    input logic        dp_err;
+    input logic [4:0]  opcode;     // Sideband packet opcode
+    input logic [2:0]  srcid;      // Source ID field
+    input logic [2:0]  dstid;      // Destination ID field
+    input logic [15:0] msginfo;    // Message info field
+    input logic [7:0]  msgcode;    // Message code byte
+    input logic [7:0]  msgsubcode; // Message subcode byte
+    input logic [63:0] payload;    // 64-bit payload data
+    input logic        cp_err;     // Control parity error flag
+    input logic        dp_err;     // Data parity error flag
     begin
       @(negedge lclk);
       sb_rx_opcode     = opcode;
@@ -445,8 +473,8 @@ module ut_ltsm_policy;
 
   // Shorthand for a no-data PHY-to-PHY training packet.
   task drive_nodata;
-    input logic [7:0] msgcode;
-    input logic [7:0] msgsubcode;
+    input logic [7:0] msgcode;    // Sideband message code
+    input logic [7:0] msgsubcode; // Sideband message subcode
     begin
       drive_rx(SB_OP_MSG_NODATA, SRCID_PHY, DSTID_REMOTE_PHY,
                16'h0000, msgcode, msgsubcode, 64'h0, 1'b0, 1'b0);
@@ -455,9 +483,9 @@ module ut_ltsm_policy;
 
   // Shorthand for a DATA64 PHY-to-PHY training packet.
   task drive_data64;
-    input logic [7:0]  msgcode;
-    input logic [7:0]  msgsubcode;
-    input logic [63:0] payload;
+    input logic [7:0]  msgcode;    // Sideband message code
+    input logic [7:0]  msgsubcode; // Sideband message subcode
+    input logic [63:0] payload;    // 64-bit data payload
     begin
       drive_rx(SB_OP_MSG_DATA64, SRCID_PHY, DSTID_REMOTE_PHY,
                16'h0000, msgcode, msgsubcode, payload, 1'b0, 1'b0);
@@ -466,7 +494,7 @@ module ut_ltsm_policy;
 
   // Pulse the iteration result (used to trigger RESET->SBINIT).
   task pulse_iter;
-    input logic match;
+    input logic match; // Pattern iteration match flag
     begin
       @(negedge lclk);
       sbinit_rx_iter_match = match;
@@ -492,11 +520,11 @@ module ut_ltsm_policy;
 
   // Inject a complete SBINIT packet through the direct RX path.
   task inject_sbinit;
-    input logic [7:0] msgcode;
-    input logic [7:0] msgsubcode;
-    input logic [2:0] srcid;
-    input logic [2:0] dstid;
-    input logic       cp_err;
+    input logic [7:0] msgcode;    // Sideband message code
+    input logic [7:0] msgsubcode; // Sideband message subcode
+    input logic [2:0] srcid;      // Source ID field
+    input logic [2:0] dstid;      // Destination ID field
+    input logic       cp_err;     // Control parity error flag
     begin
       drive_rx(SB_OP_MSG_NODATA, srcid, dstid,
                8'h00, msgcode, msgsubcode, 64'h0, cp_err, 1'b0);
@@ -507,8 +535,8 @@ module ut_ltsm_policy;
   // Bounded state waits. A stuck LTSM returns instead of hanging forever.
   // =========================================================================
   task wait_state_bounded;
-    input logic [7:0] st;
-    input int         max_cycles;
+    input logic [7:0] st;         // Target LTSM state
+    input int         max_cycles; // Maximum wait cycles
     begin
       fork
         begin
@@ -523,8 +551,8 @@ module ut_ltsm_policy;
   endtask
 
   task wait_state_change_bounded;
-    input logic [7:0] st;
-    input int         max_cycles;
+    input logic [7:0] st;         // State to exit
+    input int         max_cycles; // Maximum wait cycles
     begin
       fork
         begin
@@ -541,8 +569,8 @@ module ut_ltsm_policy;
   // Wait for the LTSM to leave a state or to start the next transaction of
   // the same state. Both events prove the current transaction completed.
   task wait_txn_done;
-    input logic [7:0] st;
-    input int         version;
+    input logic [7:0] st;      // Current state under observation
+    input int         version; // Transmit version counter snapshot
     begin
       fork
         begin
@@ -568,7 +596,7 @@ module ut_ltsm_policy;
   // never accepted, which keeps the request outstanding.
   // =========================================================================
   task run_to_mbinit_param;
-    input logic grant;
+    input logic grant; // Mailbox accept grant qualifier
     begin
       sb_tx_busy           = 1'b0;
       tx_grant             = grant;
@@ -657,7 +685,7 @@ module ut_ltsm_policy;
   endtask
 
   task await_tx_code;
-    input logic [7:0] expected_code;
+    input logic [7:0] expected_code; // Expected message code to capture
     int cycles;
     begin
       cap_code = 8'hFF;
@@ -675,7 +703,10 @@ module ut_ltsm_policy;
     end
   endtask
 
-  function automatic logic [7:0] rsp_code_for(input logic [7:0] code, input logic [7:0] subcode);
+  function automatic logic [7:0] rsp_code_for(
+    input logic [7:0] code,    // Sideband message code
+    input logic [7:0] subcode  // Sideband message subcode
+  );
     case (code)
       MC_SB_DONE_REQ:  rsp_code_for = MC_SB_DONE_RSP;
       MC_MBINIT_REQ:   rsp_code_for = MC_MBINIT_RSP;
@@ -687,7 +718,10 @@ module ut_ltsm_policy;
     endcase
   endfunction
 
-  function automatic logic [7:0] rsp_subcode_for(input logic [7:0] code, input logic [7:0] subcode);
+  function automatic logic [7:0] rsp_subcode_for(
+    input logic [7:0] code,    // Sideband message code
+    input logic [7:0] subcode  // Sideband message subcode
+  );
     if ((code == 8'hBA) && (subcode == 8'h0E))
       rsp_subcode_for = 8'h0F;
     else
@@ -733,7 +767,7 @@ module ut_ltsm_policy;
     end
   endtask
 
-  // Assert that a fatal packet completes the Phase C TRAINERROR Entry
+  // Assert that a fatal packet completes the TRAINERROR Entry
   // exchange. The directed partner answers E5h/00h with EAh/00h, then the
   // public TRAINERROR hold proves the required LinkError result.
   task expect_fatal;
@@ -817,14 +851,17 @@ module ut_ltsm_policy;
 
   // Malformed packet fields, set by each case before the call.
   logic [4:0]  bad_opcode;
-  logic [2:0]  bad_srcid, bad_dstid;
+  logic [2:0]  bad_srcid;
+  logic [2:0]  bad_dstid;
   logic [15:0] bad_msginfo;
-  logic [7:0]  bad_msgcode, bad_msgsubcode;
+  logic [7:0]  bad_msgcode;
+  logic [7:0]  bad_msgsubcode;
   logic [63:0] bad_payload;
-  logic        bad_cp, bad_dp;
+  logic        bad_cp;
+  logic        bad_dp;
 
   task run_fatal_case;
-    input logic grant;
+    input logic grant; // Mailbox accept grant qualifier
     begin
       run_to_mbinit_param(grant);
       repeat (10) @(posedge lclk);
@@ -1298,7 +1335,7 @@ module ut_ltsm_policy;
   endtask
 
   // =========================================================================
-  // Scenario 8: Phase C Recovery Policy
+// Scenario 8: Link Recovery Policy
   // TRAINERROR holds LinkError, accepts LinkReset only, and returns to RESET.
   // Disabled also returns to RESET. Each RESET entry needs a fresh trigger.
   // =========================================================================
@@ -1408,7 +1445,7 @@ module ut_ltsm_policy;
   // =========================================================================
   // Scenario 9: Private Mainband Framing Fault
   //
-  // The Phase E framing_fault_event input is a one-lclk pulse in lclk that
+// The framing_fault_event input is a one-lclk pulse in lclk that
   // represents a receive-gearbox boundary violation. It must join the
   // existing fatal policy:
   //   - RESET ignores it, because the physical layer is not running yet.
@@ -1640,9 +1677,9 @@ module ut_ltsm_policy;
     test_framing_fault();
     test_linkerror_dwell();
 
-    // Phase F: export unit evidence JSON upon clean zero-error completion.
+    // Export unit evidence JSON upon clean zero-error completion.
     // Spec ref: UCIe 1.0 Section 4.5.3, Section 4.5.3.8, Table 56, and
-    // PLAN.md Section 15.9 Phase F.
+    // PLAN.md Section 15.9 coverage integration.
     if (total_errors == 0) begin
       integer fd;
       fd = $fopen("logs/ltsm_policy_evidence.json", "w");

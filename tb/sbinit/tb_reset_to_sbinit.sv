@@ -41,12 +41,14 @@
 //
 // REVISION HISTORY
 // ----------------------------------------------------------------------------
-//   Rev     Date        Author      Description
-//   ------  ----------  ----------  ------------------------------------------
-//   v0.0.1  2026-09-24  -           Initial creation of dual-die SBINIT TB.
-//   v0.0.2  2026-09-28  -           Migrate sideband pins to scalar SDR strobe.
-//   v0.0.3  2026-10-08  -           Documentation compliance pass: add detailed
-//                                    header and per-construct comments.
+//   Rev     Date        Description
+//   ------  ----------  ------------------------------------------------------
+//   v0.0.1  2026-09-24  Initial creation of dual-die SBINIT TB.
+//   v0.0.2  2026-09-28  Migrate sideband pins to scalar SDR strobe.
+//   v0.0.3  2026-10-08  Documentation compliance pass: add detailed
+//                       header and per-construct comments.
+//   v0.0.4  2026-10-09  Cleanup pass: remove unused table column and add inline
+//                       comment for task input argument.
 // ============================================================================
 `ifndef TbResetToSbinit_SV
 `define TbResetToSbinit_SV
@@ -407,7 +409,9 @@ module tb_reset_to_sbinit;
   // --------------------------------------------------------------------------
   // Protocol-layer stimulus
   // --------------------------------------------------------------------------
-  task automatic fdi_cfg_write_link_control(input int die_sel);
+  task automatic fdi_cfg_write_link_control(
+    input int die_sel // Die index selector: 0 for die 0, 1 for die 1
+  );
     ucie_pkg::sb_packet_t req;
     logic [63:0] hdr;
     logic [63:0] pld;

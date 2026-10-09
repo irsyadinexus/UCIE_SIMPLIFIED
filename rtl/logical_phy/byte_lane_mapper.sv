@@ -25,7 +25,9 @@
 //   x8, lanes 0-7   byte l  (l < 8)        Lanes 0-7 only; lanes 8-15 = 0
 //   x8, lanes 8-15  byte (l-8)  (l >= 8)   Lanes 8-15 only; lanes 0-7 = 0
 //
-//   With byte_reversal set, byte k is sourced from position NBYTES-1-k.
+//   With byte_reversal set, x16 sources byte NBYTES-1-l. In x8 mode, actual reversed
+//   x8 selection uses bytes_in[NBYTES-1-index], which with NBYTES=16 selects bytes 15..8
+//   in reverse order for either surviving lane half.
 //   The table is symmetric, so the transmit and receive directions share
 //   one mapper block.
 //
@@ -80,6 +82,7 @@
 //                        Figure 43 (Standard package x8 degraded).
 //   v0.0.4  2026-10-08  Documentation compliance pass: expand comments on lower
 //                        and upper lane generate assigns with spec subsection references.
+//   v0.0.5  2026-10-09  Documentation compliance pass: add per-port inline comments.
 // ============================================================================
 `ifndef ByteLaneMapper_SV
 `define ByteLaneMapper_SV
@@ -90,36 +93,38 @@ import ucie_pkg::*;
 module byte_lane_mapper #(
   parameter int unsigned NLANES = NLANES_MAX
 ) (
-  input  logic        lclk,
-  input  logic        lreset_n,
-  input  logic        enable,
+  input  logic        lclk,               // Link clock (500 MHz)
+  input  logic        lreset_n,           // Unused compatibility reset retained for interface consistency; only lint-referenced
+  input  logic        enable,             // Module enable (gates all outputs to 0)
   input  logic        lnk_is_x8,          // 1 = x8-degraded, 0 = x16
   input  logic [1:0]  degrade_lanes,      // DEGRADE_LANES_0_7 / _8_15
   input  logic        byte_reversal,      // optional byte-order reversal
-  input  logic [NBYTES-1:0][7:0] bytes_in,
-  output logic [NLANES-1:0][7:0] data_out
+  input  logic [NBYTES-1:0][7:0] bytes_in, // Input parallel data bytes
+  output logic [NLANES-1:0][7:0] data_out // Output lane-aligned bytes
 );
 
   // =========================================================================
   // Per-lane source-byte mux  (spec 4.1.1 / 5.2 – byte-to-lane mapping)
   // =========================================================================
   // Each lane selects its source byte directly:
-  //   x16              : lane l <- byte l        (or NBYTES-1-l if reversed)
-  //   x8, lanes 0-7    : lane l <- byte l        for l <  8, 0 for l >= 8
-  //   x8, lanes 8-15   : lane l <- byte (l-8)    for l >= 8, 0 for l <  8
+  //   x16              : lane l <- byte l (or NBYTES-1-l if reversed)
+  //   x8, lanes 0-7    : lane l <- byte l (or NBYTES-1-l if reversed) for l < 8, 0 for l >= 8
+  //   x8, lanes 8-15   : lane l <- byte (l-8) (or NBYTES-1-(l-8) if reversed) for l >= 8, 0 for l < 8
   //
-  // The x8 cases fold the x16 table onto the surviving half; the inactive
-  // half reads zero. byte_reversal swaps the byte ordering within the
-  // active half.
+  // In normal x8 mode, surviving lanes carry bytes 0..7. With byte_reversal set,
+  // actual reversed x8 selection uses bytes_in[NBYTES-1-index], which with NBYTES=16
+  // selects bytes 15..8 in reverse order for either surviving lane half. The inactive
+  // half reads zero.
   //
   // The generate loop splits at NLANES_X8 (= 8):
   //   g_lower : Lanes 0 to NLANES_X8-1. In x8 mode with DEGRADE_LANES_0_7,
-  //             these lanes carry data; with DEGRADE_LANES_8_15 they are
+  //             these lanes carry data (bytes 0..7 normally, or bytes 15..8 in reverse
+  //             order when byte_reversal is set); with DEGRADE_LANES_8_15 they are
   //             zeroed.
   //   g_upper : Lanes NLANES_X8 to NLANES-1. In x8 mode with
   //             DEGRADE_LANES_8_15, these lanes carry data from bytes
-  //             0..(NLANES_X8-1); with DEGRADE_LANES_0_7 they are zeroed.
-  //
+  //             0..(NLANES_X8-1) normally, or bytes 15..8 in reverse order when
+  //             byte_reversal is set; with DEGRADE_LANES_0_7 they are zeroed.
   // When enable is de-asserted, all lanes output 8'b0 regardless of mode.
   // =========================================================================
   generate
@@ -134,7 +139,8 @@ module byte_lane_mapper #(
         // assign: data_out[l] - Lower Lane Data Multiplexer (Lanes 0..7)
         //
         // Drives lower half lanes. In x16 mode, routes byte l (or reversed byte).
-        // In x8 degrade mode on lanes 0..7, routes byte l. If lanes 8..15 survive,
+        // In x8 degrade mode on lanes 0..7, routes byte l normally, or reversed
+        // byte NBYTES-1-l (selecting bytes 15..8 in reverse order). If lanes 8..15 survive,
         // lower lanes are zeroed per Section 4.3.7. Gated by enable.
         //
         // Spec ref: UCIe 1.0 Section 4.1.1 (Figure 42) and Section 4.3.7.
@@ -151,7 +157,8 @@ module byte_lane_mapper #(
         // assign: data_out[l] - Upper Lane Data Multiplexer (Lanes 8..15)
         //
         // Drives upper half lanes. In x16 mode, routes byte l (or reversed byte).
-        // In x8 degrade mode on lanes 8..15, routes byte l-8. If lanes 0..7 survive,
+        // In x8 degrade mode on lanes 8..15, routes byte l-8 normally, or reversed
+        // byte NBYTES-1-(l-8) (selecting bytes 15..8 in reverse order). If lanes 0..7 survive,
         // upper lanes are zeroed per Section 4.3.7. Gated by enable.
         //
         // Spec ref: UCIe 1.0 Section 4.1.1 (Figure 43) and Section 4.3.7.

@@ -4,7 +4,7 @@
 
 The current endpoint uses two incompatible reduced sideband formats, drops required packet metadata, leaves Adapter/PHY configuration routing inert, and proves only same-RTL loopback behavior. Replace it with a fixed-profile interoperable Chapter 6 subset: standard no-data and DATA64 messages, 32-bit and 64-bit configuration requests, all three completion forms, full parity/tag/BE/status semantics, and Unsupported Request completions for memory opcodes. Keep analog PHY behavior, runtime PM circuits, lane reversal, and degradation outside this work, while preserving initialization and state progression.
 
-The selected architecture keeps one physical sideband engine, router, CDC boundary, and TX arbiter in `logical_phy`. The Adapter connects through one canonical typed packet client, owns reduced-profile Stage 3, and keeps its CSR and FDI policy. The public physical interface changes cleanly to scalar TX/RX data with forwarded clocks. Verification uses literal normative golden vectors and an independent peer BFM that does not reuse RTL encode/decode logic.
+The selected architecture keeps one physical sideband engine, router, CDC boundary, and TX arbiter in `logical_phy`. The Adapter connects through one canonical typed packet client, owns reduced-profile Stage 3, and keeps its CSR and FDI policy. The public physical interface changes cleanly to scalar TX/RX data with forwarded clocks: each die provides its own nominal 800 MHz TX source (`sbclk`) while the physical receive path is peer-clocked by the incoming forwarded strobe (`sb_rx_clk`). Verification uses literal normative golden vectors and an independent peer BFM that does not reuse RTL encode/decode logic.
 
 ## Approach
 
@@ -35,7 +35,7 @@ If Icarus Verilog 12 rejects a package function that returns `sb_packet_t`, keep
 2. Serialize one scalar bit per sideband UI, least-significant bit first. Send the 64-UI header, then 32 low UIs. If the opcode has data, send one padded 64-UI payload packet, then another 32 low UIs. A no-data transaction ends after the header gap.
 3. Decode transaction length only from the opcode. Detect truncated phases, reserved opcodes, CP errors, DP errors, and nonzero upper payload bits for 32-bit data. Return separate `rx_format_error`, `rx_cp_error`, and `rx_dp_error` indications with the decoded packet.
 4. Change `rtl/ucie_main.sv` and `rtl/logical_phy/logical_phy.sv` from the NC-wide bus-and-valid interface to:
-   - input `sbclk` as the local 800 MHz transmit source clock.
+   - input `sbclk` as the die's own local 800 MHz transmit source clock (not shared across dies).
    - output scalar `sb_tx_clk`.
    - output scalar `sb_tx_data`.
    - input scalar `sb_rx_clk`.
@@ -43,7 +43,7 @@ If Icarus Verilog 12 rejects a package function that returns `sb_packet_t`, keep
    Remove the public sideband-valid pins.
 5. Make one strobe owner toggle `sb_tx_clk` only during each 64-UI header or payload packet. Park `sb_tx_clk` and `sb_tx_data` low during every 32-UI gap and while idle. Launch TX data on rising edges and sample RX data on falling edges of `sb_rx_clk`.
 6. Keep `sb_init_raw.sv` as the raw SBINIT owner. Use the same scalar strobe/data owner in raw and packet modes, including gated strobe behavior outside active SBINIT data. Preserve the boundary-safe raw-to-packet reset sequence.
-7. Run TX serialization from `sbclk` and RX deserialization from `sb_rx_clk`. Keep independent `sb_cdc_mailbox` crossings from `lclk` to TX and from RX to `lclk`.
+7. Run TX serialization from local `sbclk` and RX deserialization from peer-clocked `sb_rx_clk`. Keep independent `sb_cdc_mailbox` crossings from `lclk` to TX and from RX to `lclk`. Dual-die simulation topologies drive each die from independent generators: Die0 startup delay 0.1875 ns, Die1 startup delay 0.4375 ns, half-period 0.625 ns, fixed relative phase 0.250 ns, and no modeled frequency drift.
 8. Replace the single RX hold register with a two-entry RX queue before the RX CDC mailbox. If both entries are full when a transaction completes, assert a sticky overflow error and route it to the fatal sideband error policy.
 9. Keep one physical codec, one strobe owner, and one gap owner. Delete the Adapter-side imitation of physical serialization.
 
@@ -142,7 +142,7 @@ If Icarus Verilog 12 rejects a package function that returns `sb_packet_t`, keep
    - every direct `sb_codec` instance in `tb/unit/ut_sb_codec.sv` and `tb/unit/ut_ltsm.sv`.
    - LTSM instances in `tb/unit/ut_ltsm.sv` and `tb/unit/ut_ltsm_policy.sv`.
    - CDC packet bundles in `tb/unit/ut_sb_cdc.sv`; size them from `$bits(sb_packet_t)` plus aligned error bits and remove numeric packet widths.
-5. Cross-connect `dut_a.sb_tx_data/sb_tx_clk` to `dut_b.sb_rx_data/sb_rx_clk` and vice versa. Remove legacy NC bus and valid wires with no wrapper or compatibility alias.
+5. Cross-connect `dut_a.sb_tx_data/sb_tx_clk` to `dut_b.sb_rx_data/sb_rx_clk` and vice versa. Drive each die from its own independent nominal 800 MHz TX generator (Die0 startup delay 0.1875 ns, Die1 startup delay 0.4375 ns, half-period 0.625 ns, fixed relative phase 0.250 ns, no modeled frequency drift) rather than sharing a single local sideband clock source. Remove legacy NC bus and valid wires with no wrapper or compatibility alias.
 6. Update each modified RTL and test header revision entry and each affected construct comment with the applicable UCIe subsection. Do not change `doc/PLAN.md` as part of this implementation.
 
 ### 7. Add independent conformance verification before changing coverage gates
@@ -244,6 +244,6 @@ Expected results:
 - Memory accesses are recognized standard packets but unsupported endpoint operations. They always complete with Unsupported Request and never reach a register file.
 - The endpoint has no Retimer. It decodes Stall status and capability Stall messages and resets the applicable timeout, but it does not originate Retimer Stall keep-alives.
 - Streaming negotiation advertises Raw Mode, Streaming, and Stack0 only. It sends no FinCap message because UCIe 1.0 makes the Streaming Raw result implicit when PCIe, CXL, and vendor extensions are absent.
-- `sbclk` remains the local 800 MHz TX source. The sideband engine gates it onto `sb_tx_clk` only for active 64-UI packets and parks the strobe low during gaps and idle. `sb_rx_clk` independently clocks the receive path. Analog clock quality is outside scope.
+- `sbclk` remains each die's own nominal 800 MHz TX source rather than a shared local sideband clock across dies. The sideband engine gates it onto `sb_tx_clk` only for active 64-UI packets and parks the strobe low during gaps and idle. `sb_rx_clk` independently clocks the physical receive path from the peer's forwarded strobe. Dual-die simulation generators model Die0 startup delay 0.1875 ns, Die1 startup delay 0.4375 ns, half-period 0.625 ns, fixed relative phase 0.250 ns, and no modeled frequency drift. Analog clock quality is outside scope.
 - The typed Adapter packet client is a private implementation channel selected for maintainability. Public FDI cfg phases and physical serial pins remain standard-shaped; no legacy bus-and-valid wrapper remains.
 - `doc/PLAN.md:1154-1159` limited new files for the completed A–F project phases. This remediation is a new task. It adds only the independent golden package, peer BFM, peer test, and focused Adapter sideband test needed for the selected verification strategy.

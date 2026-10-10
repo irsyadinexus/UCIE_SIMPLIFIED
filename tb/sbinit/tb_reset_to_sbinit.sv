@@ -49,6 +49,8 @@
 //                       header and per-construct comments.
 //   v0.0.4  2026-10-09  Cleanup pass: remove unused table column and add inline
 //                       comment for task input argument.
+//   v0.0.5  2026-10-10  Migrate shared sbclk to separate d0_sbclk and d1_sbclk
+//                       per clock contract and expose both in waveform dump.
 // ============================================================================
 `ifndef TbResetToSbinit_SV
 `define TbResetToSbinit_SV
@@ -63,13 +65,15 @@ module tb_reset_to_sbinit;
   // Clocks
   // --------------------------------------------------------------------------
   logic lclk;
-  logic sbclk;
+  logic d0_sbclk;
+  logic d1_sbclk;
   logic d0_mbclk;
   logic d1_mbclk;
 
   initial begin
     lclk     = 1'b0;
-    sbclk    = 1'b0;
+    d0_sbclk = 1'b0;
+    d1_sbclk = 1'b0;
     d0_mbclk = 1'b0;
     d1_mbclk = 1'b0;
     #0.125;
@@ -86,13 +90,32 @@ module tb_reset_to_sbinit;
   always #1.000 lclk = ~lclk;       // 500 MHz
 
   // --------------------------------------------------------------------------
-  // always: Sideband Clock Generator (800 MHz sbclk)
+  // initial: Sideband Local Clock Generator (800 MHz) for Die 0
   //
-  // Generates 800 MHz sideband clock, asynchronous to link clock domain.
+  // Generates 800 MHz free-running sideband clock for Die 0 with 0.1875 ns
+  // startup delay and 0.625 ns half-period (1.25 ns period), asynchronous
+  // to the link clock domain per the clock contract.
   //
   // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband Signaling.
   // --------------------------------------------------------------------------
-  always #0.625 sbclk = ~sbclk;     // 800 MHz, asynchronous to lclk
+  initial begin
+    #0.1875;
+    forever #0.625 d0_sbclk = ~d0_sbclk;
+  end
+
+  // --------------------------------------------------------------------------
+  // initial: Sideband Local Clock Generator (800 MHz) for Die 1
+  //
+  // Generates 800 MHz free-running sideband clock for Die 1 with 0.4375 ns
+  // startup delay and 0.625 ns half-period (1.25 ns period), providing
+  // 0.250 ns phase separation relative to Die 0 per the clock contract.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband Signaling.
+  // --------------------------------------------------------------------------
+  initial begin
+    #0.4375;
+    forever #0.625 d1_sbclk = ~d1_sbclk;
+  end
 
   // --------------------------------------------------------------------------
   // always: Free-Running Mainband Local Clock Generator (2 GHz) for Die 0
@@ -349,7 +372,7 @@ module tb_reset_to_sbinit;
     .lclk(lclk), .lreset_n(d0_lreset_n), .mbclk(d0_mbclk),
     .mb_tx_clk(d0_mb_tx_clk), .mb_tx_clk_oe(d0_mb_tx_clk_oe),
     .mb_tx_data_oe(d0_mb_tx_data_oe), .mb_tx_valid_oe(d0_mb_tx_valid_oe),
-    .mb_rx_clk(mb_d1_to_d0_clk), .sbclk(sbclk),
+    .mb_rx_clk(mb_d1_to_d0_clk), .sbclk(d0_sbclk),
     .sbreset_n(d0_sbreset_n),
     .lp_irdy(d0_lp_irdy), .lp_valid(d0_lp_valid), .lp_data(d0_lp_data),
     .lp_stream(d0_lp_stream), .lp_stallack(d0_lp_stallack),
@@ -386,7 +409,7 @@ module tb_reset_to_sbinit;
     .lclk(lclk), .lreset_n(d1_lreset_n), .mbclk(d1_mbclk),
     .mb_tx_clk(d1_mb_tx_clk), .mb_tx_clk_oe(d1_mb_tx_clk_oe),
     .mb_tx_data_oe(d1_mb_tx_data_oe), .mb_tx_valid_oe(d1_mb_tx_valid_oe),
-    .mb_rx_clk(mb_d0_to_d1_clk), .sbclk(sbclk),
+    .mb_rx_clk(mb_d0_to_d1_clk), .sbclk(d1_sbclk),
     .sbreset_n(d1_sbreset_n),
     .lp_irdy(d1_lp_irdy), .lp_valid(d1_lp_valid), .lp_data(d1_lp_data),
     .lp_stream(d1_lp_stream), .lp_stallack(d1_lp_stallack),
@@ -503,9 +526,10 @@ module tb_reset_to_sbinit;
     $dumpfile(wave_path);
 
     // Keep the low-rate reset, state, FDI, and RDI probes active from time
-    // zero. Do not dump the free-running internal sbclk. The external scalar
+    // zero. Expose both local sideband clock sources (d0_sbclk, d1_sbclk) so the
+    // parent can measure periods and phase separation. The external scalar
     // sideband clock/data pins remain in the dump.
-    $dumpvars(0, lclk, d0_mbclk, d1_mbclk,
+    $dumpvars(0, lclk, d0_sbclk, d1_sbclk, d0_mbclk, d1_mbclk,
                  d0_mb_tx_clk, d0_mb_tx_clk_oe, d0_mb_tx_data_oe, d0_mb_tx_valid_oe,
                  d1_mb_tx_clk, d1_mb_tx_clk_oe, d1_mb_tx_data_oe, d1_mb_tx_valid_oe,
                  mb_d0_to_d1_clk, mb_d1_to_d0_clk,

@@ -17,7 +17,8 @@
 -Timing
 @28
 tb_link_init_wave.lclk
-tb_link_init_wave.sbclk
+tb_link_init_wave.d0_sbclk
+tb_link_init_wave.d1_sbclk
 tb_link_init_wave.d0_mbclk
 tb_link_init_wave.d1_mbclk
 tb_link_init_wave.mb_d0_to_d1_clk

@@ -14,7 +14,7 @@ Verification engine: Icarus Verilog 12.0 (`iverilog -g2012`) under WSL Ubuntu-24
 | Format | Raw Mode = Format 1 | README |
 | Adapter datapath | Streaming pass-through, no CRC / no retry / no DLLP | README |
 | Modules | 1 module, 1 D2D Adapter, 1 protocol layer | README |
-| Sideband clock | 800 MHz | README |
+| Sideband clock | Nominal 800 MHz SDR: local TX source (`sbclk`), peer-clocked RX (`sb_rx_clk`) | README |
 | Main band | 2 GHz, lclk = 1 GHz, 4 GT/s only | README |
 | Timeout timers | True to spec: 8 ms sub-state residency, 4 ms RESET min, 8 ms SB message | README |
 | Retimer / CXL / PCIe | Not supported | README |
@@ -30,6 +30,7 @@ Derived legal consequences (spec rules):
 - `lp_retimer_crd` / `pl_retimer_crd` must never assert. `Retimer` bit 11 and
   `Retimer_Credits [20:12]` are 0 in advertised capabilities.
 - DP/UP bits 21/22 are kept for port identity only (cosmetic, no PCIe).
+- Each die operates its own nominal 800 MHz TX source (`sbclk`) rather than sharing a local clock, with physical RX peer-clocked by the incoming forwarded strobe (`sb_rx_clk`). Independent simulation generators model Die0 (startup delay 0.1875 ns) and Die1 (startup delay 0.4375 ns) with 0.625 ns half-period, 0.250 ns fixed relative phase, and no modeled frequency drift.
 
 ---
 
@@ -310,6 +311,10 @@ Local Active entry does not flush an early peer singleton. Ordinary stalls prese
 The digital model supports independent phase at exact nominal rates, not indefinite frequency-drift compensation.
 Scalar pins and output enables do not prove differential analog levels, termination, eye margin, or jitter.
 
+### 6.3.1 Directional forwarded sideband clock
+
+Each endpoint provides its own nominal 800 MHz `sbclk` transmit source clock rather than sharing a single sideband source across dies. Transmit packets and raw SBINIT patterns forward this source onto scalar `sb_tx_clk` only during active serialization, parking the strobe low during gaps and idle. Physical reception on `sb_rx_clk` is peer-clocked by the incoming forwarded strobe and sampled on falling edges. Dual-die simulation topologies model independent generators with Die0 startup delay 0.1875 ns, Die1 startup delay 0.4375 ns, half-period 0.625 ns, fixed relative phase 0.250 ns, and no modeled frequency drift, preserving the fixed 800 MHz SDR rate.
+
 ### 6.4 Scrambler / LFSR (spec 4.4.1)
 
 `G(x) = x^23 + x^21 + x^16 + x^8 + x^5 + x^2 + 1`. Per-lane seed = lane number mod 8:
@@ -398,6 +403,8 @@ tb_loopback_top
  +-- scoreboard : Raw Mode byte compare, both directions
  +-- cov_export : writes counters to sim/logs/coverage.json
 ```
+The two-die simulation topology provides each die with its own nominal 800 MHz TX source clock (`sbclk`) and peer-clocked physical RX (`sb_rx_clk`), rather than a shared local sideband clock. Independent simulation generators drive Die0 (startup delay 0.1875 ns) and Die1 (startup delay 0.4375 ns) with half-period 0.625 ns, fixed relative phase 0.250 ns, and no modeled frequency drift. The line model crosses `sb_tx_clk`/`sb_tx_data` to peer `sb_rx_clk`/`sb_rx_data`.
+
 
 `protocol_layer_bfm` emulates the Protocol Layer: reset flow to initiate link init,
 then Raw Mode streaming data once link is Active. Asserts `lp_state_req` = Active,
@@ -524,8 +531,10 @@ The implementation changes only:
 - focused unit tests, loopback checks, coverage, and simulation targets
 
 `d2d_adapter` remains unchanged. The paired lclk/sbclk CDC mailbox inside each
-logical PHY remains unchanged. Each die can have an independent reset pair, but
-the lclk and sbclk resets inside one die must assert together.
+logical PHY remains unchanged. Each die operates its own nominal 800 MHz `sbclk`
+TX source and peer-clocked `sb_rx_clk` RX rather than sharing a clock. Each die can
+have an independent reset pair, but the lclk and sbclk resets inside one die must
+assert together.
 
 ### 14.3 Protocol Requirements
 
@@ -608,10 +617,12 @@ Out-of-Reset, Done ordering, invalid packet, and timeout behavior. Update
 for the pattern-trigger RESET exit, explicit request/response behavior, and the
 true 8 ms timeout.
 
-Update `tb/loopback/tb_loopback_top.sv` to use independent local reset pairs.
-Release Die 1 reset 2.5 ms after Die 0. Assert Die 0's local training trigger,
-but leave Die 1's trigger low. Require the received SBINIT pattern to start
-Die 1 after its own 4 ms RESET minimum. Check reset duration, the Stage 0 skew,
+Update `tb/loopback/tb_loopback_top.sv` to use independent local reset pairs and
+independent nominal 800 MHz sideband clock generators (Die 0 startup delay 0.1875 ns,
+Die 1 startup delay 0.4375 ns, half-period 0.625 ns, fixed relative phase 0.250 ns,
+and no modeled frequency drift). Release Die 1 reset 2.5 ms after Die 0. Assert Die 0's
+local training trigger, but leave Die 1's trigger low. Require the received SBINIT pattern
+to start Die 1 after its own 4 ms RESET minimum. Check reset duration, the Stage 0 skew,
 SBINIT order, absence of early main-band activity, both ACTIVE observations,
 and both Raw Mode data directions. Use a 20 ms integration watchdog.
 

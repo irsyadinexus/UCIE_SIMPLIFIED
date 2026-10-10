@@ -90,6 +90,9 @@
 //   v0.0.9  2026-10-09  Verify full-FIFO descrambled streams without word duplication.
 //                       Check clock, data, and Valid pad disable through CAL.
 //                       Remove duplicate physical-clock and pad VCD declarations.
+//   v0.0.10 2026-10-10  Migrate shared sbclk to local per-die sources d0_sbclk
+//                       and d1_sbclk per the clock contract. Migrate DUT hookups,
+//                       waveform dump, and GTKWave layout.
 // ============================================================================
 `include "ucie_pkg.sv"
 import ucie_pkg::*;
@@ -100,14 +103,16 @@ module tb_link_init_wave;
   // ==========================================================================
   // Clocks
   // ==========================================================================
-  logic lclk;   // 500 MHz local clock (2.0 ns period)
-  logic sbclk;  // 800 MHz sideband clock (1.25 ns period)
+  logic lclk;     // 500 MHz local clock (2.0 ns period)
+  logic d0_sbclk; // 800 MHz sideband local clock for Die 0 (1.25 ns period, 0.1875 ns offset)
+  logic d1_sbclk; // 800 MHz sideband local clock for Die 1 (1.25 ns period, 0.4375 ns offset)
   logic d0_mbclk; // 2.0 GHz mainband local source for Die 0 (0.5 ns period)
   logic d1_mbclk; // 2.0 GHz mainband local source for Die 1 (0.5 ns period, phase shifted)
 
   initial begin
     lclk     = 1'b0;
-    sbclk    = 1'b0;
+    d0_sbclk = 1'b0;
+    d1_sbclk = 1'b0;
     d0_mbclk = 1'b0;
     d1_mbclk = 1'b0;
     #0.125;
@@ -125,14 +130,31 @@ module tb_link_init_wave;
   always #1.000 lclk = ~lclk;
 
   // --------------------------------------------------------------------------
-  // always: Sideband Clock Generator (800 MHz sbclk)
+  // initial: Free-Running Sideband Local Clock Generator (800 MHz) for Die 0
   //
-  // Generates 800 MHz sideband clock (1.25 ns period, 0.625 ns half-period).
+  // Generates 800 MHz sideband local clock (1.25 ns period, 0.625 ns half-period)
+  // for Die 0 with 0.1875 ns startup delay per the clock contract.
   //
   // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband Signaling.
   // --------------------------------------------------------------------------
-  always #0.625 sbclk = ~sbclk;
+  initial begin
+    #0.1875;
+    forever #0.625 d0_sbclk = ~d0_sbclk;
+  end
 
+  // --------------------------------------------------------------------------
+  // initial: Free-Running Sideband Local Clock Generator (800 MHz) for Die 1
+  //
+  // Generates 800 MHz sideband local clock (1.25 ns period, 0.625 ns half-period)
+  // for Die 1 with 0.4375 ns startup delay (0.250 ns relative phase) per the
+  // clock contract.
+  //
+  // Spec ref: UCIe 1.0 Specification, Section 5.13 - Sideband Signaling.
+  // --------------------------------------------------------------------------
+  initial begin
+    #0.4375;
+    forever #0.625 d1_sbclk = ~d1_sbclk;
+  end
   // --------------------------------------------------------------------------
   // always: Free-Running Mainband Local Clock Generator (2 GHz) for Die 0
   //
@@ -376,7 +398,7 @@ module tb_link_init_wave;
     .mb_tx_data_oe         (d0_mb_tx_data_oe),
     .mb_tx_valid_oe        (d0_mb_tx_valid_oe),
     .mb_rx_clk             (mb_d1_to_d0_clk),
-    .sbclk                 (sbclk),
+    .sbclk                 (d0_sbclk),
     .sbreset_n             (d0_sbreset_n),
     // FDI (Table 115)
     .lp_irdy               (d0_lp_irdy),
@@ -449,7 +471,7 @@ module tb_link_init_wave;
     .mb_tx_data_oe         (d1_mb_tx_data_oe),
     .mb_tx_valid_oe        (d1_mb_tx_valid_oe),
     .mb_rx_clk             (mb_d0_to_d1_clk),
-    .sbclk                 (sbclk),
+    .sbclk                 (d1_sbclk),
     .sbreset_n             (d1_sbreset_n),
     // FDI (Table 115)
     .lp_irdy               (d1_lp_irdy),
@@ -1354,7 +1376,7 @@ module tb_link_init_wave;
     $dumpfile(wave_path);
 
     // Group 1: Timing (Clocks and Resets)
-    $dumpvars(0, lclk, sbclk, d0_mbclk, d1_mbclk,
+    $dumpvars(0, lclk, d0_sbclk, d1_sbclk, d0_mbclk, d1_mbclk,
                  d0_mb_tx_clk, d0_mb_tx_clk_oe, d0_mb_tx_data_oe, d0_mb_tx_valid_oe,
                  d1_mb_tx_clk, d1_mb_tx_clk_oe, d1_mb_tx_data_oe, d1_mb_tx_valid_oe,
                  mb_d0_to_d1_clk, mb_d1_to_d0_clk,

@@ -45,22 +45,18 @@
 //     zero-delay continuous assignments (ideal wires).
 //
 //   CLOCKING
-//     Three clock domains are generated in this testbench:
+//     Three clock domain families are generated in this testbench:
 //       - lclk   : 500 MHz (2.0 ns period). The adapter / logical-PHY local
 //                  clock. This is the domain on which all RDI data transfers
 //                  are referenced.
-//       - mbclk  : 2 GHz (0.5 ns period). The forwarded clock fCK that
-//                  clocks the main-band DDR serialiser / deserialiser. This
-//                  clock is GATED while neither Link Training State Machine
-//                  (LTSM) sits in LINKINIT or ACTIVE. Sideband-only training
-//                  phases (RESET, SBINIT, MBINIT, MBTRAIN) suppress idle
-//                  fCK toggles. Once either LTSM enters LT_LINKINIT (for
-//                  diagnostic training patterns) or LT_ACTIVE (for scrambled
-//                  user data), fCK is enabled and toggles at 2 GHz.
-//       - sbclk  : 800 MHz (1.25 ns period), phase-offset from lclk. The
-//                  sideband codec runs in this independent domain. Toggle
-//                  mailboxes inside logical_phy preserve complete packet
-//                  requests and responses across the CDC boundary.
+//       - d0_mbclk, d1_mbclk : 2 GHz (0.5 ns period). Free-running local
+//                  sources with unequal phases. Forwarded physical clocks fCK
+//                  are driven by DUT clock outputs and output enables.
+//       - d0_sbclk, d1_sbclk : 800 MHz (1.25 ns period), phase-offset from
+//                  lclk. Die 0 runs on its local d0_sbclk and Die 1 runs on
+//                  its local d1_sbclk. Toggle mailboxes inside logical_phy
+//                  preserve complete packet requests and responses across the
+//                  CDC boundary.
 //
 //   RAW MODE STREAMING FLOW
 //     After both dies reach LINK ACTIVE, the `push_one` task injects a
@@ -122,38 +118,38 @@
 //     for completeness of the multi-source coverage model.
 // INTERNAL BLOCK DIAGRAM
 //
-//   +================================================================+
-//   |  tb_loopback_top                                               |
-//   |                                                                |
-//   |   lclk (500 MHz)  mbclk (2 GHz, gated)  sbclk (800 MHz, async) |
-//   |     |                |                      |                  |
-//   |     +----------+-----+----------+-----------+                  |
-//   |     |          |     |          |           |                  |
-//   |  +--v----------v-----v--+    +--v-----------v-----v--+        |
-//   |  |      dut_a           |    |       dut_b           |        |
-//   |  |    (ucie_main)       |    |     (ucie_main)       |        |
-//   |  |                      |    |                       |        |
-//   |  |  BFM d0_lp_* ----+  |    |  +---- BFM d1_lp_*    |        |
-//   |  |                  |  |    |  |                     |        |
-//   |  sb_clk/data --->+--+--->+--+-> sb_clk/data_in    |        |
-//   |  sb_clk/data_in <+--+<--+--+<-- sb_clk/data       |        |
-//   |  |                  |  |    |  |                     |        |
-//   |  mb_tx_data/val->+--+--->+--+-> mb_rx_data/val    |        |
-//   |  mb_rx_data/val <+--+<--+--+<-- mb_tx_data/val    |        |
-//   |  |  pl_data ------->+  |    |  +-------> pl_data     |        |
-//   |  +---------------------+    +------------------------+        |
-//   |            |                           |                      |
-//   |   scoreboard (push_one)       scoreboard (push_one)           |
-//   |            |                           |                      |
-//   |     xfer_done_0                 xfer_done_1                   |
-//   |            \                          /                       |
-//   |             +-------+--------+-------+                        |
-//   |                     |                                         |
-//   |              +------v------+                                  |
-//   |              | cov_monitor |                                  |
-//   |              |   (u_cov)   |                                  |
-//   |              +-------------+                                  |
-//   +================================================================+
+//   +====================================================================+
+//   |  tb_loopback_top                                                   |
+//   |                                                                    |
+//   |   lclk (500 MHz)     d0_mbclk, d0_sbclk      d1_mbclk, d1_sbclk    |
+//   |     |                      |                         |             |
+//   |     +-----------+          |                         |             |
+//   |     |           |          |                         |             |
+//   |  +--v-----------v-------+  |      +--v---------------v---------+   |
+//   |  |        dut_a         |<-+      |          dut_b             |<-+
+//   |  |      (ucie_main)     |         |        (ucie_main)         |   |
+//   |  |                      |         |                            |   |
+//   |  |  BFM d0_lp_* ----+   |         |   +---- BFM d1_lp_*        |   |
+//   |  |                  |   |         |   |                        |   |
+//   |  |  sb_clk/data --->+---+---------+---+-> sb_clk/data_in       |   |
+//   |  |  sb_clk/data_in <+---+<--------+---+<-- sb_clk/data         |   |
+//   |  |                  |   |         |   |                        |   |
+//   |  |  mb_tx_data/val->+---+---------+---+-> mb_rx_data/val       |   |
+//   |  |  mb_rx_data/val <+---+<--------+---+<-- mb_tx_data/val      |   |
+//   |  |  pl_data ------->+   |         |   +-------> pl_data        |   |
+//   |  +----------------------+         +----------------------------+   |
+//   |            |                                    |                  |
+//   |   scoreboard (push_one)                scoreboard (push_one)       |
+//   |            |                                    |                  |
+//   |     xfer_done_0                          xfer_done_1               |
+//   |            \                                   /                   |
+//   |             +------------------+--------------+                    |
+//   |                                |                                   |
+//   |                         +------v------+                            |
+//   |                         | cov_monitor |<-- d0_sbclk                |
+//   |                         |   (u_cov)   |                            |
+//   |                         +-------------+                            |
+//   +====================================================================+
 //
 // PARAMETERS
 //   This testbench uses the default parameter values from `ucie_pkg`:
@@ -167,15 +163,19 @@
 //   d0_mbclk, d1_mbclk : 2 GHz free-running local sources (0.5 ns period) with
 //                       unequal phases. Physical forwarded clocks come from
 //                       the DUT clock outputs and output enables.
-//   sbclk     : 800 MHz phase-offset clock generated after 0.1875 ns, then
-//               toggled every 0.625 ns. It is asynchronous to lclk.
+//   d0_sbclk, d1_sbclk : 800 MHz phase-offset local clocks generated after
+//                       0.1875 ns (Die 0) and 0.4375 ns (Die 1, 0.250 ns
+//                       relative phase), then toggled every 0.625 ns. Both are
+//                       asynchronous to lclk; Die 0 uses d0_sbclk and Die 1
+//                       uses d1_sbclk.
 //   d0_lreset_n/d0_sbreset_n : Die 0 aligned local reset pair.
 //   d1_lreset_n/d1_sbreset_n : Die 1 aligned pair, released 2.5 ms later.
 //
 // DESIGN NOTES
-//   - The two `ucie_main` instances share one sbclk, but sbclk is independent
-//     of lclk. Each logical_phy crosses LTSM packet events through paired
-//     asynchronous mailboxes before reaching its sb_codec.
+//   - Each `ucie_main` instance runs on its own local sideband clock (d0_sbclk
+//     for Die 0 and d1_sbclk for Die 1), independent of lclk. Each logical_phy
+//     crosses LTSM packet events through paired asynchronous mailboxes before
+//     reaching its sb_codec.
 //   - The RDI state and LTSM state are observed via hierarchical references
 //     into each DUT. They feed the coverage monitor and the continuous Active
 //     gate invariant; the data scoreboard itself reads only the public FDI
@@ -263,6 +263,11 @@
 //   v0.0.19 2026-10-09  Cleanup pass: remove obsolete implementation-phase
 //                        references outside revision history, add task argument
 //                        inline comments, and split multi-signal declarations.
+//   v0.0.20 2026-10-10  Migrate sideband clocking to per-die local sources:
+//                        replace shared sbclk declaration, initialization, and
+//                        generator with independent d0_sbclk and d1_sbclk;
+//                        connect cov_monitor diagnostic port to d0_sbclk;
+//                        migrate diagrams, clock notes, and comments.
 // ============================================================================
 `ifndef TbLoopbackTop_SV
 `define TbLoopbackTop_SV
@@ -273,19 +278,21 @@ import ucie_pkg::*;
 module tb_loopback_top;
 
   // ------------------------------------------------------- clocks
-  // lclk and sbclk are independent. The sideband CDC mailboxes in each
-  // logical PHY accept one-lclk-cycle LTSM events and deliver one-sbclk-cycle
-  // codec events without pulse loss.
+  // lclk, d0_sbclk, and d1_sbclk are independent. The sideband CDC mailboxes
+  // in each logical PHY accept one-lclk-cycle LTSM events and deliver
+  // one-sideband-clock-cycle codec events without pulse loss.
   logic lclk;
   logic d0_mbclk;
   logic d1_mbclk;
-  logic sbclk;
+  logic d0_sbclk;
+  logic d1_sbclk;
 
   initial begin
     lclk         = 1'b0;
     d0_mbclk     = 1'b0;
     d1_mbclk     = 1'b0;
-    sbclk        = 1'b0;
+    d0_sbclk     = 1'b0;
+    d1_sbclk     = 1'b0;
     #0.125;
     forever #0.250 d1_mbclk = ~d1_mbclk;
   end
@@ -396,23 +403,40 @@ module tb_loopback_top;
     end
   end
   // -------------------------------------------------------------------------
-  // initial: sbclk Generator
+  // initial: d0_sbclk Generator
   //
-  // Starts the 800 MHz sideband clock with a 0.1875 ns phase offset from
-  // lclk. The 0.625 ns half-period gives a 1.25 ns period. The offset makes
-  // the two clock domains asynchronous in simulation while preserving a
-  // physically accurate sideband frequency.
+  // Starts the 800 MHz local sideband clock for Die 0 with a 0.1875 ns phase
+  // offset from lclk. The 0.625 ns half-period gives a 1.25 ns period. The
+  // offset makes the sideband domain asynchronous to lclk in simulation while
+  // preserving a physically accurate sideband frequency.
   //
   // Spec ref: UCIe 1.0, Section 5.13 - Sideband signaling.
   // -------------------------------------------------------------------------
   initial begin
     #0.1875;
-    forever #0.625 sbclk = ~sbclk;
+    forever #0.625 d0_sbclk = ~d0_sbclk;
+  end
+
+  // -------------------------------------------------------------------------
+  // initial: d1_sbclk Generator
+  //
+  // Starts the 800 MHz local sideband clock for Die 1 with a 0.4375 ns phase
+  // offset from lclk (0.250 ns phase separation relative to Die 0). The
+  // 0.625 ns half-period gives a 1.25 ns period, keeping the domain asynchronous
+  // to lclk per the clock contract.
+  //
+  // Spec ref: UCIe 1.0, Section 5.13 - Sideband signaling.
+  // -------------------------------------------------------------------------
+  initial begin
+    #0.4375;
+    forever #0.625 d1_sbclk = ~d1_sbclk;
   end
   // ------------------------------------------------------- per-die reset pairs
-  // Each die releases its lclk/sbclk reset pair on the same lclk edge. Die 1
-  // releases exactly 2.5 ms after Die 0 so the CDC mailbox reset contract is
-  // preserved locally while the two Stage 0 timelines remain independent.
+  // Each die releases its lclk / sideband reset pair on the same lclk edge.
+  // Die 0 uses d0_sbreset_n (aligned with d0_sbclk) and Die 1 uses d1_sbreset_n
+  // (aligned with d1_sbclk). Die 1 releases exactly 2.5 ms after Die 0 so the
+  // CDC mailbox reset contract is preserved locally while the two Stage 0
+  // timelines remain independent.
   logic d0_lreset_n;
   logic d0_sbreset_n;
   logic d1_lreset_n;
@@ -636,7 +660,7 @@ module tb_loopback_top;
   // -------------------------------------------------------------------------
   // assign: d0_ltsm_state - Die 0 LTSM State Probe
   //
-  // Taps Die 0 LTSM state for coverage monitoring and mbclk gating.
+  // Taps Die 0 LTSM state for coverage monitoring.
   //
   // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
   // -------------------------------------------------------------------------
@@ -645,7 +669,7 @@ module tb_loopback_top;
   // -------------------------------------------------------------------------
   // assign: d1_ltsm_state - Die 1 LTSM State Probe
   //
-  // Taps Die 1 LTSM state for coverage monitoring and mbclk gating.
+  // Taps Die 1 LTSM state for coverage monitoring.
   //
   // Spec ref: UCIe 1.0 Specification, Section 4.5.3 - Link Training.
   // -------------------------------------------------------------------------
@@ -788,7 +812,7 @@ module tb_loopback_top;
     .mb_tx_data_oe   (d0_mb_tx_data_oe),
     .mb_tx_valid_oe  (d0_mb_tx_valid_oe),
     .mb_rx_clk       (mb_a2b_clk),
-    .sbclk           (sbclk),
+    .sbclk           (d0_sbclk),
     .sbreset_n       (d0_sbreset_n),
     .lp_cfg          (d0_lp_cfg),
     .lp_cfg_vld      (d0_lp_cfg_vld),
@@ -853,7 +877,7 @@ module tb_loopback_top;
     .mb_tx_data_oe   (d1_mb_tx_data_oe),
     .mb_tx_valid_oe  (d1_mb_tx_valid_oe),
     .mb_rx_clk       (mb_b2a_clk),
-    .sbclk           (sbclk),
+    .sbclk           (d1_sbclk),
     .sbreset_n       (d1_sbreset_n),
     .lp_irdy         (d1_lp_irdy),
     .lp_valid        (d1_lp_valid),
@@ -1191,7 +1215,7 @@ module tb_loopback_top;
   cov_monitor u_cov (
     .lclk              (lclk),
     .lreset_n          (d0_lreset_n && d1_lreset_n),
-    .sbclk             (sbclk),
+    .sbclk             (d0_sbclk),
     .ltsm_state_0      (d0_ltsm_state),
     .sbinit_phase_0    (d0_sbinit_phase),
     .link_active_0     (d0_link_active_obs),

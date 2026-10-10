@@ -20,7 +20,7 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - **Runtime PHY Retrain**: Not supported.
 - **Runtime Power Management (L1 / L2)**: Not supported.
 - **Electrical PHY**: Not supported (implements negotiated parameters and digital logic, no analog circuitry).
-- **Sideband Frequency**: 800 MHz SDR (spec accurate). Features asynchronous Clock Domain Crossing (CDC) mailboxes between the 500 MHz `lclk` domain and the 800 MHz `sbclk` physical codec domain.
+- **Sideband Frequency & Clock Interface**: 800 MHz SDR (spec accurate). Each die provides its own nominal 800 MHz transmit source clock (`sbclk`) rather than sharing a local clock, while the physical receive path is peer-clocked by the incoming forwarded strobe (`sb_rx_clk`). Features asynchronous Clock Domain Crossing (CDC) mailboxes between the 500 MHz `lclk` domain and the local 800 MHz `sbclk` physical codec domain. Dual-die simulation topologies use independent clock generators: Die0 startup delay 0.1875 ns, Die1 startup delay 0.4375 ns, half-period 0.625 ns, fixed relative phase 0.250 ns, and no modeled frequency drift.
 - **Mainband Frequency**: The continuous-only x16 profile uses a 2 GHz forwarded clock, 4 GT/s DDR transfers, and a 500 MHz `lclk`.
 - **Mainband Clock Interface**: Each endpoint keeps one local input, `mbclk`. The source must run at 2 GHz before hardware reset release. It must remain stable throughout operation. The controller returns source-domain reset readiness internally. It does not measure PLL lock or source health.
 - **Directional Mainband Pins**: `mb_tx_clk` drives the peer `mb_rx_clk`. Scalar `mb_tx_clk_oe`, `mb_tx_data_oe`, and `mb_tx_valid_oe` describe pad drive permission. RESET, SBINIT, PARAM, and CAL disable the pads. Enabled electrical idle holds the clock, data, and Valid low.
@@ -31,7 +31,7 @@ This repository contains a synthesizable SystemVerilog implementation of a Unive
 - **Standard Package Width**: x16 only (no runtime x8 degrade negotiated on the main line; the byte-to-lane mapper implements both x8 degrade halves and is verified by directed unit test).
 - **Data Width**: Parameterized `NBYTES`, default 16 bytes (128 bits), on both FDI and RDI.
 - **Data Link**: No CRC, no retry/replay, no sequence numbers (legal at 4 GT/s Raw Mode).
-- **Sideband Packet**: Standard 64-bit header (UCIe 1.0 Figures 100–103), 32-UI inter-packet gap, optional 64-bit payload (DATA64 / 32-bit zero-padded) followed by 32-UI gap, serialized over scalar physical pins (`sb_tx_clk`, `sb_tx_data`, `sb_rx_clk`, `sb_rx_data`) with 800 MHz SDR forwarded strobe clocking and falling-edge sampling.
+- **Sideband Packet**: Standard 64-bit header (UCIe 1.0 Figures 100–103), 32-UI inter-packet gap, optional 64-bit payload (DATA64 / 32-bit zero-padded) followed by 32-UI gap, serialized over scalar physical pins (`sb_tx_clk`, `sb_tx_data`, `sb_rx_clk`, `sb_rx_data`) with 800 MHz SDR forwarded strobe clocking (local nominal 800 MHz `sbclk` launched on `sb_tx_clk` only during active transmission) and peer-clocked falling-edge sampling on `sb_rx_clk`.
 - **Physical Layer RESET**: Physical Layer stays in RESET for a spec-mandated minimum of 4 ms upon every entry to RESET (UCIe 1.0 Section 4.5.3.1).
 - **LinkError Remediation (UCIe 1.0 Section 8.3.2.7)**:
   - Minimum residency dwell satisfaction: Dwell is satisfied immediately if a validated sideband LinkError handshake completes; otherwise, an unscaled 8 ms residency timer (`u_linkerror_timer`, `C_RESIDENCY` = 4,000,000 `lclk` cycles) serves as a fallback to satisfy dwell and allow recovery without peer sideband acknowledgment.
@@ -82,9 +82,9 @@ UCIE Main (ucie_main.sv)
         |-- RDI State Machine (spec 8.1 / Table 114)
         |-- LTSM Sequencer (ltsm.sv: all 24 state encodings; 21 reachable in this scope, including TRAINERROR)
         |-- LinkError Residency Timer (u_linkerror_timer: 8 ms C_RESIDENCY unscaled per Section 8.3.2.7)
-        |-- Sideband Codec (sb_codec.sv: 64-bit header, CP/DP parity, scalar physical pins)
+        |-- Sideband Codec (sb_codec.sv: 64-bit header, CP/DP parity, scalar physical pins: local TX source / peer RX clock)
         |-- Raw SBINIT Detector & Driver (sb_init_raw.sv: 4.5.3.2 Standard Package SBINIT primitive)
-        |-- Sideband CDC Mailboxes (sb_cdc_mailbox.sv: 500 MHz lclk <-> 800 MHz sbclk)
+        |-- Sideband CDC Mailboxes (sb_cdc_mailbox.sv: 500 MHz lclk <-> local 800 MHz sbclk)
         |-- Training Pattern Generator (pattern_gen.sv: Per-Lane-ID, VALTRAIN, clock repair, LFSR)
         |-- Mainband DDR Gearboxes and Word FIFOs (local TX source / peer RX clock)
         |-- Mainband Clock Controller (coherent requests, scalar OEs, safe full pulses)
@@ -118,8 +118,10 @@ tb/bfm/           Protocol layer BFM (protocol_layer_bfm.sv), independent scalar
                   (tb_sideband_peer.sv), literal golden vectors (sb_golden_vectors.sv),
                   and Adapter sideband testbench (tb_adapter_sideband.sv).
 tb/loopback/      Dual-die top-level testbench (tb_loopback_top.sv): two real ucie_main instances
-                  with crossed sideband and mainband pins, testing end-to-end training,
-                  bidirectional Raw Mode streaming, and fault injection recovery.
+                  with crossed physical sideband and mainband pins and independent per-die
+                  nominal 800 MHz TX sources (Die0 delay 0.1875 ns, Die1 delay 0.4375 ns,
+                  0.625 ns half-period, 0.250 ns relative phase, no modeled frequency drift),
+                  testing end-to-end training, bidirectional streaming, and fault recovery.
 tb/waveform/      RESET-to-ACTIVE waveform testbench (tb_link_init_wave.sv): 512B random,
                   512B incrementing (after LinkReset), 1024B decrementing (after LinkError),
                   and 2048B all-ones (after Disabled) bidirectional streams, plus Figure 125
@@ -135,6 +137,7 @@ scripts/          Automated compliance and construct checking scripts.
 - **100% Reachable State Coverage**: All 21 reachable LTSM states (`00h`–`11h`, `14h`, `15h`, `16h` `TRAINERROR`) are visited and verified. Documented unreachable states (`12h` `MBTRAIN.REPAIR`, `13h` `PHYRETRAIN`, `17h` `L1L2`) are excluded from the denominator.
 - **Phase F Functional Event Coverage**: All functional event counters (PARAM roles, arbitration, fatal causes, TRAINERROR, LinkReset, Disabled, PMNAK, Active Entry, pre-Active data block, scrambling, framing faults) are non-zero.
 - **Zero Warnings Gate**: RTL elaborates cleanly with `-g2012 -Wall` and zero warnings under Icarus Verilog 12.0.
+- **Measured Sideband Phase Check**: Both two-die waveform targets passed with separate local sideband sources. Waveform measurements confirmed the configured periods and phase separation without coincident edges.
 
 ## Code Quality & Comment Rule Compliance
 
